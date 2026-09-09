@@ -64,7 +64,7 @@ cwd = "crates/remux-dashboard"
 [tasks.build-docker]
 dependencies = ["jellyfin-web-ensure"]
 command = "docker"
-args = ["buildx", "build", "--network", "host", "-f", "docker/Dockerfile", "-t", "ghcr.io/nullstreamin/remux:local", "."]
+args = ["buildx", "build", "--network", "host", "-f", "docker/Dockerfile", "-t", "ghcr.io/nulldev85/nullfin:local", "."]
 
 
 [tasks.jellyfin-web-checkout]

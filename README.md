@@ -24,7 +24,7 @@ Regular Jellyfin playback behavior stays intact. The faster source-list path is 
 ```yaml
 services:
   nullfin:
-    image: ghcr.io/nullstreamin/nullfin:latest
+    image: ghcr.io/nulldev85/nullfin:latest
     container_name: nullfin
     restart: unless-stopped
     ports:
@@ -50,7 +50,7 @@ not erase the last known source list.
 
 ## A couple of sensible notes
 
-Keep the data folder persistent and back it up before updating. Pin `ghcr.io/nullstreamin/nullfin:v0.31.1` instead of `latest` if you would rather update manually.
+Keep the data folder persistent and back it up before updating. Pin a versioned image instead of `latest` if you would rather update manually.
 
 Manifest URLs can contain API keys or personal tokens, so do not paste configured URLs into screenshots, bug reports, or public Compose files.
 

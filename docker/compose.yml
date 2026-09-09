@@ -1,6 +1,6 @@
 services:
   nullfin:
-    image: ghcr.io/nullstreamin/nullfin:latest
+    image: ghcr.io/nulldev85/nullfin:latest
     build:
       context: ..
       dockerfile: docker/Dockerfile
