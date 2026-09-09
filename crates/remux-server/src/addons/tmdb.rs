@@ -301,62 +301,43 @@ impl CatalogAddon for TmdbAddon {
         )?;
 
         let stream: Pin<Box<dyn Stream<Item = db::Media> + Send>> = match local_id {
-            "popular_movies" => Box::pin(with_imdb_resolved(
-                discover_movie_stream(
-                    client.clone(),
-                    sdks::tmdb::DiscoverQuery {
-                        sort_by: Some("popularity.desc".into()),
-                        ..Default::default()
-                    },
-                ),
+            "popular_movies" => Box::pin(discover_movie_stream(
                 client,
-                false,
+                sdks::tmdb::DiscoverQuery {
+                    sort_by: Some("popularity.desc".into()),
+                    ..Default::default()
+                },
             )),
-            "popular_tv" => Box::pin(with_imdb_resolved(
-                discover_tv_stream(
-                    client.clone(),
-                    sdks::tmdb::DiscoverQuery {
-                        sort_by: Some("popularity.desc".into()),
-                        ..Default::default()
-                    },
-                ),
+            "popular_tv" => Box::pin(discover_tv_stream(
                 client,
-                true,
+                sdks::tmdb::DiscoverQuery {
+                    sort_by: Some("popularity.desc".into()),
+                    ..Default::default()
+                },
             )),
-            "top_rated_movies" => Box::pin(with_imdb_resolved(
-                discover_movie_stream(
-                    client.clone(),
-                    sdks::tmdb::DiscoverQuery {
-                        sort_by: Some("vote_average.desc".into()),
-                        vote_count_gte: Some(300),
-                        ..Default::default()
-                    },
-                ),
+            "top_rated_movies" => Box::pin(discover_movie_stream(
                 client,
-                false,
+                sdks::tmdb::DiscoverQuery {
+                    sort_by: Some("vote_average.desc".into()),
+                    vote_count_gte: Some(300),
+                    ..Default::default()
+                },
             )),
-            "top_rated_tv" => Box::pin(with_imdb_resolved(
-                discover_tv_stream(
-                    client.clone(),
-                    sdks::tmdb::DiscoverQuery {
-                        sort_by: Some("vote_average.desc".into()),
-                        vote_count_gte: Some(300),
-                        ..Default::default()
-                    },
-                ),
+            "top_rated_tv" => Box::pin(discover_tv_stream(
                 client,
-                true,
+                sdks::tmdb::DiscoverQuery {
+                    sort_by: Some("vote_average.desc".into()),
+                    vote_count_gte: Some(300),
+                    ..Default::default()
+                },
             )),
-            "trending_movies_week" => Box::pin(with_imdb_resolved(
-                trending_movie_stream(client.clone(), sdks::tmdb::TrendingWindow::Week),
+            "trending_movies_week" => Box::pin(trending_movie_stream(
                 client,
-                false,
+                sdks::tmdb::TrendingWindow::Week,
             )),
-            "trending_tv_week" => Box::pin(with_imdb_resolved(
-                trending_tv_stream(client.clone(), sdks::tmdb::TrendingWindow::Week),
-                client,
-                true,
-            )),
+            "trending_tv_week" => {
+                Box::pin(trending_tv_stream(client, sdks::tmdb::TrendingWindow::Week))
+            }
             _ => return Ok(None),
         };
 
@@ -485,34 +466,6 @@ fn series_result_to_stub(s: sdks::tmdb::SeriesSearchResult) -> db::Media {
         media.set_image(db::ImageKind::Primary, url);
     }
     media
-}
-
-/// Wraps a catalog stub stream and resolves the IMDB ID for each item inline,
-/// recomputing the stable UUID from the IMDB ID. Items that cannot be resolved
-/// are dropped (no IMDB ID = no canonical identity).
-fn with_imdb_resolved(
-    stream: impl Stream<Item = db::Media> + Send + 'static,
-    client: sdks::RestClient<sdks::BearerAuth>,
-    is_tv: bool,
-) -> impl Stream<Item = db::Media> + Send {
-    stream
-        .map(move |mut stub| {
-            let c = client.clone();
-            async move {
-                let imdb = MediaResolveService::resolve_imdb_from_ids(
-                    &stub.external_ids,
-                    is_tv,
-                    &c,
-                )
-                .await?;
-                stub.id = common::stable_media_uuid(&stub.kind, imdb.as_str());
-                stub.external_ids
-                    .imdb = Some(imdb);
-                Some(stub)
-            }
-        })
-        .buffer_unordered(10)
-        .filter_map(futures::future::ready)
 }
 
 fn discover_movie_stream(
@@ -653,6 +606,23 @@ fn trending_tv_stream(
 // TMDB SDK type → db::Media conversions
 // ---------------------------------------------------------------------------
 
+fn tmdb_external_ids(
+    tmdb_id: i64,
+    external: Option<&sdks::tmdb::ExternalIds>,
+) -> db::ExternalIds {
+    db::ExternalIds {
+        tmdb: Some(tmdb_id),
+        imdb: external
+            .and_then(|ids| {
+                ids.imdb_id
+                    .as_ref()
+            })
+            .and_then(|id| db::NonEmptyString::try_new(id.clone()).ok()),
+        tvdb: external.and_then(|ids| ids.tvdb_id),
+        ..Default::default()
+    }
+}
+
 impl From<&sdks::tmdb::Season> for db::Media {
     fn from(s: &sdks::tmdb::Season) -> Self {
         let air_date = s
@@ -666,10 +636,11 @@ impl From<&sdks::tmdb::Season> for db::Media {
                 .clone()
                 .filter(|o| !o.is_empty()),
             idx: Some(s.season_number),
-            external_ids: db::ExternalIds {
-                tmdb: Some(s.id),
-                ..Default::default()
-            },
+            external_ids: tmdb_external_ids(
+                s.id,
+                s.external_ids
+                    .as_ref(),
+            ),
             released_at: air_date,
             digital_released_at: air_date,
             ..Default::default()
@@ -708,10 +679,11 @@ impl From<&sdks::tmdb::Episode> for db::Media {
                 .filter(|o| !o.is_empty()),
             idx: Some(ep.episode_number),
             parent_idx: Some(ep.season_number),
-            external_ids: db::ExternalIds {
-                tmdb: Some(ep.id),
-                ..Default::default()
-            },
+            external_ids: tmdb_external_ids(
+                ep.id,
+                ep.external_ids
+                    .as_ref(),
+            ),
             released_at: ep
                 .air_date
                 .and_then(|d| d.and_hms_opt(0, 0, 0)),
@@ -765,7 +737,12 @@ fn tmdb_client(
         .with_auth(sdks::BearerAuth {
             token: api_key.to_string(),
         })
-        .with_retry(sdks::ExponentialBackoff::builder().build_with_max_retries(3)))
+        .with_retry(sdks::ExponentialBackoff::builder().build_with_max_retries(3))
+        // TMDB never sends a `Retry-After` header on 429s (they dropped
+        // fixed rate limiting in 2019), so without this every 429 falls
+        // back to the SDK's generic 60s default, which is far longer than
+        // TMDB's actual throttle window.
+        .with_default_retry_after(std::time::Duration::from_secs(2)))
 }
 
 async fn tmdb_client_from_ctx(
@@ -1259,6 +1236,25 @@ fn watch_provider_tags(
         .collect()
 }
 
+/// Image languages to request alongside the configured metadata language so
+/// `best_logo`/`best_thumb` (which look for English-tagged title-card art)
+/// can find a match even when the server's preferred language isn't English.
+/// Without `include_image_language`, TMDB restricts `images.backdrops`/
+/// `logos` to the request's `language` plus untagged entries, so an "en"
+/// entry never comes back unless the configured language already is "en".
+fn thumb_and_logo_languages(preferred_language: Option<&str>) -> String {
+    let mut langs = vec!["en", "null"];
+    if let Some(primary) = preferred_language.and_then(|l| {
+        l.split('-')
+            .next()
+    }) && !primary.is_empty()
+        && !langs.contains(&primary)
+    {
+        langs.insert(0, primary);
+    }
+    langs.join(",")
+}
+
 async fn fetch_tmdb_meta(
     media: &db::Media,
     ctx: &AppContext,
@@ -1280,25 +1276,11 @@ async fn fetch_tmdb_meta(
 
     match media.kind {
         db::MediaKind::Movie => {
-            // Use the TMDB ID directly if known; otherwise discover it via /find.
-            let tmdb_movie_id: Option<i64> = if let Some(id) = ids.tmdb {
-                Some(id)
-            } else {
-                match MediaResolveService::tmdb_search_key(ids, None).await {
-                    Some((external_id, external_source)) => {
-                        MediaResolveService::find_tmdb_id_by(
-                            external_id,
-                            external_source,
-                            false,
-                            &client,
-                        )
-                        .await
-                        .ok()
-                        .flatten()
-                    }
-                    None => return Ok(None),
-                }
-            };
+            // `resolve_external_ids` (called at the top of
+            // `refresh_meta`, before any addon runs) already resolves a
+            // tmdb id from whatever else is known, if one is resolvable at
+            // all — nothing left to discover here.
+            let tmdb_movie_id: Option<i64> = ids.tmdb;
 
             if let Some(tmdb_id) = tmdb_movie_id {
                 let movie_details = client
@@ -1309,6 +1291,11 @@ async fn fetch_tmdb_meta(
                                 .preferred_metadata_language
                                 .clone(),
                         )
+                        .with_image_languages(thumb_and_logo_languages(
+                            config
+                                .preferred_metadata_language
+                                .as_deref(),
+                        ))
                         .with_cache(Duration::from_secs(360)),
                     )
                     .await?;
@@ -1478,25 +1465,11 @@ async fn fetch_tmdb_meta(
             }
         }
         db::MediaKind::Series => {
-            // Use the TMDB ID directly if known; otherwise discover it via /find.
-            let tmdb_series_id: Option<i64> = if let Some(id) = ids.tmdb {
-                Some(id)
-            } else {
-                match MediaResolveService::tmdb_search_key(ids, None).await {
-                    Some((external_id, external_source)) => {
-                        MediaResolveService::find_tmdb_id_by(
-                            external_id,
-                            external_source,
-                            true,
-                            &client,
-                        )
-                        .await
-                        .ok()
-                        .flatten()
-                    }
-                    None => return Ok(None),
-                }
-            };
+            // `resolve_external_ids` (called at the top of
+            // `refresh_meta`, before any addon runs) already resolves a
+            // tmdb id from whatever else is known, if one is resolvable at
+            // all — nothing left to discover here.
+            let tmdb_series_id: Option<i64> = ids.tmdb;
 
             if let Some(tmdb_id) = tmdb_series_id {
                 let tv_details = client
@@ -1507,6 +1480,11 @@ async fn fetch_tmdb_meta(
                                 .preferred_metadata_language
                                 .clone(),
                         )
+                        .with_image_languages(thumb_and_logo_languages(
+                            config
+                                .preferred_metadata_language
+                                .as_deref(),
+                        ))
                         .with_cache(Duration::from_secs(360)),
                     )
                     .await?;
@@ -1867,6 +1845,29 @@ async fn fetch_tmdb_season_meta(
         db::ImageKind::Primary,
     ) {
         patch.set_image(db::ImageKind::Primary, url);
+    }
+    patch.external_ids = tmdb_external_ids(
+        season.id,
+        season
+            .external_ids
+            .as_ref(),
+    );
+    match client
+        .execute(
+            sdks::tmdb::SeasonExternalIdsEndpoint {
+                series_id: tmdb_id,
+                season_number: season_idx,
+            }
+            .with_cache(Duration::from_secs(360)),
+        )
+        .await
+    {
+        Ok(ids) => patch
+            .external_ids
+            .merge(&tmdb_external_ids(season.id, Some(&ids)), true),
+        Err(error) => {
+            warn!(%error, series_id = tmdb_id, season = season_idx, "TMDB season external IDs unavailable")
+        }
     }
     Ok(Some(patch))
 }
@@ -2321,6 +2322,116 @@ mod tests {
     use super::*;
     use remux_sdks::Endpoint;
 
+    #[test]
+    fn season_and_episode_external_ids_are_mapped() {
+        let ids = sdks::tmdb::ExternalIds {
+            imdb_id: Some("tt1234567".into()),
+            tvdb_id: Some(456),
+        };
+        let season = sdks::tmdb::Season {
+            id: 123,
+            external_ids: Some(ids.clone()),
+            ..Default::default()
+        };
+        let episode = sdks::tmdb::Episode {
+            id: 789,
+            external_ids: Some(ids),
+            ..Default::default()
+        };
+        for (patch, tmdb) in [
+            (db::Media::from(&season), 123),
+            (db::Media::from(&episode), 789),
+        ] {
+            assert_eq!(
+                patch
+                    .external_ids
+                    .tmdb,
+                Some(tmdb)
+            );
+            assert_eq!(
+                patch
+                    .external_ids
+                    .tvdb,
+                Some(456)
+            );
+            assert_eq!(
+                patch
+                    .external_ids
+                    .imdb
+                    .as_deref()
+                    .map(String::as_str),
+                Some("tt1234567")
+            );
+        }
+    }
+
+    #[test]
+    fn external_id_refresh_preserves_missing_values_and_respects_force() {
+        let existing = db::ExternalIds {
+            tmdb: Some(123),
+            tvdb: Some(456),
+            ..Default::default()
+        };
+        for force in [false, true] {
+            let mut media = db::Media {
+                external_ids: existing.clone(),
+                ..Default::default()
+            };
+            let empty = sdks::tmdb::ExternalIds {
+                imdb_id: Some(String::new()),
+                tvdb_id: None,
+            };
+            super::super::apply_meta(
+                &mut media,
+                db::Media {
+                    external_ids: tmdb_external_ids(123, Some(&empty)),
+                    ..Default::default()
+                },
+                force,
+            );
+            assert_eq!(
+                media
+                    .external_ids
+                    .tvdb,
+                Some(456)
+            );
+            assert!(
+                media
+                    .external_ids
+                    .imdb
+                    .is_none()
+            );
+            super::super::apply_meta(
+                &mut media,
+                db::Media {
+                    external_ids: tmdb_external_ids(
+                        123,
+                        Some(&sdks::tmdb::ExternalIds {
+                            imdb_id: Some("tt1234567".into()),
+                            tvdb_id: Some(999),
+                        }),
+                    ),
+                    ..Default::default()
+                },
+                force,
+            );
+            assert_eq!(
+                media
+                    .external_ids
+                    .tvdb,
+                Some(if force { 999 } else { 456 })
+            );
+            assert_eq!(
+                media
+                    .external_ids
+                    .imdb
+                    .as_deref()
+                    .map(String::as_str),
+                Some("tt1234567")
+            );
+        }
+    }
+
     fn image_entry(path: &str, language: Option<&str>) -> sdks::tmdb::ImageEntry {
         sdks::tmdb::ImageEntry {
             file_path: path.to_string(),
@@ -2429,5 +2540,17 @@ mod tests {
                 .iter()
                 .all(|(key, _)| key != "include_image_language")
         );
+    }
+
+    /// TMDB restricts `images.backdrops`/`logos` to the request's `language`
+    /// plus untagged entries, so an "en"-tagged title card never comes back
+    /// unless "en" is explicitly requested — regardless of the server's
+    /// configured metadata language.
+    #[test]
+    fn thumb_and_logo_languages_always_include_english_and_null() {
+        assert_eq!(thumb_and_logo_languages(None), "en,null");
+        assert_eq!(thumb_and_logo_languages(Some("en")), "en,null");
+        assert_eq!(thumb_and_logo_languages(Some("nl")), "nl,en,null");
+        assert_eq!(thumb_and_logo_languages(Some("nl-NL")), "nl,en,null");
     }
 }

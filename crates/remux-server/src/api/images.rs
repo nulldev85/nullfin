@@ -106,7 +106,9 @@ async fn items_images_inner(
                     .parse()
                     .unwrap_or(ImageKind::Primary);
                 let is_collection = matches!(media.kind, db::MediaKind::Collection);
-                // If Thumb is requested but not stored, fall back to Primary.
+                // Thumb falls back to a synthesized Backdrop+Logo composite
+                // (below) when a Backdrop exists; only falls back to Primary
+                // outright when there's no Backdrop to synthesize from either.
                 // Collection artwork is generated and stored as Primary, but
                 // clients also request it as a wide Backdrop. Use the generated
                 // rendition when a collection has no dedicated backdrop.
@@ -114,7 +116,13 @@ async fn items_images_inner(
                     .images
                     .get(kind)
                     .or_else(|| {
-                        if kind == ImageKind::Thumb {
+                        if kind == ImageKind::Thumb
+                            && !is_collection
+                            && media
+                                .images
+                                .get(ImageKind::Backdrop)
+                                .is_none()
+                        {
                             media
                                 .images
                                 .get(ImageKind::Primary)
@@ -153,6 +161,32 @@ async fn items_images_inner(
                             .context_not_found("image fetch failed")?;
                         (b, ct, source_key, true)
                     }
+                } else if kind == ImageKind::Thumb
+                    && !is_collection
+                    && let Some(backdrop) = media
+                        .images
+                        .get(ImageKind::Backdrop)
+                {
+                    let logo = media
+                        .images
+                        .get(ImageKind::Logo);
+                    let (bytes, cache_key) = ImageService::cached_synthetic_thumb(
+                        &state
+                            .ctx
+                            .config
+                            .data_dir,
+                        backdrop.id,
+                        logo.map(|l| l.id),
+                        &backdrop.path,
+                        logo.map(|l| {
+                            l.path
+                                .as_str()
+                        }),
+                        &media.title,
+                    )
+                    .await
+                    .context_internal("thumb generation failed")?;
+                    (bytes, "image/jpeg".to_string(), cache_key, false)
                 } else if matches!(
                     image_type,
                     api::ImageType::Primary
@@ -400,7 +434,12 @@ async fn upload_item_image_inner(
     kind: ImageKind,
     image: api::image::JellyfinImage,
 ) -> Result<impl IntoResponse> {
-    let (is_collection_source, title) = {
+    // A GIF poster is always served as-is to preserve animation, so it can
+    // never be composite source material for the collection image
+    // configurator (which flattens everything to a static JPEG). Gate on the
+    // upload itself rather than a mode/setting so this can't be misconfigured.
+    let is_gif = crate::api::image::detect_content_type(&image.bytes) == "image/gif";
+    let (is_collection_kind, is_collection_source, title) = {
         let media = db::Media::get_by_id(
             &state
                 .ctx
@@ -409,12 +448,15 @@ async fn upload_item_image_inner(
         )
         .await?
         .context_not_found("item not found")?;
+        let is_collection_kind = kind == ImageKind::Primary
+            && matches!(
+                media.kind,
+                db::MediaKind::Collection | db::MediaKind::Folder
+            );
         (
-            kind == ImageKind::Primary
-                && matches!(
-                    media.kind,
-                    db::MediaKind::Collection | db::MediaKind::Folder
-                )
+            is_collection_kind,
+            is_collection_kind
+                && !is_gif
                 && media
                     .collection_image_config
                     .is_some(),
@@ -473,6 +515,19 @@ async fn upload_item_image_inner(
         )
         .await
         .context_internal("failed to generate collection image")?;
+    } else if is_collection_kind && is_gif {
+        // Drop any existing image config: it no longer applies once the
+        // collection has a raw GIF poster, and this also hides the
+        // layout/overlay configurator in the dashboard for it.
+        sqlx::query("UPDATE media SET collection_image_config = NULL WHERE id = ?")
+            .bind(id)
+            .execute(
+                &state
+                    .ctx
+                    .db,
+            )
+            .await
+            .context_internal("failed to clear collection image config")?;
     }
     Ok(StatusCode::NO_CONTENT)
 }
