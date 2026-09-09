@@ -1417,10 +1417,15 @@ impl AddonService {
                         .as_ref()
                         .filter(|kind| matches!(kind.id(), "opendal" | "iptv"))
                     {
-                        if let Some((resource_refs, raw_types)) = kind.available_info().await? {
-                            caps.metadata.supported_resources = resource_refs;
+                        if let Some((resource_refs, raw_types)) = kind
+                            .available_info()
+                            .await?
+                        {
+                            caps.metadata
+                                .supported_resources = resource_refs;
                             if !raw_types.is_empty() {
-                                caps.metadata.supported_types = raw_types
+                                caps.metadata
+                                    .supported_types = raw_types
                                     .into_iter()
                                     .filter_map(recognized_manifest_media_kind)
                                     .collect();

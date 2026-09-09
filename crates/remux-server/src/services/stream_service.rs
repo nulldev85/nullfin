@@ -13,7 +13,11 @@ use uuid::Uuid;
 fn source_score(title: &str) -> Option<&str> {
     title
         .rsplit_once("Score:")
-        .and_then(|(_, value)| value.split_whitespace().next())
+        .and_then(|(_, value)| {
+            value
+                .split_whitespace()
+                .next()
+        })
 }
 
 fn provider_info_with_score(
@@ -613,7 +617,9 @@ impl StreamService {
             // MediaSourceInfo and would otherwise drop provider hints.
             source.remux = Some(api::MediaSourceRemuxInfo {
                 provider_info: provider_info_with_score(
-                    stream.stream_info.as_ref(),
+                    stream
+                        .stream_info
+                        .as_ref(),
                     &stream.title,
                     self.display_score_in_filename,
                 ),

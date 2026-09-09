@@ -148,12 +148,13 @@ async fn items_playbackinfo_inner(
 ) -> Result<impl IntoResponse> {
     // Some source pickers send the parent item ID as MediaSourceId. Keep that
     // request as a version-list lookup so every add-on result remains visible.
-    let uses_version_picker = uses_version_picker_compat(&session.device.app_name);
-    let media_source_id = compatible_media_source_id(
-        uses_version_picker,
-        id,
-        q.media_source_id,
+    let uses_version_picker = uses_version_picker_compat(
+        &session
+            .device
+            .app_name,
     );
+    let media_source_id =
+        compatible_media_source_id(uses_version_picker, id, q.media_source_id);
     let skip_initial_probe = uses_version_picker && media_source_id.is_none();
 
     trace!(?id, ?q, "items_playbackinfo");
@@ -713,7 +714,9 @@ fn compatible_media_source_id(
 
 fn uses_version_picker_compat(app_name: &str) -> bool {
     const CLIENT_ID: &[u8] = &[115, 116, 114, 97, 110, 100];
-    app_name.as_bytes().eq_ignore_ascii_case(CLIENT_ID)
+    app_name
+        .as_bytes()
+        .eq_ignore_ascii_case(CLIENT_ID)
 }
 
 static NO_STREAMS_VIDEO: &[u8] = include_bytes!("../../assets/no-streams.mp4");
