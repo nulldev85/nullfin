@@ -2508,6 +2508,15 @@ impl AddonService {
         ctx: &AppContext,
         user_id: Option<Uuid>,
     ) -> Result<Vec<db::Media>> {
+        // Twelve seconds matches the proven upper bound for debrid-backed
+        // Stremio providers while preventing one broken addon from blocking
+        // every healthy provider forever. Keep a small floor so an accidental
+        // zero does not disable all remote playback.
+        let addon_timeout = Duration::from_millis(
+            ctx.config
+                .addon_stream_timeout_ms
+                .max(250),
+        );
         let addons = self
             .addons_for::<dyn StreamAddon>(media, &ctx.db, user_id)
             .await;
@@ -2527,14 +2536,16 @@ impl AddonService {
                 let id_prefixes = r
                     .resource_id_prefixes(&ResourceType::Stream)
                     .map(|p| p.to_vec());
-                match r
-                    .stream
-                    .as_ref()
-                    .unwrap()
-                    .get_streams(media, ctx, id_prefixes.as_deref())
-                    .await
-                {
-                    Ok(mut streams) => {
+                let result = tokio::time::timeout(
+                    addon_timeout,
+                    r.stream
+                        .as_ref()
+                        .unwrap()
+                        .get_streams(media, ctx, id_prefixes.as_deref()),
+                )
+                .await;
+                match result {
+                    Ok(Ok(mut streams)) => {
                         let elapsed = t.elapsed();
                         if streams.is_empty() {
                             debug!(addon = %name, ?elapsed, "addon: no streams");
@@ -2560,8 +2571,17 @@ impl AddonService {
                         }
                         streams
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         warn!(addon = %name, error = %e, elapsed = ?t.elapsed(), "stream addon failed");
+                        vec![]
+                    }
+                    Err(_) => {
+                        warn!(
+                            addon = %name,
+                            timeout_ms = addon_timeout.as_millis(),
+                            elapsed = ?t.elapsed(),
+                            "stream addon timed out; keeping results from healthy providers"
+                        );
                         vec![]
                     }
                 }

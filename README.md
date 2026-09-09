@@ -25,16 +25,28 @@ Regular Jellyfin playback behavior stays intact. The faster source-list path is 
 services:
   nullfin:
     image: ghcr.io/nullstreamin/nullfin:latest
+    container_name: nullfin
     restart: unless-stopped
     ports:
       - "3000:3000"
+    environment:
+      ADDON_STREAM_TIMEOUT_MS: "12000"
     volumes:
-      - ./data:/data
+      - nullfin-data:/data
+
+volumes:
+  nullfin-data:
 ```
 
 Open `http://localhost:3000`, create the admin account, and add your Stremio manifest URLs from the Addons page. Then add Nullfin to your media client as a Jellyfin server.
 
 That is enough for most setups. If an add-on cannot be reached during an import, Nullfin keeps it disabled so the rest of the migration can finish. You can fix or remove that entry afterward.
+
+Stream providers are queried in parallel. A provider that does not answer within
+12 seconds is skipped for that request, so working add-ons can still begin
+playback; set `ADDON_STREAM_TIMEOUT_MS` if your providers need a different hard
+deadline. Successful Stremio responses remain cached, and an empty refresh does
+not erase the last known source list.
 
 ## A couple of sensible notes
 

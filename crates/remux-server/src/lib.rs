@@ -548,6 +548,10 @@ fn default_torrent_http_port() -> u16 {
     9876
 }
 
+fn default_addon_stream_timeout_ms() -> u64 {
+    12_000
+}
+
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct Config {
     #[serde(default = "default_data_dir")]
@@ -565,6 +569,11 @@ pub struct Config {
     /// Log queries that exceed this threshold in milliseconds. Defaults to 10 000 ms.
     #[serde(default = "default_slow_query_threshold_ms")]
     pub slow_query_threshold_ms: u64,
+    /// Maximum time a single addon may spend resolving streams. Healthy addons
+    /// still complete in parallel; a stalled provider is dropped without holding
+    /// the complete playback request open indefinitely.
+    #[serde(default = "default_addon_stream_timeout_ms")]
+    pub addon_stream_timeout_ms: u64,
     /// Disable the DHT gossip socket. Useful when no Torznab sources are
     /// configured or when running in a restricted network environment.
     #[serde(default)]
@@ -712,6 +721,7 @@ impl Default for Config {
             port: default_port(),
             torrent_http_port: default_torrent_http_port_opt(),
             slow_query_threshold_ms: default_slow_query_threshold_ms(),
+            addon_stream_timeout_ms: default_addon_stream_timeout_ms(),
             disable_dht: false,
             torrent_peer_port: default_torrent_peer_port(),
             bgutil_script_path: default_bgutil_script_path(),

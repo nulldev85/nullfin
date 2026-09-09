@@ -80,4 +80,17 @@ mod tests {
 
         assert_eq!(config.port, 5000);
     }
+
+    #[test]
+    fn parses_addon_stream_timeout_from_environment() {
+        let env = config::Environment::default().source(Some({
+            let mut env = config::Map::new();
+            env.insert("ADDON_STREAM_TIMEOUT_MS".into(), "18000".into());
+            env
+        }));
+
+        let config = load_config(env).unwrap();
+
+        assert_eq!(config.addon_stream_timeout_ms, 18_000);
+    }
 }
