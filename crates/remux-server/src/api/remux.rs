@@ -590,6 +590,74 @@ pub async fn remux_metrics_status(
     }))
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ItemMetric {
+    pub source: String,
+    pub value: f64,
+    pub date: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ItemMetricsResponse {
+    pub metrics: Vec<ItemMetric>,
+}
+
+/// Each source's most recent score for one item.
+///
+/// A source is sampled daily, so the newest row per source is the current
+/// score; the older rows stay for the aggregate and are not wanted here.
+async fn latest_metrics(
+    db: &sqlx::SqlitePool,
+    id: Uuid,
+) -> sqlx::Result<Vec<ItemMetric>> {
+    let rows = sqlx::query_as::<_, (String, f64, String)>(
+        "SELECT p.source, p.value, p.date \
+         FROM popularity_raw p \
+         WHERE p.media_id = ? \
+           AND p.date = (SELECT MAX(q.date) FROM popularity_raw q \
+                         WHERE q.media_id = p.media_id AND q.source = p.source) \
+         ORDER BY p.source",
+    )
+    .bind(id)
+    .fetch_all(db)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(source, value, date)| ItemMetric {
+            source,
+            value,
+            date,
+        })
+        .collect())
+}
+
+/// Every score a metrics addon holds for one item, one row per source.
+///
+/// The values were already being collected -- each `MetricsAddon` writes a
+/// source and a 0-100 value into `popularity_raw` -- but until now they were
+/// only ever read back averaged into `popularity_agg`, which exists to sort
+/// shelves. A client that wants to show where a score came from needs them
+/// unaveraged.
+#[get("/remux/metrics/{id}")]
+pub async fn remux_item_metrics(
+    State(state): State<AppState>,
+    _session: auth::AuthSession,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse> {
+    Ok(Json(ItemMetricsResponse {
+        metrics: latest_metrics(
+            &state
+                .ctx
+                .db,
+            id,
+        )
+        .await?,
+    }))
+}
+
 #[get("/remux/streams/{id}")]
 pub async fn remux_streams(
     State(state): State<AppState>,
@@ -662,5 +730,89 @@ pub async fn remux_meta(
         Err(_) => {
             Ok((StatusCode::NOT_FOUND, Json(serde_json::Value::Null)).into_response())
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use sqlx::SqlitePool;
+
+    async fn test_db() -> SqlitePool {
+        let db = db::connect("sqlite::memory:", 10_000)
+            .await
+            .unwrap();
+        db::migrate(&db)
+            .await
+            .unwrap();
+        db
+    }
+
+    async fn insert_metric(
+        db: &SqlitePool,
+        source: &str,
+        media_id: Uuid,
+        value: f64,
+        date: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO popularity_raw (source, external_id, media_id, value, date) \
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(source)
+        // The table is keyed by (source, external_id, date), so each item needs
+        // an external id of its own; media_id is the later back-reference.
+        .bind(media_id.to_string())
+        .bind(media_id)
+        .bind(value)
+        .bind(date)
+        .execute(db)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn latest_metrics_returns_one_current_row_per_source() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+
+        insert_metric(&db, "trakt", item, 61.0, "2026-09-08").await;
+        insert_metric(&db, "trakt", item, 78.0, "2026-09-09").await;
+        insert_metric(&db, "tmdb", item, 80.0, "2026-09-09").await;
+
+        let metrics = latest_metrics(&db, item)
+            .await
+            .unwrap();
+
+        // One row per source, each carrying that source's newest sample.
+        assert_eq!(metrics.len(), 2);
+        assert_eq!(metrics[0].source, "tmdb");
+        assert_eq!(metrics[0].value, 80.0);
+        assert_eq!(metrics[1].source, "trakt");
+        assert_eq!(metrics[1].value, 78.0);
+        assert_eq!(metrics[1].date, "2026-09-09");
+    }
+
+    #[tokio::test]
+    async fn latest_metrics_keeps_items_apart_and_answers_empty_for_unknown_ones() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        let other = Uuid::new_v4();
+
+        insert_metric(&db, "tmdb", item, 80.0, "2026-09-09").await;
+        insert_metric(&db, "tmdb", other, 12.0, "2026-09-09").await;
+
+        let metrics = latest_metrics(&db, item)
+            .await
+            .unwrap();
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].value, 80.0);
+
+        assert!(
+            latest_metrics(&db, Uuid::new_v4())
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }
