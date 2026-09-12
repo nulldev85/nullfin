@@ -2412,7 +2412,9 @@ impl AddonService {
                 .search(kind, query, limit, ctx)
                 .await
             {
-                Ok(Some(results)) => {
+                // An addon can advertise search yet return no matches for this
+                // query. Give the next configured search provider a chance.
+                Ok(Some(results)) if !results.is_empty() => {
                     for m in &results {
                         ctx.store
                             .save(
@@ -2423,6 +2425,7 @@ impl AddonService {
                     }
                     return Ok(results);
                 }
+                Ok(Some(_)) => continue,
                 Ok(None) => continue,
                 Err(e) => {
                     warn!(addon = %r.row.name, error = %e, "search addon error")

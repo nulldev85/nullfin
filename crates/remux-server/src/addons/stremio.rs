@@ -1242,8 +1242,7 @@ async fn stremio_search(
 
     let results = svc
         .search(aio_type, query.to_string())
-        .await
-        .unwrap_or_default();
+        .await?;
 
     let mut media = results
         .into_iter()
