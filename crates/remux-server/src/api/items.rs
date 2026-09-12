@@ -376,7 +376,11 @@ pub async fn get_items(
             // Remote providers may have no search catalog or may return no
             // matches. Still search imported library titles in that case.
             if all_items.is_empty() {
-                local_kinds.extend(remote_kinds.iter().cloned());
+                local_kinds.extend(
+                    remote_kinds
+                        .iter()
+                        .cloned(),
+                );
             }
 
             // Local: single DB query for all local kinds combined.
