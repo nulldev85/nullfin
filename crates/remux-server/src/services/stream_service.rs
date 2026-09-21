@@ -1302,6 +1302,8 @@ mod tests {
             show_ungrouped: true,
             stream_filter: None,
             user_id: None,
+            skip_initial_probe: false,
+            display_score_in_filename: false,
         });
         let probed = |effective: &db::Media, specific_requested: bool| ProbedStreams {
             results: vec![ProbeResult {
@@ -1373,6 +1375,8 @@ mod tests {
             show_ungrouped: false,
             stream_filter: None,
             user_id: None,
+            skip_initial_probe: false,
+            display_score_in_filename: false,
         });
         service.streams = vec![dead.clone(), alive.clone()];
         let selection = service.select_streams();
@@ -1392,6 +1396,8 @@ mod tests {
             show_ungrouped: false,
             stream_filter: None,
             user_id: None,
+            skip_initial_probe: false,
+            display_score_in_filename: false,
         });
         service.group = Some((
             group_a,
