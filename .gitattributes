@@ -1,0 +1,18 @@
+# Normalize all text files to LF in the repository, regardless of the
+# platform that committed them. Without this, Windows checkouts with
+# core.autocrlf committed CRLF blobs, which turned every upstream merge into
+# whole-file conflicts against remux's LF blobs.
+* text=auto
+
+# Binary assets must never be normalized.
+*.png binary
+*.ico binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.mp4 binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.otf binary
