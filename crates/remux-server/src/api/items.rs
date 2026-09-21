@@ -19,6 +19,7 @@ use crate::{
     common::{IntoVec, TickUnit, ToRunTimeTicks},
     db,
     db::auth,
+    device_profile::{DeviceProfileExt, SourceRankingContext},
     errors::LogErr,
     sdks,
 };
@@ -180,6 +181,54 @@ pub async fn get_danmu_raw(
     StatusCode::NOT_FOUND
 }
 
+/// Per-kind cap on how many remote/local search results to request — a plain
+/// `limit` is tuned for browsing a single kind, so a search fanning out
+/// across many kinds at once would otherwise ask each one for the full
+/// (typically page-sized) limit.
+fn kind_limit(kind: &db::MediaKind, limit: usize) -> usize {
+    match kind {
+        db::MediaKind::Track => limit.min(1000),
+        db::MediaKind::Artist | db::MediaKind::Album => limit.min(10),
+        db::MediaKind::Person => limit.min(20),
+        _ => limit,
+    }
+}
+
+/// Whether a search for `kind` may be dispatched to a remote addon, or must
+/// stay local-only.
+fn is_remote_enabled(cfg: &api::ServerConfiguration, kind: &db::MediaKind) -> bool {
+    match &cfg.search_remote_enabled {
+        // IPTV/EPG content (channels and their program listings) is always
+        // local-only: there's no remote addon concept of searching "for a
+        // program," and dispatching one wastes a round trip at best, errors
+        // at worst.
+        None => !matches!(kind, db::MediaKind::TvChannel | db::MediaKind::TvProgram),
+        Some(list) => list.contains(&kind.to_string()),
+    }
+}
+
+/// Episodes are navigated through their series and season containers rather
+/// than being useful top-level search results. Keep them out of every search
+/// path, including `local:` searches that bypass the remote-search fan-out.
+fn exclude_episodes_from_search(q: &mut api::GetItemsQuery) {
+    if q.search_term
+        .is_none()
+    {
+        return;
+    }
+
+    if let Some(include_types) = &mut q.include_item_types {
+        include_types.retain(|kind| *kind != api::MediaType::Episode);
+    }
+
+    let exclude_types = q
+        .exclude_item_types
+        .get_or_insert_with(Vec::new);
+    if !exclude_types.contains(&api::MediaType::Episode) {
+        exclude_types.push(api::MediaType::Episode);
+    }
+}
+
 /// Search results: singles/EPs belong under Tracks, not surfaced as Albums
 /// (Deezer `album_kind`). Applies to both live addon results and library hits.
 pub async fn get_items(
@@ -188,6 +237,7 @@ pub async fn get_items(
     mut q: api::GetItemsQuery,
     want_count: bool,
 ) -> Result<ItemsQueryResultBuilder> {
+    exclude_episodes_from_search(&mut q);
     if !want_count {
         q.enable_total_record_count = Some(false);
     }
@@ -268,25 +318,7 @@ pub async fn get_items(
             let limit = q
                 .limit
                 .unwrap_or(250) as usize;
-
-            fn kind_limit(kind: &db::MediaKind, limit: usize) -> usize {
-                match kind {
-                    db::MediaKind::Track => limit.min(1000),
-                    db::MediaKind::Artist | db::MediaKind::Album => limit.min(10),
-                    db::MediaKind::Person => limit.min(20),
-                    _ => limit,
-                }
-            }
-
-            fn is_remote_enabled(
-                cfg: &api::ServerConfiguration,
-                kind: &db::MediaKind,
-            ) -> bool {
-                match &cfg.search_remote_enabled {
-                    None => !matches!(kind, db::MediaKind::TvChannel),
-                    Some(list) => list.contains(&kind.to_string()),
-                }
-            }
+            let fetch_limit = (skip as usize).saturating_add(limit);
 
             // Requested kinds: explicit from the client, or fall back to the computed
             // defaults (Movie + Series + Episode with exclude_item_types already applied).
@@ -333,7 +365,7 @@ pub async fn get_items(
                         .search(
                             k,
                             s,
-                            kind_limit(k, limit),
+                            kind_limit(k, fetch_limit),
                             &state.ctx,
                             Some(
                                 session
@@ -387,7 +419,7 @@ pub async fn get_items(
                 local_q.include_item_types = Some(local_types);
                 local_q.parent_id = None;
                 local_q.start_index = None;
-                local_q.limit = Some(limit as u32);
+                local_q.limit = Some(fetch_limit.min(u32::MAX as usize) as u32);
                 match db::Media::get_by_jellyfin_filter(
                     &state
                         .ctx
@@ -636,10 +668,26 @@ pub async fn get_items(
                     .collect();
                 // Respect the client's IncludeItemTypes filter if provided,
                 // but constrain it to what this collection actually holds.
+                // When Recursive=true, expand the allowed set to include descendant
+                // types: a Series collection also permits Season and Episode.
+                // This lets child-type queries (Episode under Shows) through while
+                // still blocking unrelated types (Movie under Shows). get_by_filter
+                // then scopes descendants to the correct series via a grandparent
+                // subquery on the smart filter rules.
+                let allowed_types: Vec<api::MediaType> = if q.recursive {
+                    let mut expanded = collection_types.clone();
+                    if expanded.contains(&api::MediaType::Series) {
+                        expanded.push(api::MediaType::Season);
+                        expanded.push(api::MediaType::Episode);
+                    }
+                    expanded
+                } else {
+                    collection_types.clone()
+                };
                 if let Some(requested) = &q.include_item_types {
                     let intersection: Vec<_> = requested
                         .iter()
-                        .filter(|t| collection_types.contains(t))
+                        .filter(|t| allowed_types.contains(t))
                         .cloned()
                         .collect();
                     if intersection.is_empty() {
@@ -779,7 +827,7 @@ pub async fn get_items(
 
     // handle details request
     if let Some(ids) = &q.ids {
-        if ids.len() == 1 {
+        if ids.len() == 1 && !q.strict_item_filters {
             let media = item(
                 state,
                 session.clone(),
@@ -1373,6 +1421,13 @@ pub async fn items_remote_images(
     let provider = q
         .provider
         .as_deref();
+    let requested_image_type = q
+        .kind
+        .as_deref()
+        .and_then(|kind| {
+            kind.parse::<api::ImageType>()
+                .ok()
+        });
     let mut images = Vec::new();
     let mut queried_providers = Vec::new();
 
@@ -1381,7 +1436,16 @@ pub async fn items_remote_images(
         match state
             .ctx
             .addons
-            .fetch_images(&media, &state.ctx)
+            .fetch_images(
+                &media,
+                &state.ctx,
+                crate::addons::ImageFetchOptions {
+                    image_type: requested_image_type,
+                    include_all_languages: q
+                        .include_all_languages
+                        .unwrap_or(false),
+                },
+            )
             .await
         {
             Ok(v) => images.extend(v),
@@ -1541,6 +1605,42 @@ pub async fn item(
     item_for_user(state, session, id, fields, None).await
 }
 
+fn rank_item_sources(
+    sources: &mut [db::Media],
+    ranking: SourceRankingContext<'_>,
+    user_cfg: &api::UserConfiguration,
+    server_metadata_language: Option<&str>,
+    original_language: Option<&str>,
+) {
+    if ranking.mode == remux_sdks::remux::SortMediaSourcesMode::Disabled
+        || sources.len() < 2
+        || sources
+            .iter()
+            .any(|source| {
+                source
+                    .group_id
+                    .is_some()
+            })
+    {
+        return;
+    }
+
+    sources.sort_by_cached_key(|source| {
+        let mut info = api::MediaSourceInfo::from(source.clone());
+        crate::conversions::apply_filename_guess(&mut info, source);
+        info.resolve_default_streams(
+            user_cfg,
+            server_metadata_language,
+            original_language,
+            None,
+            None,
+            None,
+            None,
+        );
+        std::cmp::Reverse(ranking.key(&info))
+    });
+}
+
 async fn item_for_user(
     state: AppState,
     session: auth::AuthSession,
@@ -1570,6 +1670,9 @@ async fn item_for_user(
     let transcoding_enabled = encoding_cfg
         .enable_video_transcoding
         .unwrap_or(true);
+    let subtitle_mode = encoding_cfg
+        .subtitle_mode
+        .unwrap_or_default();
     // Clients that switch versions (Android TV) refetch the item by MediaSource id
     // and then play MediaSources[0], so the requested group must end up first and
     // keep its own UUID instead of the item id stamped by `db_media_to_item`.
@@ -1632,6 +1735,21 @@ async fn item_for_user(
             media.kind,
             db::MediaKind::Movie | db::MediaKind::Episode | db::MediaKind::Track
         );
+    // Hoisted so both the ranking pass below and the real resolve_default_streams
+    // pass further down use the same user config — language defaults must apply
+    // even when the user has never saved a configuration (NULL for brand-new
+    // users), so the server's global metadata language is the fallback.
+    let user_cfg = session
+        .user
+        .configuration
+        .as_ref()
+        .map(|c| {
+            c.0.clone()
+        })
+        .unwrap_or_default();
+    let persisted_device_profile = session
+        .device
+        .parsed_device_profile();
 
     if needs_streams {
         if media.kind == db::MediaKind::Movie || media.kind == db::MediaKind::Episode {
@@ -1723,6 +1841,33 @@ async fn item_for_user(
             }
         }
         media.sources = Some(filtered);
+
+        if requested_group.is_none() {
+            if let Some(sources) = media
+                .sources
+                .as_mut()
+            {
+                rank_item_sources(
+                    sources,
+                    SourceRankingContext {
+                        mode: server_config
+                            .sort_media_sources
+                            .unwrap_or_default(),
+                        device_profile: persisted_device_profile.as_ref(),
+                        subtitle_mode,
+                        explicit_subtitle_index: None,
+                    },
+                    &user_cfg,
+                    server_config
+                        .preferred_metadata_language
+                        .as_deref(),
+                    media
+                        .original_language
+                        .as_deref(),
+                );
+            }
+        }
+
         media
             .user_state(
                 &state
@@ -1767,6 +1912,33 @@ async fn item_for_user(
             }
         }
         media.sources = Some(filtered);
+
+        if requested_group.is_none() {
+            if let Some(sources) = media
+                .sources
+                .as_mut()
+            {
+                rank_item_sources(
+                    sources,
+                    SourceRankingContext {
+                        mode: server_config
+                            .sort_media_sources
+                            .unwrap_or_default(),
+                        device_profile: persisted_device_profile.as_ref(),
+                        subtitle_mode,
+                        explicit_subtitle_index: None,
+                    },
+                    &user_cfg,
+                    server_config
+                        .preferred_metadata_language
+                        .as_deref(),
+                    media
+                        .original_language
+                        .as_deref(),
+                );
+            }
+        }
+
         media
             .user_state(
                 &state
@@ -1785,6 +1957,119 @@ async fn item_for_user(
         )
         .await?;
     let mut base_item = api::db_media_to_item(media.clone(), false);
+
+    if needs_streams {
+        crate::conversions::apply_filename_probe_fallback(
+            &mut base_item,
+            media
+                .sources
+                .as_deref()
+                .unwrap_or(&[]),
+            &state
+                .ctx
+                .db,
+        )
+        .await;
+    }
+
+    // When streams were actually fetched but none found, replace the
+    // listing-style stubs with a single "No streams found" stub. Must run
+    // before the resolve/label blocks below so they operate on this final
+    // source instead of the transient two-stub list from db_media_to_item
+    // (whose second entry is an empty placeholder with no real streams).
+    if needs_streams
+        && matches!(media.kind, db::MediaKind::Movie | db::MediaKind::Episode)
+        && media
+            .sources
+            .as_deref()
+            .map_or(false, |s| s.is_empty())
+    {
+        let media_streams = media
+            .probe_data
+            .as_ref()
+            .map(|p| {
+                p.media_streams
+                    .clone()
+            })
+            .unwrap_or_default();
+        base_item.media_sources = Some(vec![api::MediaSourceInfo {
+            id: media.id,
+            e_tag: media.id,
+            name: Some("No streams found".to_string()),
+            protocol: api::MediaProtocol::File,
+            path: Some(format!("/remux/{}", media.id)),
+            media_streams,
+            ..Default::default()
+        }]);
+    }
+
+    if want_streams {
+        if let Some(ref mut sources) = base_item.media_sources {
+            // Default audio/subtitle stream indexes are per-request API values
+            // (never persisted) — derive them here for the detail page. Must
+            // run before the label block below, which needs to know the real
+            // resolved subtitle to judge a possible burn-in.
+            for source in sources.iter_mut() {
+                source.resolve_default_streams(
+                    &user_cfg,
+                    server_config
+                        .preferred_metadata_language
+                        .as_deref(),
+                    media
+                        .original_language
+                        .as_deref(),
+                    None,
+                    None,
+                    None,
+                    None,
+                );
+            }
+        }
+    }
+
+    // Append the Direct Play/Direct Stream/Transcode decision to the video
+    // stream's DisplayTitle, same as PlaybackInfo — done here, after the
+    // filename-guess fallback and default-stream resolution above, so both
+    // the media_streams this endpoint ever gets (real ffprobe or guessed) and
+    // the subtitle/bitrate checks compute_transcode_reasons needs are ready.
+    // No live DeviceProfile exists on a plain GET, so this only runs when the
+    // device has previously sent one that got persisted.
+    if needs_streams
+        && server_config
+            .show_playback_decision_in_title
+            .unwrap_or(true)
+    {
+        if let Some(device_profile) = persisted_device_profile.as_ref() {
+            let ranking = SourceRankingContext {
+                mode: server_config
+                    .sort_media_sources
+                    .unwrap_or_default(),
+                device_profile: Some(device_profile),
+                subtitle_mode,
+                explicit_subtitle_index: None,
+            };
+            if let Some(sources) = base_item
+                .media_sources
+                .as_mut()
+            {
+                for source in sources.iter_mut() {
+                    let assessment = ranking.assess(source);
+                    let source_bitrate = source.bitrate;
+                    if let Some(video) = source
+                        .media_streams
+                        .iter_mut()
+                        .find(|s| matches!(s.type_, Some(api::MediaStreamType::Video)))
+                    {
+                        crate::device_profile::annotate_video_display_title(
+                            video,
+                            source_bitrate,
+                            &assessment.reasons,
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     if !transcoding_enabled {
         if let Some(sources) = base_item
@@ -1817,34 +2102,6 @@ async fn item_for_user(
             source.id = gid;
             source.e_tag = gid;
         }
-    }
-
-    // When streams were actually fetched but none found, replace the
-    // listing-style stubs with a single "No streams found" stub.
-    if needs_streams
-        && matches!(media.kind, db::MediaKind::Movie | db::MediaKind::Episode)
-        && media
-            .sources
-            .as_deref()
-            .map_or(false, |s| s.is_empty())
-    {
-        let media_streams = media
-            .probe_data
-            .as_ref()
-            .map(|p| {
-                p.media_streams
-                    .clone()
-            })
-            .unwrap_or_default();
-        base_item.media_sources = Some(vec![api::MediaSourceInfo {
-            id: media.id,
-            e_tag: media.id,
-            name: Some("No streams found".to_string()),
-            protocol: api::MediaProtocol::File,
-            path: Some(format!("/remux/{}", media.id)),
-            media_streams,
-            ..Default::default()
-        }]);
     }
 
     // For tracks, wrap the Source row(s) as HLS-transcoded MediaSources.
@@ -1982,39 +2239,6 @@ async fn item_for_user(
         base_item.location_type = api::LocationType::Virtual;
         base_item.path = None;
         base_item.can_download = Some(false);
-    }
-
-    if want_streams {
-        // Language defaults must apply even when the user has never saved a
-        // configuration (configuration is NULL for brand-new users) — the server's
-        // global metadata language is the fallback for subtitle selection.
-        let cfg = session
-            .user
-            .configuration
-            .as_ref()
-            .map(|c| {
-                c.0.clone()
-            })
-            .unwrap_or_default();
-        if let Some(ref mut sources) = base_item.media_sources {
-            // Default audio/subtitle stream indexes are per-request API values
-            // (never persisted) — derive them here for the detail page.
-            for source in sources.iter_mut() {
-                source.resolve_default_streams(
-                    &cfg,
-                    server_config
-                        .preferred_metadata_language
-                        .as_deref(),
-                    media
-                        .original_language
-                        .as_deref(),
-                    None,
-                    None,
-                    None,
-                    None,
-                );
-            }
-        }
     }
 
     apply_permissions(&mut base_item, &session.user);
@@ -2404,7 +2628,7 @@ fn parse_collection_type(s: &str) -> Option<db::CollectionMediaKind> {
 #[get("/genres")]
 pub async fn genres(
     State(state): State<AppState>,
-    _session: auth::AuthSession,
+    session: auth::AuthSession,
     Query(q): Query<api::GetItemsQuery>,
 ) -> Result<impl IntoResponse> {
     let parent = if let Some(pid) = q.parent_id {
@@ -2461,6 +2685,10 @@ pub async fn genres(
     } else {
         vec![db::MediaKind::Genre, db::MediaKind::MusicGenre]
     };
+    let smart_filter = parent
+        .as_ref()
+        .and_then(|p| p.parse_smart_filter())
+        .cloned();
 
     let result = db::Media::get_by_filter(
         &state
@@ -2472,6 +2700,14 @@ pub async fn genres(
             offset: q.start_index,
             total_count: true,
             genre_related_kinds,
+            parent_id: q.parent_id,
+            parent,
+            filter_rules: smart_filter,
+            user_id: Some(
+                session
+                    .user
+                    .id,
+            ),
             sort_by: q
                 .sort_by
                 .unwrap_or_default(),
@@ -2583,6 +2819,57 @@ pub async fn get_music_genre_by_name(
     Ok(Json(api::db_media_to_item(genre, false)))
 }
 
+// Tailored per item kind, mirroring how real Jellyfin's built-in providers
+// each declare a `Supports(item)`/`Type` — e.g. IMDb has no type
+// restriction, TmdbSeriesExternalId only supports Series, etc. `ProviderIds`
+// only ever carries `imdb`/`tmdb`/`tvdb` (see that struct in remux-sdks) —
+// there's no separate collection/slug variant to key a
+// `TmdbCollection`/`TvdbCollection`/`TvdbSlug` field off, so those are left
+// out entirely rather than rendering as fields that can never hold a value.
+// Collection is excluded entirely: `TmdbAddon::supports` (and every other
+// meta addon) never fetches for `MediaKind::Collection`, so an id typed into
+// that field here would never be acted on by anything.
+fn external_id_infos_for_kind(kind: db::MediaKind) -> Vec<api::ExternalIdInfo> {
+    let jellyfin_type = |t: &str| Some(t.to_string());
+    match kind {
+        db::MediaKind::Movie
+        | db::MediaKind::Series
+        | db::MediaKind::Season
+        | db::MediaKind::Episode
+        | db::MediaKind::Person => {
+            let type_name = match kind {
+                db::MediaKind::Movie => "Movie",
+                db::MediaKind::Series => "Series",
+                db::MediaKind::Season => "Season",
+                db::MediaKind::Episode => "Episode",
+                db::MediaKind::Person => "Person",
+                _ => unreachable!(),
+            };
+            vec![
+                api::ExternalIdInfo {
+                    name: "IMDb".to_string(),
+                    key: "Imdb".to_string(),
+                    type_: None,
+                    url_format_string: None,
+                },
+                api::ExternalIdInfo {
+                    name: "TheMovieDb".to_string(),
+                    key: "Tmdb".to_string(),
+                    type_: jellyfin_type(type_name),
+                    url_format_string: None,
+                },
+                api::ExternalIdInfo {
+                    name: "TheTVDB".to_string(),
+                    key: "Tvdb".to_string(),
+                    type_: jellyfin_type(type_name),
+                    url_format_string: None,
+                },
+            ]
+        }
+        _ => vec![],
+    }
+}
+
 #[get("/items/{id}/metadataeditor")]
 pub async fn items_metadata_editor(
     State(state): State<AppState>,
@@ -2655,47 +2942,24 @@ pub async fn items_metadata_editor(
             .cmp(&b.display_name)
     });
 
-    let external_id_infos: Vec<api::ExternalIdInfo> = vec![
-        ("IMDb", "Imdb", None),
-        ("TheMovieDb", "Tmdb", Some("Movie")),
-        ("TheMovieDb", "TmdbCollection", Some("BoxSet")),
-        ("TheTVDB", "TvdbCollection", Some("BoxSet")),
-        ("TheTVDB Numerical", "Tvdb", Some("Movie")),
-        ("TheTVDB Slug", "TvdbSlug", Some("Movie")),
-    ]
-    .into_iter()
-    .map(|(name, key, type_)| api::ExternalIdInfo {
-        name: name.to_string(),
-        key: key.to_string(),
-        type_: type_.map(str::to_string),
-        url_format_string: None,
-    })
-    .collect();
+    let external_id_infos = external_id_infos_for_kind(item.kind);
 
-    let content_type_options: Vec<String> = vec![
-        db::MediaKind::Movie,
-        db::MediaKind::Series,
-        db::MediaKind::Season,
-        db::MediaKind::Episode,
-        db::MediaKind::Artist,
-        db::MediaKind::Album,
-        db::MediaKind::Track,
-        db::MediaKind::Playlist,
-    ]
-    .into_iter()
-    .map(|k| k.to_string())
-    .collect();
-
+    // Jellyfin only surfaces this when an item's containing library has no
+    // configured content type at all (e.g. a "Mixed content" library) or the
+    // item already has an explicit per-item override — it exists to resolve
+    // an ambiguity Jellyfin's own file scanner can hit ("is this a movie or
+    // an episode?"). Every `Media` row here already carries a definitively
+    // resolved `kind` from the moment it's imported, regardless of which
+    // addon produced it or how mixed that addon's source is, so this never
+    // applies — stays empty like it does for the overwhelming majority of
+    // real Jellyfin items too.
     Ok(Json(api::MetadataEditorInfo {
         parental_rating_options,
         countries,
         cultures,
         external_id_infos,
-        content_type: Some(
-            item.kind
-                .to_string(),
-        ),
-        content_type_options,
+        content_type: None,
+        content_type_options: vec![],
     }))
 }
 
@@ -3152,6 +3416,7 @@ struct PatchItemRequest {
     latest_sort_digital: Option<bool>,
     collection_default_sort: Option<Vec<api::ItemSortBy>>,
     collection_default_sort_order: Option<Vec<api::SortOrder>>,
+    image_config: Option<sdks::remux::CollectionImageConfig>,
 }
 
 #[patch("/items/{id}")]
@@ -3246,6 +3511,10 @@ pub async fn patch_item(
         qb.push(", collection_default_sort_order = ")
             .push_bind(sqlx::types::Json(v));
     }
+    if let Some(ref cfg) = payload.image_config {
+        qb.push(", collection_image_config = ")
+            .push_bind(sqlx::types::Json(cfg));
+    }
 
     qb.push(" WHERE id = ")
         .push_bind(id);
@@ -3256,6 +3525,24 @@ pub async fn patch_item(
                 .db,
         )
         .await?;
+
+    // Invalidate cached generated image when image config changes.
+    if payload
+        .image_config
+        .is_some()
+    {
+        let _ = ImageService::invalidate_collection_image(
+            &state
+                .ctx
+                .config
+                .data_dir,
+            id,
+            &state
+                .ctx
+                .db,
+        )
+        .await;
+    }
 
     if let Some(tags) = &payload.tags {
         set_tags(
@@ -3384,11 +3671,15 @@ pub async fn media_segments(
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        RemoteImagesQuery, exclude_episodes_from_search, external_id_infos_for_kind,
+        is_remote_enabled,
+    };
     use chrono::Utc;
     use http::header::HeaderValue;
     use remux_sdks::remux::{
-        CollectionFilter, FilterGroup, FilterMatchMode, FilterRule, SetOp,
-        VideoContainer,
+        CollectionFilter, FilterGroup, FilterMatchMode, FilterRule, GetItemsQuery,
+        MediaType, NumericOp, ServerConfiguration, SetOp, VideoContainer,
     };
     use uuid::Uuid;
 
@@ -3400,6 +3691,123 @@ mod tests {
             insert_test_source_of_kind,
         },
     };
+
+    #[test]
+    fn remote_images_query_accepts_include_all_languages() {
+        let query: RemoteImagesQuery = serde_urlencoded::from_str(
+            "type=Primary&startIndex=0&limit=6&IncludeAllLanguages=true",
+        )
+        .unwrap();
+
+        assert_eq!(
+            query
+                .kind
+                .as_deref(),
+            Some("Primary")
+        );
+        assert_eq!(query.include_all_languages, Some(true));
+    }
+
+    /// An unscoped search (no explicit `IncludeItemTypes`) must consider IPTV
+    /// channels and their EPG program listings — otherwise they're silently
+    /// unsearchable outside an explicit type-filtered query (#474).
+    #[test]
+    fn default_requested_item_types_include_tv_channels_and_programs() {
+        let types = GetItemsQuery::default().get_requested_item_types();
+        assert!(types.contains(&MediaType::TvChannel));
+        assert!(types.contains(&MediaType::TvProgram));
+    }
+
+    /// IPTV/EPG content must never be dispatched to a remote addon search —
+    /// there's no remote-addon concept of "search for a program", and it
+    /// should always resolve from the local library instead (#474).
+    #[test]
+    fn tv_channel_and_program_search_is_never_remote_by_default() {
+        let cfg = ServerConfiguration::default();
+        assert!(!is_remote_enabled(&cfg, &db::MediaKind::TvChannel));
+        assert!(!is_remote_enabled(&cfg, &db::MediaKind::TvProgram));
+        // Sanity check the function isn't just always false.
+        assert!(is_remote_enabled(&cfg, &db::MediaKind::Movie));
+    }
+
+    #[test]
+    fn search_excludes_episodes_without_changing_non_search_queries() {
+        let mut search = GetItemsQuery {
+            search_term: Some("term".to_string()),
+            include_item_types: Some(vec![MediaType::Movie, MediaType::Episode]),
+            ..Default::default()
+        };
+
+        exclude_episodes_from_search(&mut search);
+
+        assert_eq!(search.include_item_types, Some(vec![MediaType::Movie]));
+        assert_eq!(search.exclude_item_types, Some(vec![MediaType::Episode]));
+
+        let mut browse = GetItemsQuery {
+            include_item_types: Some(vec![MediaType::Episode]),
+            ..Default::default()
+        };
+        exclude_episodes_from_search(&mut browse);
+        assert_eq!(browse.include_item_types, Some(vec![MediaType::Episode]));
+        assert_eq!(browse.exclude_item_types, None);
+    }
+
+    #[test]
+    fn external_id_infos_tailored_to_movie() {
+        let infos = external_id_infos_for_kind(db::MediaKind::Movie);
+        let keys: Vec<&str> = infos
+            .iter()
+            .map(|i| {
+                i.key
+                    .as_str()
+            })
+            .collect();
+        assert_eq!(keys, vec!["Imdb", "Tmdb", "Tvdb"]);
+        assert_eq!(
+            infos
+                .iter()
+                .find(|i| i.key == "Tmdb")
+                .unwrap()
+                .type_,
+            Some("Movie".to_string())
+        );
+        assert_eq!(
+            infos
+                .iter()
+                .find(|i| i.key == "Imdb")
+                .unwrap()
+                .type_,
+            None
+        );
+    }
+
+    #[test]
+    fn external_id_infos_tailored_to_person() {
+        let infos = external_id_infos_for_kind(db::MediaKind::Person);
+        assert_eq!(
+            infos
+                .iter()
+                .find(|i| i.key == "Tvdb")
+                .unwrap()
+                .type_,
+            Some("Person".to_string())
+        );
+    }
+
+    #[test]
+    fn external_id_infos_empty_for_collection() {
+        // TmdbAddon::supports (and every other meta addon) never fetches
+        // for MediaKind::Collection, so a BoxSet's tmdb/tvdb id would be a
+        // dead-end field with no downstream effect.
+        assert!(external_id_infos_for_kind(db::MediaKind::Collection).is_empty());
+    }
+
+    #[test]
+    fn external_id_infos_empty_for_unsupported_kinds() {
+        assert!(external_id_infos_for_kind(db::MediaKind::Track).is_empty());
+        assert!(external_id_infos_for_kind(db::MediaKind::Album).is_empty());
+        assert!(external_id_infos_for_kind(db::MediaKind::Artist).is_empty());
+    }
 
     async fn get_user_id(server: &axum_test::TestServer, auth: &str) -> String {
         let resp: serde_json::Value = server
@@ -3424,6 +3832,19 @@ mod tests {
                 rules: vec![FilterRule::Tag {
                     op: SetOp::In,
                     values: vec![tag.to_string()],
+                }],
+            }],
+        }
+    }
+
+    fn catalog_filter(catalog_id: Uuid) -> CollectionFilter {
+        CollectionFilter {
+            match_mode: FilterMatchMode::All,
+            groups: vec![FilterGroup {
+                match_mode: FilterMatchMode::All,
+                rules: vec![FilterRule::Catalog {
+                    op: SetOp::In,
+                    catalog_ids: vec![catalog_id],
                 }],
             }],
         }
@@ -3488,6 +3909,178 @@ mod tests {
             .await
             .expect("insert_media failed");
         m
+    }
+
+    async fn add_genre(db: &sqlx::SqlitePool, media_id: Uuid, genre: &str) {
+        let pairs = db::build_genre_relations_from_names(
+            media_id,
+            &[genre.to_string()],
+            db::MediaKind::Genre,
+        );
+        let genres: Vec<_> = pairs
+            .iter()
+            .map(|(_, media)| media.clone())
+            .collect();
+        let relations: Vec<_> = pairs
+            .into_iter()
+            .map(|(relation, _)| relation)
+            .collect();
+        db::Media::upsert(db, &genres)
+            .await
+            .unwrap();
+        db::MediaRelation::upsert(db, &relations)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn genres_for_smart_collection_only_include_matching_items() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let db = &guard
+            .0
+            .db;
+        let catalog_id = Uuid::new_v4();
+
+        let collection = insert_smart_collection_with_filter(
+            db,
+            "Music Videos",
+            db::CollectionMediaKind::Series,
+            Some(catalog_filter(catalog_id)),
+        )
+        .await;
+        let included =
+            insert_media(db, "Included Series", db::MediaKind::Series, "tt1000001")
+                .await;
+        let unrelated =
+            insert_media(db, "Unrelated Series", db::MediaKind::Series, "tt1000002")
+                .await;
+        db::MediaRelation::upsert(
+            db,
+            &[db::MediaRelation {
+                left_media_id: catalog_id,
+                right_media_id: included.id,
+                role: Some(db::RelationRole::Catalog),
+                ..Default::default()
+            }],
+        )
+        .await
+        .unwrap();
+        add_genre(db, included.id, "Live").await;
+        add_genre(db, unrelated.id, "Gaming").await;
+
+        let response: serde_json::Value = server
+            .get("/genres")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .add_query_param(
+                "ParentId",
+                collection
+                    .id
+                    .to_string(),
+            )
+            .await
+            .json();
+        let names: Vec<&str> = response["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["Name"].as_str())
+            .collect();
+
+        assert_eq!(names, vec!["Live"]);
+        assert_eq!(response["TotalRecordCount"], 1);
+    }
+
+    #[tokio::test]
+    async fn genres_for_smart_collection_scope_user_rules_to_requester() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let db = &guard
+            .0
+            .db;
+        let requester = db::User::get_by_username(db, "test")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut other_user = db::User::new_with_password(
+            String::new(),
+            "other-user".into(),
+            "test",
+            None,
+        )
+        .unwrap();
+        other_user
+            .save(db)
+            .await
+            .unwrap();
+
+        let collection = insert_smart_collection_with_filter(
+            db,
+            "Favorite Videos",
+            db::CollectionMediaKind::Series,
+            Some(CollectionFilter {
+                match_mode: FilterMatchMode::All,
+                groups: vec![FilterGroup {
+                    match_mode: FilterMatchMode::All,
+                    rules: vec![FilterRule::Favorite { value: true }],
+                }],
+            }),
+        )
+        .await;
+        let requester_item =
+            insert_media(db, "Requester Video", db::MediaKind::Series, "tt1000003")
+                .await;
+        let other_user_item =
+            insert_media(db, "Other User Video", db::MediaKind::Series, "tt1000004")
+                .await;
+        add_genre(db, requester_item.id, "Official Video").await;
+        add_genre(db, other_user_item.id, "Tutorials").await;
+
+        let mut requester_state =
+            db::UserMediaState::get_or_new(db, &requester, &requester_item)
+                .await
+                .unwrap();
+        requester_state.favorite = true;
+        requester_state
+            .save(db)
+            .await
+            .unwrap();
+        let mut other_user_state =
+            db::UserMediaState::get_or_new(db, &other_user, &other_user_item)
+                .await
+                .unwrap();
+        other_user_state.favorite = true;
+        other_user_state
+            .save(db)
+            .await
+            .unwrap();
+
+        let response: serde_json::Value = server
+            .get("/genres")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .add_query_param(
+                "ParentId",
+                collection
+                    .id
+                    .to_string(),
+            )
+            .await
+            .json();
+        let names: Vec<&str> = response["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["Name"].as_str())
+            .collect();
+
+        assert_eq!(names, vec!["Official Video"]);
+        assert_eq!(response["TotalRecordCount"], 1);
     }
 
     async fn insert_smart_collection(
@@ -3675,6 +4268,237 @@ mod tests {
         );
     }
 
+    async fn insert_episode(
+        db: &sqlx::SqlitePool,
+        title: &str,
+        series: &db::Media,
+    ) -> db::Media {
+        use std::sync::atomic::{AtomicI64, Ordering};
+        static EP_COUNTER: AtomicI64 = AtomicI64::new(1);
+        let idx = EP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let now = chrono::Utc::now().naive_utc();
+        let mut ep = db::Media {
+            title: title.to_string(),
+            kind: db::MediaKind::Episode,
+            parent_id: Some(series.id),
+            grandparent_id: Some(series.id),
+            idx: Some(idx),
+            created_at: now,
+            updated_at: now,
+            ..Default::default()
+        };
+        ep.save(db)
+            .await
+            .expect("insert_episode failed");
+        ep
+    }
+
+    async fn mark_played(db: &sqlx::SqlitePool, media: &db::Media) {
+        let user: db::User = sqlx::query_as("SELECT * FROM users LIMIT 1")
+            .fetch_one(db)
+            .await
+            .unwrap();
+        let mut ms = db::UserMediaState::get_or_new(db, &user, media)
+            .await
+            .unwrap();
+        ms.play_count = 1;
+        ms.save(db)
+            .await
+            .unwrap();
+    }
+
+    // Recursive=true + IncludeItemTypes=Episode + Filters=IsPlayed must return
+    // only played episodes under a smart series collection, not zero.
+    #[tokio::test]
+    async fn test_recursive_episode_isplayed_under_smart_collection() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let db = &guard
+            .0
+            .db;
+
+        let collection =
+            insert_smart_collection(db, "Shows", db::CollectionMediaKind::Series).await;
+        let series =
+            insert_media(db, "Breaking Bad", db::MediaKind::Series, "tt0903747").await;
+        let ep_played = insert_episode(db, "Pilot", &series).await;
+        let _ep_unplayed = insert_episode(db, "Cat's in the Bag", &series).await;
+        mark_played(db, &ep_played).await;
+
+        let user_id = get_user_id(&server, &auth).await;
+
+        let resp = server
+            .get(&format!("/users/{user_id}/items"))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .add_query_params(&[
+                (
+                    "parentId",
+                    collection
+                        .id
+                        .to_string()
+                        .as_str(),
+                ),
+                ("recursive", "true"),
+                ("includeItemTypes", "Episode"),
+                ("filters", "IsPlayed"),
+            ])
+            .await;
+
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        assert_eq!(
+            body["TotalRecordCount"]
+                .as_i64()
+                .unwrap_or(0),
+            1,
+            "must return exactly the 1 played episode"
+        );
+        let name = body["Items"][0]["Name"]
+            .as_str()
+            .unwrap_or("");
+        assert_eq!(name, "Pilot");
+    }
+
+    // Recursive=true + IncludeItemTypes=Episode with a tag-filtered collection
+    // must only return episodes from series that satisfy the filter, not all episodes.
+    #[tokio::test]
+    async fn test_recursive_episode_respects_collection_filter() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let db = &guard
+            .0
+            .db;
+
+        // Collection only allows series tagged "action".
+        let collection = insert_smart_collection_with_filter(
+            db,
+            "Action Shows",
+            db::CollectionMediaKind::Series,
+            Some(tag_filter("action")),
+        )
+        .await;
+
+        let series_a =
+            insert_media(db, "Series A", db::MediaKind::Series, "tt9000001").await;
+        let series_b =
+            insert_media(db, "Series B", db::MediaKind::Series, "tt9000002").await;
+
+        // Tag only series A with "action".
+        sqlx::query("INSERT OR IGNORE INTO media_tags (media_id, tag) VALUES (?, ?)")
+            .bind(series_a.id)
+            .bind("action")
+            .execute(db)
+            .await
+            .unwrap();
+
+        let ep_a = insert_episode(db, "Episode A1", &series_a).await;
+        let _ep_b = insert_episode(db, "Episode B1", &series_b).await;
+
+        let user_id = get_user_id(&server, &auth).await;
+
+        let resp = server
+            .get(&format!("/users/{user_id}/items"))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .add_query_params(&[
+                (
+                    "parentId",
+                    collection
+                        .id
+                        .to_string()
+                        .as_str(),
+                ),
+                ("recursive", "true"),
+                ("includeItemTypes", "Episode"),
+            ])
+            .await;
+
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        assert_eq!(
+            body["TotalRecordCount"]
+                .as_i64()
+                .unwrap_or(0),
+            1,
+            "must only return episode from the tagged series"
+        );
+        let id = body["Items"][0]["Id"]
+            .as_str()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        assert_eq!(
+            id,
+            ep_a.id
+                .to_string()
+                .replace('-', "")
+        );
+    }
+
+    // Mixed IncludeItemTypes=Movie,Episode under a series-only smart collection with
+    // Filters=IsPlayed must return only played episodes — movies must be excluded.
+    #[tokio::test]
+    async fn test_recursive_mixed_types_movie_excluded_from_series_collection() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let db = &guard
+            .0
+            .db;
+
+        let collection =
+            insert_smart_collection(db, "Shows", db::CollectionMediaKind::Series).await;
+        let series =
+            insert_media(db, "The Wire", db::MediaKind::Series, "tt0306414").await;
+        let ep = insert_episode(db, "The Target", &series).await;
+        let movie =
+            insert_media(db, "Inception", db::MediaKind::Movie, "tt1375666").await;
+
+        mark_played(db, &ep).await;
+        mark_played(db, &movie).await;
+
+        let user_id = get_user_id(&server, &auth).await;
+
+        let resp = server
+            .get(&format!("/users/{user_id}/items"))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .add_query_params(&[
+                (
+                    "parentId",
+                    collection
+                        .id
+                        .to_string()
+                        .as_str(),
+                ),
+                ("recursive", "true"),
+                ("includeItemTypes", "Movie,Episode"),
+                ("filters", "IsPlayed"),
+            ])
+            .await;
+
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        assert_eq!(
+            body["TotalRecordCount"]
+                .as_i64()
+                .unwrap_or(0),
+            1,
+            "only the episode must be returned, not the movie"
+        );
+        assert_eq!(
+            body["Items"][0]["Type"]
+                .as_str()
+                .unwrap_or(""),
+            "Episode"
+        );
+    }
+
     // /UserViews must not return a promoted smart collection with no matching content.
     #[tokio::test]
     async fn userviews_hides_empty_smart_collection() {
@@ -3721,6 +4545,267 @@ mod tests {
         assert!(
             !names.contains(&"Empty Provider Shows"),
             "empty smart collection must not appear in /UserViews; got: {names:?}"
+        );
+    }
+
+    // Regression #425: a promoted collection-of-collections with no
+    // sub-collections at all yet (just created) must still show — #414 only
+    // meant to hide a group container whose *existing* children are all
+    // empty, not one that hasn't been populated yet.
+    #[tokio::test]
+    async fn userviews_keeps_freshly_promoted_group_container_with_no_children_yet() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let db = &guard
+            .0
+            .db;
+
+        let mut group = db::Media {
+            title: "Fresh group".to_string(),
+            kind: db::MediaKind::Collection,
+            collection_kind: Some(db::CollectionKind::Manual),
+            collection_media_kind: Some(db::CollectionMediaKind::Collection),
+            promoted: true,
+            ..Default::default()
+        };
+        group
+            .save(db)
+            .await
+            .unwrap();
+
+        let body: serde_json::Value = server
+            .get("/userviews")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await
+            .json();
+        let group_id = group
+            .id
+            .to_string()
+            .replace('-', "");
+
+        assert!(
+            body["Items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["Id"].as_str() == Some(group_id.as_str())),
+            "a group container with no sub-collections yet must still appear in /UserViews; got: {body}"
+        );
+    }
+
+    // Regression #414: a promoted collection-of-collections must disappear
+    // from /UserViews when every child collection is empty.
+    #[tokio::test]
+    async fn userviews_hides_group_container_with_only_empty_subcollections() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let db = &guard
+            .0
+            .db;
+
+        let mut group = db::Media {
+            title: "Empty group".to_string(),
+            kind: db::MediaKind::Collection,
+            collection_kind: Some(db::CollectionKind::Manual),
+            collection_media_kind: Some(db::CollectionMediaKind::Collection),
+            promoted: true,
+            ..Default::default()
+        };
+        group
+            .save(db)
+            .await
+            .unwrap();
+
+        let mut child = db::Media {
+            title: "Empty child".to_string(),
+            kind: db::MediaKind::Collection,
+            collection_kind: Some(db::CollectionKind::Smart),
+            collection_media_kind: Some(db::CollectionMediaKind::Movie),
+            collection_smart_filter: Some(tag_filter("provider:NobodyHasThis")),
+            promoted: false,
+            ..Default::default()
+        };
+        child
+            .save(db)
+            .await
+            .unwrap();
+        db::Media::set_parent_id(db, &[child.id], Some(group.id))
+            .await
+            .unwrap();
+
+        let body: serde_json::Value = server
+            .get("/userviews")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await
+            .json();
+        let group_id = group
+            .id
+            .to_string()
+            .replace('-', "");
+
+        assert!(
+            !body["Items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["Id"].as_str() == Some(group_id.as_str())),
+            "group container with only empty subcollections must not appear in /UserViews; got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn userviews_hides_nested_empty_group_containers() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let db = &guard
+            .0
+            .db;
+
+        let mut root = db::Media {
+            title: "Empty root group".to_string(),
+            kind: db::MediaKind::Collection,
+            collection_kind: Some(db::CollectionKind::Manual),
+            collection_media_kind: Some(db::CollectionMediaKind::Collection),
+            promoted: true,
+            ..Default::default()
+        };
+        root.save(db)
+            .await
+            .unwrap();
+
+        let mut nested = db::Media {
+            title: "Empty nested group".to_string(),
+            kind: db::MediaKind::Collection,
+            collection_kind: Some(db::CollectionKind::Manual),
+            collection_media_kind: Some(db::CollectionMediaKind::Collection),
+            parent_id: Some(root.id),
+            ..Default::default()
+        };
+        nested
+            .save(db)
+            .await
+            .unwrap();
+
+        let mut leaf = db::Media {
+            title: "Empty nested child".to_string(),
+            kind: db::MediaKind::Collection,
+            collection_kind: Some(db::CollectionKind::Smart),
+            collection_media_kind: Some(db::CollectionMediaKind::Movie),
+            collection_smart_filter: Some(tag_filter("provider:NobodyHasThis")),
+            parent_id: Some(nested.id),
+            ..Default::default()
+        };
+        leaf.save(db)
+            .await
+            .unwrap();
+
+        let body: serde_json::Value = server
+            .get("/userviews")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await
+            .json();
+        let root_id = root
+            .id
+            .to_string()
+            .replace('-', "");
+
+        assert!(
+            !body["Items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["Id"].as_str() == Some(root_id.as_str())),
+            "nested empty group containers must not appear in /UserViews; got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn userviews_keeps_group_container_with_populated_subcollection() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let db = &guard
+            .0
+            .db;
+
+        let mut group = db::Media {
+            title: "Populated group".to_string(),
+            kind: db::MediaKind::Collection,
+            collection_kind: Some(db::CollectionKind::Manual),
+            collection_media_kind: Some(db::CollectionMediaKind::Collection),
+            promoted: true,
+            ..Default::default()
+        };
+        group
+            .save(db)
+            .await
+            .unwrap();
+
+        let mut child = db::Media {
+            title: "Populated child".to_string(),
+            kind: db::MediaKind::Collection,
+            collection_kind: Some(db::CollectionKind::Manual),
+            collection_media_kind: Some(db::CollectionMediaKind::Movie),
+            parent_id: Some(group.id),
+            ..Default::default()
+        };
+        child
+            .save(db)
+            .await
+            .unwrap();
+
+        let external_ids = ExternalIds {
+            imdb: Some(NonEmptyString::try_new("tt_issue414".to_string()).unwrap()),
+            ..Default::default()
+        };
+        let mut movie = db::Media {
+            id: Uuid::from(&MediaIdRaw {
+                kind: db::MediaKind::Movie,
+                external_ids: external_ids.clone(),
+                season: None,
+                episode: None,
+            }),
+            title: "Collection member".to_string(),
+            kind: db::MediaKind::Movie,
+            external_ids,
+            ..Default::default()
+        };
+        movie
+            .save(db)
+            .await
+            .unwrap();
+        db::MediaRelation::add_collection_items(db, &child.id, &[movie.id])
+            .await
+            .unwrap();
+
+        let body: serde_json::Value = server
+            .get("/userviews")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await
+            .json();
+        let group_id = group
+            .id
+            .to_string()
+            .replace('-', "");
+
+        assert!(
+            body["Items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["Id"].as_str() == Some(group_id.as_str())),
+            "group container with a populated subcollection must appear in /UserViews; got: {body}"
         );
     }
 
@@ -4781,6 +5866,611 @@ mod tests {
             indices,
             vec![1, 2, 3],
             "episodes must be in episode-number order, got {indices:?}"
+        );
+    }
+
+    async fn set_max_parental_rating(db: &sqlx::SqlitePool, rating: i32) {
+        let mut user: db::User = sqlx::query_as("SELECT * FROM users LIMIT 1")
+            .fetch_one(db)
+            .await
+            .unwrap();
+        let mut policy = user
+            .policy
+            .as_ref()
+            .map(|p| {
+                p.0.clone()
+            })
+            .unwrap_or_default();
+        policy.max_parental_rating = Some(rating);
+        user.policy = Some(sqlx::types::Json(policy));
+        user.save(db)
+            .await
+            .unwrap();
+    }
+
+    fn parental_rating_filter(max_age: i64) -> CollectionFilter {
+        CollectionFilter {
+            match_mode: FilterMatchMode::All,
+            groups: vec![FilterGroup {
+                match_mode: FilterMatchMode::All,
+                rules: vec![FilterRule::ParentalRating {
+                    op: NumericOp::Lt,
+                    value: max_age,
+                }],
+            }],
+        }
+    }
+
+    // Episode with no certification_age; series has certification_age=13.
+    // max_parental_rating=13 must pass the episode through via grandparent fallback.
+    #[tokio::test]
+    async fn test_max_parental_rating_episode_inherits_series_rating_pass() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let db = &guard
+            .0
+            .db;
+        let user_id = get_user_id(&server, &auth).await;
+
+        let mut series =
+            insert_media(db, "Teen Drama", db::MediaKind::Series, "tt8800001").await;
+        series.certification_age = Some(13);
+        series
+            .save(db)
+            .await
+            .unwrap();
+        let _ep = insert_episode(db, "Pilot", &series).await;
+
+        set_max_parental_rating(db, 13).await;
+
+        let resp = server
+            .get(&format!("/users/{user_id}/items"))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .add_query_params(&[("includeItemTypes", "Episode")])
+            .await;
+
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        assert_eq!(
+            body["TotalRecordCount"]
+                .as_i64()
+                .unwrap_or(0),
+            1,
+            "episode whose series rating equals max must pass"
+        );
+    }
+
+    // Episode with no certification_age; series has certification_age=16.
+    // max_parental_rating=13 must block the episode via grandparent fallback.
+    #[tokio::test]
+    async fn test_max_parental_rating_episode_inherits_series_rating_block() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let db = &guard
+            .0
+            .db;
+        let user_id = get_user_id(&server, &auth).await;
+
+        let mut series =
+            insert_media(db, "Adult Drama", db::MediaKind::Series, "tt8800002").await;
+        series.certification_age = Some(16);
+        series
+            .save(db)
+            .await
+            .unwrap();
+        let _ep = insert_episode(db, "Pilot", &series).await;
+
+        set_max_parental_rating(db, 13).await;
+
+        let resp = server
+            .get(&format!("/users/{user_id}/items"))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .add_query_params(&[("includeItemTypes", "Episode")])
+            .await;
+
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        assert_eq!(
+            body["TotalRecordCount"]
+                .as_i64()
+                .unwrap_or(0),
+            0,
+            "episode whose series rating exceeds max must be blocked"
+        );
+    }
+
+    // Episode with no certification_age; series also has no certification_age.
+    // max_parental_rating must block the episode (unrated is not treated as safe).
+    #[tokio::test]
+    async fn test_max_parental_rating_unrated_series_blocks_episode() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let db = &guard
+            .0
+            .db;
+        let user_id = get_user_id(&server, &auth).await;
+
+        let series =
+            insert_media(db, "Unrated Show", db::MediaKind::Series, "tt8800003").await;
+        let _ep = insert_episode(db, "Pilot", &series).await;
+
+        set_max_parental_rating(db, 13).await;
+
+        let resp = server
+            .get(&format!("/users/{user_id}/items"))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .add_query_params(&[("includeItemTypes", "Episode")])
+            .await;
+
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        assert_eq!(
+            body["TotalRecordCount"]
+                .as_i64()
+                .unwrap_or(0),
+            0,
+            "episode with no rating and no series rating must be blocked"
+        );
+    }
+
+    // ParentalRating filter_rule with Lt=13: episode with unrated self but series=13 must pass.
+    #[tokio::test]
+    async fn test_filter_rule_parental_rating_episode_inherits_series_pass() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let db = &guard
+            .0
+            .db;
+        let user_id = get_user_id(&server, &auth).await;
+
+        let mut series =
+            insert_media(db, "Teen Show", db::MediaKind::Series, "tt8800004").await;
+        series.certification_age = Some(13);
+        series
+            .save(db)
+            .await
+            .unwrap();
+        let _ep = insert_episode(db, "Pilot", &series).await;
+
+        let collection = insert_smart_collection_with_filter(
+            db,
+            "Kids Shows",
+            db::CollectionMediaKind::Series,
+            Some(parental_rating_filter(13)),
+        )
+        .await;
+
+        let resp = server
+            .get(&format!("/users/{user_id}/items"))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .add_query_params(&[
+                (
+                    "parentId",
+                    collection
+                        .id
+                        .to_string()
+                        .as_str(),
+                ),
+                ("recursive", "true"),
+                ("includeItemTypes", "Episode"),
+            ])
+            .await;
+
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        assert_eq!(
+            body["TotalRecordCount"]
+                .as_i64()
+                .unwrap_or(0),
+            1,
+            "episode under series with rating<=max must appear"
+        );
+    }
+
+    // ParentalRating filter_rule with Lt=13: episode under series with rating=16 must be blocked.
+    #[tokio::test]
+    async fn test_filter_rule_parental_rating_episode_inherits_series_block() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let db = &guard
+            .0
+            .db;
+        let user_id = get_user_id(&server, &auth).await;
+
+        let mut series =
+            insert_media(db, "Adult Show", db::MediaKind::Series, "tt8800005").await;
+        series.certification_age = Some(16);
+        series
+            .save(db)
+            .await
+            .unwrap();
+        let _ep = insert_episode(db, "Pilot", &series).await;
+
+        let collection = insert_smart_collection_with_filter(
+            db,
+            "Kids Shows 2",
+            db::CollectionMediaKind::Series,
+            Some(parental_rating_filter(13)),
+        )
+        .await;
+
+        let resp = server
+            .get(&format!("/users/{user_id}/items"))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .add_query_params(&[
+                (
+                    "parentId",
+                    collection
+                        .id
+                        .to_string()
+                        .as_str(),
+                ),
+                ("recursive", "true"),
+                ("includeItemTypes", "Episode"),
+            ])
+            .await;
+
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        assert_eq!(
+            body["TotalRecordCount"]
+                .as_i64()
+                .unwrap_or(0),
+            0,
+            "episode under series with rating>max must be blocked"
+        );
+    }
+
+    // Season has no own certification_age; it inherits via grandparent_id → series.
+    // max_parental_rating=13 must pass a season whose series is rated 13.
+    #[tokio::test]
+    async fn test_max_parental_rating_season_inherits_series_rating_pass() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let db = &guard
+            .0
+            .db;
+        let user_id = get_user_id(&server, &auth).await;
+
+        let mut series =
+            insert_media(db, "Teen Series", db::MediaKind::Series, "tt8900001").await;
+        series.certification_age = Some(13);
+        series
+            .save(db)
+            .await
+            .unwrap();
+
+        let now = chrono::Utc::now().naive_utc();
+        let mut season = db::Media {
+            title: "Season 1".to_string(),
+            kind: db::MediaKind::Season,
+            parent_id: Some(series.id),
+            grandparent_id: Some(series.id),
+            idx: Some(1),
+            released_at: Some(now - chrono::Duration::days(365)),
+            created_at: now,
+            updated_at: now,
+            ..Default::default()
+        };
+        season
+            .save(db)
+            .await
+            .unwrap();
+
+        set_max_parental_rating(db, 13).await;
+
+        let resp = server
+            .get(&format!("/users/{user_id}/items"))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .add_query_params(&[("includeItemTypes", "Season")])
+            .await;
+
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        assert_eq!(
+            body["TotalRecordCount"]
+                .as_i64()
+                .unwrap_or(0),
+            1,
+            "season whose series rating equals max must pass"
+        );
+    }
+
+    // max_parental_rating=13 must block a season whose series is rated 16.
+    #[tokio::test]
+    async fn test_max_parental_rating_season_inherits_series_rating_block() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let db = &guard
+            .0
+            .db;
+        let user_id = get_user_id(&server, &auth).await;
+
+        let mut series =
+            insert_media(db, "Adult Series", db::MediaKind::Series, "tt8900002").await;
+        series.certification_age = Some(16);
+        series
+            .save(db)
+            .await
+            .unwrap();
+
+        let now = chrono::Utc::now().naive_utc();
+        let mut season = db::Media {
+            title: "Season 1".to_string(),
+            kind: db::MediaKind::Season,
+            parent_id: Some(series.id),
+            grandparent_id: Some(series.id),
+            idx: Some(1),
+            released_at: Some(now - chrono::Duration::days(365)),
+            created_at: now,
+            updated_at: now,
+            ..Default::default()
+        };
+        season
+            .save(db)
+            .await
+            .unwrap();
+
+        set_max_parental_rating(db, 13).await;
+
+        let resp = server
+            .get(&format!("/users/{user_id}/items"))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .add_query_params(&[("includeItemTypes", "Season")])
+            .await;
+
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        assert_eq!(
+            body["TotalRecordCount"]
+                .as_i64()
+                .unwrap_or(0),
+            0,
+            "season whose series rating exceeds max must be blocked"
+        );
+    }
+
+    async fn insert_media_with_provider_ids(
+        db: &sqlx::SqlitePool,
+        title: &str,
+        kind: db::MediaKind,
+        imdb: &str,
+        tmdb: Option<i64>,
+        tvdb: Option<i64>,
+    ) -> db::Media {
+        let now = Utc::now().naive_utc();
+        let ext = ExternalIds {
+            imdb: Some(NonEmptyString::try_new(imdb.to_string()).unwrap()),
+            tmdb,
+            tvdb,
+            ..Default::default()
+        };
+        let id = Uuid::from(&MediaIdRaw {
+            kind: kind.clone(),
+            external_ids: ext.clone(),
+            season: None,
+            episode: None,
+        });
+        let released = now - chrono::Duration::days(800);
+        let mut m = db::Media {
+            id,
+            title: title.to_string(),
+            kind,
+            external_ids: ext,
+            created_at: now,
+            updated_at: now,
+            released_at: Some(released),
+            digital_released_at: Some(released),
+            ..Default::default()
+        };
+        m.save(db)
+            .await
+            .expect("insert_media_with_provider_ids failed");
+        m
+    }
+
+    fn item_ids(body: &serde_json::Value) -> Vec<String> {
+        let Some(items) = body["Items"].as_array() else {
+            return Vec::new();
+        };
+        items
+            .iter()
+            .filter_map(|item| {
+                item["Id"]
+                    .as_str()
+                    .map(|id| id.to_ascii_lowercase())
+            })
+            .collect()
+    }
+
+    fn jellyfin_id(id: Uuid) -> String {
+        id.to_string()
+            .replace('-', "")
+            .to_ascii_lowercase()
+    }
+
+    #[tokio::test]
+    async fn any_provider_id_equals_finds_movie_by_tmdb() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let db = &guard
+            .0
+            .db;
+
+        let movie = insert_media_with_provider_ids(
+            db,
+            "Inception",
+            db::MediaKind::Movie,
+            "tt1375666",
+            Some(27205),
+            None,
+        )
+        .await;
+        let stored = db::Media::get_by_id(db, &movie.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored
+                .external_ids
+                .tmdb,
+            Some(27205)
+        );
+        let _other = insert_media_with_provider_ids(
+            db,
+            "The Matrix",
+            db::MediaKind::Movie,
+            "tt0133093",
+            Some(603),
+            None,
+        )
+        .await;
+
+        let user_id = get_user_id(&server, &auth).await;
+        let resp = server
+            .get(&format!("/users/{user_id}/items"))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .add_query_params(&[
+                ("anyProviderIdEquals", "Tmdb.27205"),
+                ("includeItemTypes", "Movie"),
+                ("recursive", "true"),
+                ("fields", "ProviderIds"),
+            ])
+            .await;
+
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        assert_eq!(
+            body["TotalRecordCount"]
+                .as_i64()
+                .unwrap_or(0),
+            1,
+            "http body: {body}"
+        );
+        assert_eq!(item_ids(&body), vec![jellyfin_id(movie.id)]);
+        assert_eq!(
+            body["Items"][0]["ProviderIds"]["Tmdb"].as_str(),
+            Some("27205")
+        );
+    }
+
+    #[tokio::test]
+    async fn any_provider_id_equals_matches_any_listed_provider() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let db = &guard
+            .0
+            .db;
+
+        let movie = insert_media_with_provider_ids(
+            db,
+            "Inception",
+            db::MediaKind::Movie,
+            "tt1375666",
+            Some(27205),
+            None,
+        )
+        .await;
+        let series = insert_media_with_provider_ids(
+            db,
+            "The Wire",
+            db::MediaKind::Series,
+            "tt0306414",
+            Some(1438),
+            Some(79126),
+        )
+        .await;
+
+        let user_id = get_user_id(&server, &auth).await;
+        let resp = server
+            .get("/items")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .add_query_params(&[
+                ("AnyProviderIdEquals", "Tmdb.999,Imdb.tt1375666,Tvdb.79126"),
+                ("Recursive", "true"),
+            ])
+            .await;
+
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        let mut ids = item_ids(&body);
+        ids.sort();
+        let mut expected = vec![jellyfin_id(movie.id), jellyfin_id(series.id)];
+        expected.sort();
+        assert_eq!(ids, expected);
+    }
+
+    #[tokio::test]
+    async fn any_provider_id_equals_unknown_id_returns_empty() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let db = &guard
+            .0
+            .db;
+        let _movie = insert_media_with_provider_ids(
+            db,
+            "Inception",
+            db::MediaKind::Movie,
+            "tt1375666",
+            Some(27205),
+            None,
+        )
+        .await;
+
+        let user_id = get_user_id(&server, &auth).await;
+        let resp = server
+            .get(&format!("/users/{user_id}/items"))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .add_query_params(&[
+                ("AnyProviderIdEquals", "Tmdb.1"),
+                ("IncludeItemTypes", "Movie"),
+                ("Recursive", "true"),
+            ])
+            .await;
+
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        assert_eq!(
+            body["TotalRecordCount"]
+                .as_i64()
+                .unwrap_or(-1),
+            0
+        );
+        assert!(
+            body["Items"]
+                .as_array()
+                .map(|items| items.is_empty())
+                .unwrap_or(false)
         );
     }
 }

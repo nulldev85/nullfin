@@ -39,7 +39,7 @@ use serde_with::skip_serializing_none;
 use sqlx::{Row, SqlitePool};
 use std::{
     self,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env, fs,
     path::Path,
     str::FromStr,
@@ -852,13 +852,58 @@ pub struct Rating {
     pub vote_count: Option<u32>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RemuxDbRatingSource {
+    pub source: String,
+    pub value: f64,
+    pub votes: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RemuxDbRatings {
+    pub score: Option<f64>,
+    pub score_average: Option<f64>,
+    pub tomatoes: Option<f64>,
+    #[serde(default)]
+    pub sources: Vec<RemuxDbRatingSource>,
+    pub updated_at: Option<String>,
+}
+
 #[skip_serializing_none]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ExternalRatings {
     pub tmdb: Option<Rating>,
+    pub remuxdb: Option<RemuxDbRatings>,
 }
 
 impl ExternalRatings {
+    pub fn merge(&mut self, source: &Self, replace: bool) {
+        if replace
+            || self
+                .tmdb
+                .is_none()
+        {
+            self.tmdb = source
+                .tmdb
+                .clone()
+                .or(self
+                    .tmdb
+                    .clone());
+        }
+        if replace
+            || self
+                .remuxdb
+                .is_none()
+        {
+            self.remuxdb = source
+                .remuxdb
+                .clone()
+                .or(self
+                    .remuxdb
+                    .clone());
+        }
+    }
+
     pub fn audience_rating(&self) -> Option<f64> {
         const PRIOR: f64 = 6.5;
         const M: f64 = 500.0;
@@ -1270,6 +1315,9 @@ pub struct MediaFilter {
     /// within the past year are always hidden (theatrical-only, digital date unknown).
     /// Older items without a digital date fall back to `released_at`.
     pub digital_released_before: Option<NaiveDateTime>,
+    /// If set, only return items whose `released_at` is on or after this date.
+    /// Used by /shows/upcoming to surface future-airing episodes.
+    pub released_after: Option<NaiveDateTime>,
     /// Sort order for results. Mapped from Jellyfin's ItemSortBy.
     pub sort_by: Vec<api::ItemSortBy>,
     pub sort_order: Vec<api::SortOrder>,
@@ -1297,6 +1345,8 @@ pub struct MediaFilter {
     pub program_kinds: Option<Vec<ProgramKind>>,
     /// Filter episodes/seasons/tracks by their grandparent (series, artist, etc.).
     pub grandparent_id: Option<Uuid>,
+    /// Filter by multiple grandparent IDs (OR). Used e.g. for upcoming episodes scoped to a collection's series.
+    pub grandparent_ids: Option<Vec<Uuid>>,
     /// Pre-fetched parent item. When set, `get_by_filter` uses it to detect
     /// manual collections and switches to a JOIN on media_relations.
     /// If `parent_id` is set but this is `None`, the non-JOIN path is used.
@@ -1313,6 +1363,8 @@ pub struct MediaFilter {
     /// when empty.
     pub exclude_childless: bool,
     pub exclude_ids: Option<Vec<Uuid>>,
+    /// Emby `AnyProviderIdEquals` — item must match ANY listed provider ID.
+    pub any_provider_ids: Option<api::AnyProviderIds>,
 }
 
 /// Normalise any country string to an ISO 3166-1 alpha-2 code (e.g. "US").
@@ -1409,10 +1461,6 @@ pub struct Media {
     //pub description: Option<String>,
     #[sqlx(skip)]
     pub tags: Vec<String>,
-    /// Set by TMDB meta fetch; written to `popularity_raw` by `save_pending_popularity`.
-    #[sqlx(skip)]
-    #[serde(skip)]
-    pub pending_popularity: Option<(String, crate::addons::MetricValue)>,
     #[sqlx(skip)]
     pub child_count: Option<i64>,
     #[sqlx(skip)]
@@ -1442,12 +1490,17 @@ pub struct Media {
     pub user_state: Option<super::UserMediaState>,
     #[sqlx(skip)]
     pub relations: Option<Vec<(MediaRelation, Media)>>,
-    /// Preloaded direct parent (season, album, channel, etc.).
+    /// Preloaded direct parent (season, album, channel, etc.). `Arc`, not
+    /// `Box`: this gets cloned once per child when fanning out a season's/
+    /// series' children (see `process_meta_item_inner`), and a `Box` clone
+    /// there deep-copies the whole stub — including any embedded relations —
+    /// into every single child instead of sharing one allocation.
     #[sqlx(skip)]
-    pub parent: Option<Box<Media>>,
-    /// Preloaded grandparent (series, artist, etc.).
+    pub parent: Option<Arc<Media>>,
+    /// Preloaded grandparent (series, artist, etc.). See `parent` for why
+    /// this is `Arc` rather than `Box`.
     #[sqlx(skip)]
-    pub grandparent: Option<Box<Media>>,
+    pub grandparent: Option<Arc<Media>>,
 
     // stream
     #[sqlx(json(nullable))]
@@ -1473,6 +1526,8 @@ pub struct Media {
     pub collection_default_sort: Option<Vec<sdks::remux::ItemSortBy>>,
     #[sqlx(json(nullable))]
     pub collection_default_sort_order: Option<Vec<sdks::remux::SortOrder>>,
+    #[sqlx(json(nullable))]
+    pub collection_image_config: Option<sdks::remux::CollectionImageConfig>,
 
     // IPTV / Live TV
     pub live_start: Option<NaiveDateTime>,
@@ -1487,6 +1542,13 @@ pub struct Media {
     /// User-defined name override; takes precedence over `title` for display.
     pub custom_name: Option<String>,
     pub program_kind: Option<ProgramKind>,
+
+    // --- playlist ownership ---
+    /// User that created this playlist. `None` for non-playlist media.
+    pub user_id: Option<Uuid>,
+    /// When true, the playlist is visible to all authenticated users.
+    #[sqlx(default)]
+    pub public: bool,
 
     // --- field locking ---
     /// When true, no metadata provider may overwrite any field on this item.
@@ -1623,7 +1685,7 @@ impl Media {
     /// albums, episodes, seasons, and TV programs, storing them as `self.parent` /
     /// `self.grandparent`. The API layer reads titles and image tags from those
     /// preloaded records instead of from flat denormalised fields.
-    pub async fn preload_parents(db: &SqlitePool, records: &mut Vec<Self>) {
+    pub async fn preload_parents(db: &SqlitePool, records: &mut [Self]) {
         let ids_needed: Vec<Uuid> = records
             .iter()
             .filter(|m| {
@@ -1716,7 +1778,7 @@ impl Media {
 
         // Build a synthetic Media stub from a ParentRow + its images.
         let make_stub =
-            |row: &ParentRow, images: super::image::MediaImages| -> Box<Media> {
+            |row: &ParentRow, images: super::image::MediaImages| -> Arc<Media> {
                 let mut m = Media::default();
                 m.id = row.id;
                 m.title = row
@@ -1730,7 +1792,7 @@ impl Media {
                     .external_ids
                     .clone();
                 m.images = images;
-                Box::new(m)
+                Arc::new(m)
             };
 
         for media in records.iter_mut() {
@@ -1912,11 +1974,11 @@ impl Media {
 
     /// Build a minimal Media stub with just id and title — used when preloaded
     /// parent/grandparent data is constructed inline rather than fetched from DB.
-    pub fn stub(id: Uuid, title: impl Into<String>) -> Box<Self> {
+    pub fn stub(id: Uuid, title: impl Into<String>) -> Arc<Self> {
         let mut m = Self::default();
         m.id = id;
         m.title = title.into();
-        Box::new(m)
+        Arc::new(m)
     }
 
     pub fn parse_smart_filter(&self) -> Option<&remux_sdks::remux::CollectionFilter> {
@@ -1957,7 +2019,37 @@ pub enum MediaError {
     ValidationError(String),
 }
 
+// `json_extract` returns SQLite's INTEGER storage class for a numeric JSON
+// value — comparing that against a TEXT-bound '123' never matches (SQLite
+// doesn't coerce across storage classes in a bare `=`), so integer-valued
+// fields must bind as an integer, not a stringified one. Used by
+// `Media::find_by_external_ids` and `Media::resolve_ambiguous_external_id`.
+#[derive(Clone, PartialEq)]
+enum IdValue {
+    Text(String),
+    Int(i64),
+}
+
 impl Media {
+    /// Series with in-progress episodes, including those outside the requested page.
+    pub async fn resumable_series_ids(
+        db: &SqlitePool,
+        user_id: Uuid,
+    ) -> Result<std::collections::HashSet<Uuid>> {
+        let ids: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT DISTINCT m.grandparent_id FROM user_media_state ums \
+             JOIN media m ON m.id = ums.media_id \
+             WHERE ums.user_id = ? AND ums.playback_position > 0 \
+             AND m.grandparent_id IS NOT NULL",
+        )
+        .bind(user_id)
+        .fetch_all(db)
+        .await?;
+        Ok(ids
+            .into_iter()
+            .collect())
+    }
+
     pub fn is_live(&self) -> bool {
         self.kind == MediaKind::TvChannel
     }
@@ -2028,6 +2120,30 @@ impl Media {
         }
     }
 
+    /// `media_id_raw`, but for Season/Episode substitutes `ancestor_ext` (the
+    /// grandparent series' `external_ids`) in place of the row's own —
+    /// which for Season/Episode is normally empty (`custom_stremio_type`
+    /// aside), so leaving it as-is would let "Season 1" of two unrelated
+    /// shows collide on the same identity. Pass `None` when the ancestor
+    /// can't be loaded; the result then falls back to `media_id_raw()`.
+    ///
+    /// Used exclusively for identity-based `user_media_state` reattachment
+    /// (`UserMediaState::get_or_new` / `remap_orphaned_for`), not for
+    /// dedup — Season/Episode rows are never deduped against each other,
+    /// their ids are minted deterministically via `season_id`/`episode_id`.
+    pub fn identity_raw(
+        &self,
+        ancestor_ext: Option<&ExternalIds>,
+    ) -> super::MediaIdRaw {
+        let mut raw = self.media_id_raw();
+        if matches!(self.kind, MediaKind::Season | MediaKind::Episode) {
+            if let Some(ext) = ancestor_ext {
+                raw.external_ids = ext.clone();
+            }
+        }
+        raw
+    }
+
     /// All Stremio-formatted IDs this item could be requested under. Convenience wrapper
     /// over `ExternalIds::candidate_ids` that maps Season/Episode index fields correctly.
     pub fn candidate_ids(&self, grandparent_ext: Option<&ExternalIds>) -> Vec<String> {
@@ -2057,7 +2173,7 @@ impl Media {
         {
             if let Some(gp_id) = self.grandparent_id {
                 if let Some(gp) = Self::get_by_id(db, &gp_id).await? {
-                    self.grandparent = Some(Box::new(gp));
+                    self.grandparent = Some(Arc::new(gp));
                 }
             }
         }
@@ -2135,15 +2251,6 @@ impl Media {
         }
 
         let missing = match self.kind {
-            MediaKind::Movie | MediaKind::Series => (self
-                .external_ids
-                .imdb
-                .is_none()
-                && self
-                    .external_ids
-                    .custom_stremio_id
-                    .is_none())
-            .then_some("imdb"),
             MediaKind::Season | MediaKind::Episode => self
                 .grandparent_id
                 .is_none()
@@ -2181,26 +2288,16 @@ impl Media {
             )));
         }
 
-        if matches!(self.kind, MediaKind::Movie | MediaKind::Series) {
-            let raw = self.media_id_raw();
-            if raw
+        if matches!(self.kind, MediaKind::Movie | MediaKind::Series)
+            && self
+                .media_id_raw()
                 .canonical()
                 .is_none()
-            {
-                return Err(MediaError::ValidationError(format!(
-                    "{:?} '{}' has no canonical external ID — cannot assign stable UUID",
-                    self.kind, self.title,
-                )));
-            }
-            let expected = Uuid::from(&raw);
-            if expected != self.id
-                && !Self::ext_id_uuid_candidates(self).contains(&self.id)
-            {
-                return Err(MediaError::ValidationError(format!(
-                    "{:?} '{}' UUID mismatch: id={} expected={}",
-                    self.kind, self.title, self.id, expected
-                )));
-            }
+        {
+            return Err(MediaError::ValidationError(format!(
+                "{:?} '{}' has no canonical external ID",
+                self.kind, self.title,
+            )));
         }
         if self.kind == MediaKind::Person {
             if let Some(tmdb_id) = self
@@ -2235,10 +2332,11 @@ impl Media {
             external_ids, external_ratings, created_at, updated_at, certification, certification_age, parent_idx,
             live_start, live_end, tvg_id, channel_number, enabled, sort_order, custom_name, digital_released_at, status, refreshed_at, grandparent_id,
             collection_smart_filter, country, program_kind, collection_latest_auto_unplayed, collection_latest_sort_digital,
-            collection_default_sort, collection_default_sort_order,
-            original_language, is_locked, locked_fields, album_kind, end_date
+            collection_default_sort, collection_default_sort_order, collection_image_config,
+            original_language, is_locked, locked_fields, album_kind, end_date,
+            user_id, public
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50)
         ON CONFLICT (id) DO UPDATE SET
             title = excluded.title,
             kind = excluded.kind,
@@ -2271,6 +2369,7 @@ impl Media {
             collection_latest_sort_digital = excluded.collection_latest_sort_digital,
             collection_default_sort = excluded.collection_default_sort,
             collection_default_sort_order = excluded.collection_default_sort_order,
+            collection_image_config = COALESCE(excluded.collection_image_config, media.collection_image_config),
             country = COALESCE(excluded.country, media.country),
             updated_at = excluded.updated_at,
             certification = excluded.certification,
@@ -2290,7 +2389,9 @@ impl Media {
             is_locked = excluded.is_locked,
             locked_fields = excluded.locked_fields,
             album_kind = COALESCE(excluded.album_kind, media.album_kind),
-            end_date = COALESCE(excluded.end_date, media.end_date)
+            end_date = COALESCE(excluded.end_date, media.end_date),
+            user_id = COALESCE(excluded.user_id, media.user_id),
+            public = excluded.public
         "#,
         )
         .bind(self.id)
@@ -2335,11 +2436,14 @@ impl Media {
         .bind(self.collection_latest_sort_digital)
         .bind(sqlx::types::Json(&self.collection_default_sort))
         .bind(sqlx::types::Json(&self.collection_default_sort_order))
+        .bind(sqlx::types::Json(&self.collection_image_config))
         .bind(&self.original_language)
         .bind(self.is_locked)
         .bind(sqlx::types::Json(&self.locked_fields))
         .bind(&self.album_kind)
         .bind(self.end_date)
+        .bind(self.user_id)
+        .bind(self.public)
         .execute(db)
         .await?;
 
@@ -2641,9 +2745,10 @@ impl Media {
                 custom_name = media.custom_name,
                 program_kind = excluded.program_kind,
                 original_language = COALESCE(excluded.original_language, media.original_language),
-                -- preserve user-set locks; never let a provider refresh overwrite them
+                -- preserve user-set locks and image config; never let a provider refresh overwrite them
                 is_locked = CASE WHEN media.id IS NOT NULL THEN media.is_locked ELSE excluded.is_locked END,
                 locked_fields = CASE WHEN media.id IS NOT NULL THEN media.locked_fields ELSE excluded.locked_fields END,
+                collection_image_config = COALESCE(media.collection_image_config, excluded.collection_image_config),
                 album_kind = COALESCE(excluded.album_kind, media.album_kind),
                 end_date = COALESCE(excluded.end_date, media.end_date)",
             );
@@ -2694,31 +2799,401 @@ impl Media {
         Ok(())
     }
 
+    /// Look up an existing DB row that shares any strong external ID with the
+    /// given kind/IDs, matching against *stored* `external_ids` directly
+    /// (indexed — see migration `202609030002`) rather than recomputing a
+    /// derived UUID from `ext`. Fixes the asymmetry where a stored row with
+    /// more external IDs than the incoming item was invisible to dedup: the
+    /// old scheme only ever generated candidate UUIDs from the incoming
+    /// item's own IDs, so a stored row that had *gained* an ID since it was
+    /// written (e.g. a Kitsu-only row later matched to an IMDB id) could never
+    /// be found by an incoming item that only knew the new ID.
+    ///
+    /// Covers every root-level kind that carries its own external id:
+    /// Movie/Series/TvProgram (imdb/tmdb/tvdb/kitsu/custom_stremio_id),
+    /// Artist (deezer_artist), Album/Track (deezer_album/deezer_track,
+    /// youtube_id). Returns `None` for Season/Episode (identity is
+    /// positional — see `Media::identity_raw`) and Person without querying.
+    ///
+    /// On multiple distinct matches (different IDs pointing at different
+    /// rows), the strongest ID wins (same priority as `stable_media_uuid`:
+    /// imdb ▸ custom_stremio_id ▸ tmdb ▸ tvdb ▸ kitsu, or deezer ▸ youtube_id
+    /// for music) and the conflict is logged — this is intentionally not
+    /// resolved by merging the rows.
+    /// Point remote results (search, catalog) that already exist locally at
+    /// their stored row: same kind, matching external id. The whole item is
+    /// replaced with the stored row, not just its id — a remote addon's
+    /// payload can drift from what's actually stored (a user's manual edit,
+    /// `is_locked`/`locked_fields`, images), and the moment a client opens
+    /// the item it gets the stored row anyway (`resolve_item` →
+    /// `get_by_id`), so showing the remote version in the interim is
+    /// actively misleading, not just differently fresh. The remote result's
+    /// `relations` (catalog membership, attached by the caller after
+    /// conversion) is preserved across the swap since it isn't a stored
+    /// column and carries no bearing on which row is correct.
+    ///
+    /// Remote results are minted with a fresh id per request and live in the
+    /// in-memory store for an hour. A client that keeps such an id, for
+    /// next-episode autoplay or a continue-watching entry, is left with a
+    /// dead one after that, or after a restart, and gets 404 on
+    /// `/shows/{id}/seasons` while the stored series is fine. Only results
+    /// with a matching row are rewritten; unknown items keep their id.
+    pub async fn adopt_existing_rows(db: &SqlitePool, items: &mut [Media]) {
+        let mut kinds: Vec<MediaKind> = Vec::new();
+        for m in items.iter() {
+            // `ExternalIds::is_empty()` only looks at imdb/tmdb/tvdb/custom —
+            // checking it here would skip Artist/Album/Track kinds, whose
+            // only identity is deezer_*/youtube_id, entirely.
+            // `external_id_fields` covers every kind correctly.
+            if !Self::external_id_fields(&m.kind, &m.external_ids).is_empty()
+                && !kinds.contains(&m.kind)
+            {
+                kinds.push(
+                    m.kind
+                        .clone(),
+                );
+            }
+        }
+        for kind in kinds {
+            let exts: Vec<ExternalIds> = items
+                .iter()
+                .filter(|m| m.kind == kind)
+                .map(|m| {
+                    m.external_ids
+                        .clone()
+                })
+                .collect();
+            let rows = Self::get_many_by_external_ids(db, &kind, &exts).await;
+            if rows.is_empty() {
+                continue;
+            }
+            for m in items
+                .iter_mut()
+                .filter(|m| m.kind == kind)
+            {
+                let fields = Self::external_id_fields(&kind, &m.external_ids);
+                let hit = fields
+                    .iter()
+                    .find_map(|field| {
+                        rows.iter()
+                            .find(|row| {
+                                Self::external_id_fields(&kind, &row.external_ids)
+                                    .contains(field)
+                            })
+                    });
+                if let Some(stored) = hit {
+                    let relations = m
+                        .relations
+                        .take();
+                    *m = stored.clone();
+                    m.relations = relations;
+                }
+            }
+        }
+        // A swapped-in stored row carries none of the remote result's
+        // preloaded parent/grandparent stubs (Track/Album's artist/album
+        // name and artwork, Episode/Season/TvProgram's series) — re-run
+        // unconditionally so the invariant holds regardless of whether the
+        // caller already preloaded before calling this.
+        Self::preload_parents(db, items).await;
+    }
+
+    /// Appends `kind = ? AND (json_extract(external_ids, '$.a') = ? OR
+    /// json_extract(external_ids, '$.b') = ? OR ...)` for `fields` (which
+    /// must be non-empty) to `qb`. Shared by every external-id lookup below
+    /// so the WHERE-clause shape lives in exactly one place.
+    fn push_external_id_where(
+        qb: &mut sqlx::QueryBuilder<sqlx::Sqlite>,
+        kind: &MediaKind,
+        fields: &[(&'static str, IdValue)],
+    ) {
+        qb.push("kind = ");
+        qb.push_bind(kind.to_string());
+        qb.push(" AND (");
+        for (i, (path, value)) in fields
+            .iter()
+            .enumerate()
+        {
+            if i > 0 {
+                qb.push(" OR ");
+            }
+            qb.push("json_extract(external_ids, '")
+                .push(path)
+                .push("') = ");
+            match value {
+                IdValue::Text(s) => qb.push_bind(s.clone()),
+                IdValue::Int(n) => qb.push_bind(*n),
+            };
+        }
+        qb.push(")");
+    }
+
+    /// Like `find_by_external_ids`, but for many items of the same `kind`
+    /// at once — one query (per `SQLITE_VAR_LIMIT` chunk) instead of one per
+    /// `ext`. Returns every stored row (images included) that shares any
+    /// external id with any of `exts`; callers match each of their own
+    /// items against this set themselves; matches only need to be
+    /// deduplicated, not returned in caller order.
+    async fn get_many_by_external_ids(
+        db: &SqlitePool,
+        kind: &MediaKind,
+        exts: &[ExternalIds],
+    ) -> Vec<Media> {
+        let mut wanted: Vec<(&'static str, IdValue)> = Vec::new();
+        for ext in exts {
+            for field in Self::external_id_fields(kind, ext) {
+                if !wanted.contains(&field) {
+                    wanted.push(field);
+                }
+            }
+        }
+        if wanted.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for chunk in wanted.chunks(SQLITE_VAR_LIMIT - 1) {
+            let mut qb = sqlx::QueryBuilder::new("SELECT * FROM media WHERE ");
+            Self::push_external_id_where(&mut qb, kind, chunk);
+            let mut rows: Vec<Media> = qb
+                .build_query_as()
+                .fetch_all(db)
+                .await
+                .unwrap_or_default();
+            let ids: Vec<Uuid> = rows
+                .iter()
+                .map(|m| m.id)
+                .collect();
+            let mut images = MediaImage::get_for_media_ids(db, &ids)
+                .await
+                .unwrap_or_default();
+            for row in &mut rows {
+                row.images = images
+                    .remove(&row.id)
+                    .unwrap_or_default();
+            }
+            out.extend(rows);
+        }
+        out
+    }
+
+    /// `(json path, bound value)` pairs identifying `ext` for `kind`, in
+    /// priority order.
+    fn external_id_fields(
+        kind: &MediaKind,
+        ext: &ExternalIds,
+    ) -> Vec<(&'static str, IdValue)> {
+        // (json path, bound value) in priority order — mirrors stable_media_uuid
+        // for Movie/Series/TvProgram; Artist/Album/Track have no priority
+        // conflict since each carries at most one provider's id in practice.
+        let mut id_fields: Vec<(&'static str, IdValue)> = Vec::with_capacity(5);
+        match kind {
+            MediaKind::Movie | MediaKind::Series | MediaKind::TvProgram => {
+                if let Some(ref imdb) = ext.imdb {
+                    id_fields.push(("$.imdb", IdValue::Text(imdb.to_string())));
+                }
+                if let Some(ref cid) = ext.custom_stremio_id {
+                    id_fields.push(("$.custom_stremio_id", IdValue::Text(cid.clone())));
+                }
+                if let Some(tmdb) = ext.tmdb {
+                    id_fields.push(("$.tmdb", IdValue::Int(tmdb)));
+                }
+                if let Some(tvdb) = ext.tvdb {
+                    id_fields.push(("$.tvdb", IdValue::Int(tvdb)));
+                }
+                if let Some(kitsu) = ext.kitsu {
+                    id_fields.push(("$.kitsu", IdValue::Int(kitsu)));
+                }
+            }
+            MediaKind::Artist => {
+                if let Some(id) = ext.deezer_artist {
+                    id_fields.push(("$.deezer_artist", IdValue::Int(id)));
+                }
+            }
+            MediaKind::Album => {
+                if let Some(id) = ext.deezer_album {
+                    id_fields.push(("$.deezer_album", IdValue::Int(id)));
+                }
+                if let Some(ref yid) = ext.youtube_id {
+                    id_fields.push(("$.youtube_id", IdValue::Text(yid.clone())));
+                }
+            }
+            MediaKind::Track => {
+                if let Some(id) = ext.deezer_track {
+                    id_fields.push(("$.deezer_track", IdValue::Int(id)));
+                }
+                if let Some(ref yid) = ext.youtube_id {
+                    id_fields.push(("$.youtube_id", IdValue::Text(yid.clone())));
+                }
+            }
+            // Season/Episode identity is positional (parent series + index),
+            // not a single external id — never deduped this way, their ids
+            // are minted deterministically via `season_id`/`episode_id`.
+            _ => {}
+        }
+        id_fields
+    }
+
+    pub async fn find_by_external_ids(
+        db: &SqlitePool,
+        kind: &MediaKind,
+        ext: &ExternalIds,
+    ) -> Option<Uuid> {
+        let id_fields = Self::external_id_fields(kind, ext);
+        if id_fields.is_empty() {
+            return None;
+        }
+
+        let mut qb = sqlx::QueryBuilder::new("SELECT DISTINCT id FROM media WHERE ");
+        Self::push_external_id_where(&mut qb, kind, &id_fields);
+
+        let rows: Vec<Uuid> = qb
+            .build_query_scalar()
+            .fetch_all(db)
+            .await
+            .unwrap_or_default();
+
+        match rows.len() {
+            0 => None,
+            1 => Some(rows[0]),
+            // Ambiguous match is rare (multiple distinct rows share an
+            // external id) — extracted into its own `Box::pin`'d fn so its
+            // locals live in a separately heap-allocated future rather than
+            // being inlined into this function's state machine. Inlined
+            // here, the extra QueryBuilder/query locals would be counted
+            // into every caller's stack footprint even on the common
+            // single-match path (the same state-machine-bloat shape that
+            // caused the `get_by_filter_inner` stack overflow) — and this
+            // function sits directly in the search-result playback path
+            // (`resolve_item` -> `persist_from_store`), which a
+            // library-browsed item's fast path never touches.
+            _ => {
+                Box::pin(Self::resolve_ambiguous_external_id(
+                    db, kind, rows, id_fields,
+                ))
+                .await
+            }
+        }
+    }
+
+    /// Every existing row that shares any external ID with `ext`, unlike
+    /// `find_by_external_ids` which collapses an ambiguous match down to a
+    /// single winner. Used to find the *other* row(s) a winner's upsert
+    /// collided with, so they can be merged away instead of left to collide
+    /// again on every future refresh.
+    async fn find_all_by_external_ids(
+        db: &SqlitePool,
+        kind: &MediaKind,
+        ext: &ExternalIds,
+    ) -> Vec<Uuid> {
+        let id_fields = Self::external_id_fields(kind, ext);
+        if id_fields.is_empty() {
+            return Vec::new();
+        }
+        let mut qb = sqlx::QueryBuilder::new("SELECT DISTINCT id FROM media WHERE ");
+        Self::push_external_id_where(&mut qb, kind, &id_fields);
+        qb.build_query_scalar()
+            .fetch_all(db)
+            .await
+            .unwrap_or_default()
+    }
+
+    /// Recovers from a root-media upsert that failed because one of
+    /// `media`'s external IDs is already uniquely owned by a *different*
+    /// row than the one it was about to be written to (see the winner-pick
+    /// in `find_existing_id_by_ext`/`resolve_ambiguous_external_id` — it can
+    /// only ever redirect onto one row, so a second, disjoint match is left
+    /// dangling until an incoming item's ID set spans both). SQLite's
+    /// `ON CONFLICT DO UPDATE` can't resolve that: it only redirects the
+    /// initial insert-vs-PK conflict, not a unique-index collision the
+    /// UPDATE's own `SET` introduces, so the upsert fails outright and
+    /// would otherwise repeat identically on every future refresh.
+    ///
+    /// Finds the other row(s) still holding one of `media`'s external IDs
+    /// and merges each into `media.id`: reparents its children/watch
+    /// state/relations (the same cascade used for id-remap-before-insert),
+    /// then deletes it. Returns `true` if a conflicting row was found and
+    /// merged, so the caller can retry the upsert once.
+    pub async fn merge_conflicting_duplicate(db: &SqlitePool, media: &Self) -> bool {
+        let matches =
+            Self::find_all_by_external_ids(db, &media.kind, &media.external_ids).await;
+        let mut merged_any = false;
+        for loser_id in matches {
+            if loser_id == media.id {
+                continue;
+            }
+            if let Err(e) =
+                Self::cascade_update_parent_refs(db, loser_id, media.id).await
+            {
+                warn!(loser = %loser_id, winner = %media.id, error = %e,
+                    "cascade_update_parent_refs failed during duplicate merge");
+                continue;
+            }
+            if let Err(e) = Self::delete(db, &loser_id).await {
+                warn!(loser = %loser_id, winner = %media.id, error = %e,
+                    "failed to delete merged duplicate row");
+                continue;
+            }
+            warn!(loser = %loser_id, winner = %media.id, kind = %media.kind,
+                "merged duplicate root media row sharing an external id");
+            merged_any = true;
+        }
+        merged_any
+    }
+
+    async fn resolve_ambiguous_external_id(
+        db: &SqlitePool,
+        kind: &MediaKind,
+        rows: Vec<Uuid>,
+        id_fields: Vec<(&'static str, IdValue)>,
+    ) -> Option<Uuid> {
+        // Same WHERE as the caller, but ranked by priority via
+        // `ORDER BY CASE ... END LIMIT 1` — one query picks the
+        // strongest match directly, instead of probing each field
+        // with a separate round trip.
+        let mut qb = sqlx::QueryBuilder::new("SELECT id FROM media WHERE ");
+        Self::push_external_id_where(&mut qb, kind, &id_fields);
+        qb.push(" ORDER BY CASE");
+        for (i, (path, value)) in id_fields
+            .iter()
+            .enumerate()
+        {
+            qb.push(" WHEN json_extract(external_ids, '")
+                .push(path)
+                .push("') = ");
+            match value {
+                IdValue::Text(s) => qb.push_bind(s.clone()),
+                IdValue::Int(n) => qb.push_bind(*n),
+            };
+            qb.push(format!(" THEN {i}"));
+        }
+        qb.push(" ELSE 999 END LIMIT 1");
+
+        let winner: Option<Uuid> = qb
+            .build_query_scalar()
+            .fetch_optional(db)
+            .await
+            .unwrap_or(None);
+        if let Some(id) = winner {
+            warn!(
+                ?rows,
+                winner = %id,
+                kind = %kind,
+                "find_by_external_ids: incoming item's IDs point at multiple distinct rows; \
+                 strongest ID wins"
+            );
+        }
+        winner
+    }
+
     /// Look up an existing DB row that shares any external ID with `self`.
     /// Returns the existing row's UUID so the caller can adopt it before upserting,
     /// preventing duplicate rows when the same content arrives with different canonical IDs.
     ///
-    /// Only called for root-level items (Movie, Series, Artist, Album, Track).
-    /// Season / Episode deduplication uses `(parent_id, kind, idx)` instead.
+    /// Only meaningful for root-level items (Movie, Series, TvProgram, Artist,
+    /// Album, Track) — see `find_by_external_ids`. Season/Episode
+    /// deduplication uses `(parent_id, kind, idx)` instead.
     pub async fn find_existing_id_by_ext(db: &SqlitePool, item: &Self) -> Option<Uuid> {
-        let candidates = Self::ext_id_uuid_candidates(item);
-        if candidates.is_empty() {
-            return None;
-        }
-        let placeholders = candidates
-            .iter()
-            .map(|_| "?")
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!("SELECT id FROM media WHERE id IN ({placeholders}) LIMIT 1");
-        let mut q = sqlx::query_scalar::<_, Uuid>(&sql);
-        for uuid in &candidates {
-            q = q.bind(*uuid);
-        }
-        q.fetch_optional(db)
-            .await
-            .ok()
-            .flatten()
+        Self::find_by_external_ids(db, &item.kind, &item.external_ids).await
     }
 
     /// Stable anchor key for season/episode UUID derivation: the series'
@@ -2755,136 +3230,6 @@ impl Media {
             &MediaKind::Episode,
             &format!("{series_key}:{season_idx}:{ep_idx}"),
         )
-    }
-
-    /// Legacy parent-anchored season UUID (pre-flattening scheme):
-    /// `stable_media_uuid(Season, "{series_uuid}:{season_idx}")`. Only used to
-    /// build migration candidates for rows stored under the old scheme.
-    pub fn season_id_nested(series_uuid: Uuid, season_idx: i64) -> Uuid {
-        crate::common::stable_media_uuid(
-            &MediaKind::Season,
-            &format!("{series_uuid}:{season_idx}"),
-        )
-    }
-
-    /// Legacy parent-anchored episode UUID (pre-flattening scheme):
-    /// `stable_media_uuid(Episode, "{season_uuid}:{ep_idx}")`. Only used to
-    /// build migration candidates for rows stored under the old scheme.
-    pub fn episode_id_nested(season_uuid: Uuid, ep_idx: i64) -> Uuid {
-        crate::common::stable_media_uuid(
-            &MediaKind::Episode,
-            &format!("{season_uuid}:{ep_idx}"),
-        )
-    }
-
-    /// Compute all candidate UUIDs an existing DB row could have been stored under
-    /// for the given item's external IDs. Used by `find_existing_id_by_ext` (dedup)
-    /// and `UserMediaState::get_or_new` (legacy state lookup).
-    ///
-    /// Each external ID is turned into the stable UUID it would produce if it were
-    /// the canonical key at insert time. Seasons/Episodes additionally get the
-    /// parent-anchored UUIDs the Stremio importer writes (recomputed from
-    /// `grandparent_id` + indices) plus flat keys from the grandparent series'
-    /// external IDs. The item's own current UUID is excluded so only *different*
-    /// rows can match.
-    pub fn ext_id_uuid_candidates(item: &Self) -> Vec<Uuid> {
-        use crate::common::stable_media_uuid;
-        let kind = &item.kind;
-        let ext = &item.external_ids;
-        let mut candidates: Vec<Uuid> = Vec::new();
-        match kind {
-            MediaKind::Movie | MediaKind::Series | MediaKind::TvProgram => {
-                if let Some(imdb) = ext
-                    .imdb
-                    .as_deref()
-                {
-                    candidates.push(stable_media_uuid(kind, imdb));
-                }
-                if let Some(custom) = ext
-                    .custom_stremio_id
-                    .as_deref()
-                {
-                    candidates.push(stable_media_uuid(kind, custom));
-                }
-                if let Some(tmdb) = ext.tmdb {
-                    candidates.push(stable_media_uuid(kind, &format!("tmdb:{tmdb}")));
-                }
-                if let Some(tvdb) = ext.tvdb {
-                    candidates.push(stable_media_uuid(kind, &format!("tvdb:{tvdb}")));
-                }
-                if let Some(kitsu) = ext.kitsu {
-                    candidates.push(stable_media_uuid(kind, &format!("kitsu:{kitsu}")));
-                }
-            }
-            MediaKind::Season | MediaKind::Episode => {
-                // Season/Episode UUIDs are not derived from a single external ID:
-                // the Stremio path anchors them to the series UUID
-                // (season = f(series_id, season_idx), episode = f(season_id, ep_idx)),
-                // while other paths use flat keys like f(imdb, season, episode).
-                // After a library purge + repopulate the anchors can change, so we
-                // emit every UUID the row could plausibly be stored under:
-                //
-                // 1. the parent/nested scheme the Stremio importer writes
-                // 2. flat keys derived from the grandparent series' external IDs
-                // 3. the episode's own raw Stremio ID (used as a candidate upstream)
-                let (season_idx, episode_idx) = match kind {
-                    MediaKind::Season => (item.idx, None),
-                    _ => (item.parent_idx, item.idx),
-                };
-                let Some(s) = season_idx else {
-                    return candidates;
-                };
-
-                // (1) nested: season_uuid = stable(Season, "{series_id}:{s}")
-                let series_id = item
-                    .grandparent_id
-                    .or(item.parent_id);
-                if let Some(series_id) = series_id {
-                    let season_uuid = Self::season_id_nested(series_id, s);
-                    match kind {
-                        MediaKind::Season => candidates.push(season_uuid),
-                        _ => {
-                            if let Some(e) = episode_idx {
-                                candidates
-                                    .push(Self::episode_id_nested(season_uuid, e));
-                            }
-                        }
-                    }
-                }
-
-                // (2) flat keys derived from the same candidate_ids() the addon/
-                // route matching uses: every (series external ID, season[, episode])
-                // combination, plus the episode's own Stremio ID.
-                let gp_ext = item
-                    .grandparent
-                    .as_deref()
-                    .map(|gp| &gp.external_ids);
-                for id_str in item.candidate_ids(gp_ext) {
-                    candidates.push(stable_media_uuid(kind, &id_str));
-                }
-
-                // (3) the episode's own Stremio ID is already covered by
-                // candidate_ids() above.
-            }
-            MediaKind::Artist => {
-                if let Some(id) = ext.deezer_artist {
-                    candidates.push(stable_media_uuid(kind, &id.to_string()));
-                }
-            }
-            MediaKind::Album => {
-                if let Some(id) = ext.deezer_album {
-                    candidates.push(stable_media_uuid(kind, &id.to_string()));
-                }
-            }
-            MediaKind::Track => {
-                if let Some(id) = ext.deezer_track {
-                    candidates.push(stable_media_uuid(kind, &id.to_string()));
-                }
-            }
-            _ => {}
-        }
-        candidates.retain(|u| *u != item.id);
-        candidates
     }
 
     /// Update all `parent_id` / `grandparent_id` references from `old_id` to `new_id`
@@ -3195,7 +3540,164 @@ impl Media {
         Ok(out)
     }
 
+    /// Drops empty containers from `records` in place — the `exclude_childless`
+    /// branch of `get_by_filter_inner`, pulled into its own boxed async fn.
+    ///
+    /// Regression: inlined directly in `get_by_filter_inner`, this branch's
+    /// locals (`nonempty_groups`, the loop and its nested awaits) got folded
+    /// into `get_by_filter_inner`'s own generated state machine — Rust sizes
+    /// an async fn's future to the union of live locals across *every* await
+    /// point, including ones in branches not taken at runtime. That was
+    /// enough extra stack per call to overflow deep chains elsewhere in the
+    /// request path (e.g. plain `/items` and `/latest` listings that never
+    /// take this branch at all). Boxing it here keeps those locals in a
+    /// separate, heap-allocated future instead.
+    async fn drop_empty_group_containers(
+        db: &SqlitePool,
+        records: &mut Vec<Self>,
+        filter: &MediaFilter,
+    ) -> Result<()> {
+        let mut nonempty_groups = HashSet::new();
+        for group_id in records
+            .iter()
+            .filter(|m| m.is_group_container())
+            .map(|m| m.id)
+        {
+            if Self::group_container_has_visible_content(
+                db,
+                group_id,
+                filter.user_id,
+                filter
+                    .policy_filter
+                    .clone(),
+            )
+            .await?
+            {
+                nonempty_groups.insert(group_id);
+            }
+        }
+
+        records.retain(|m| {
+            if !matches!(
+                m.kind,
+                MediaKind::Collection | MediaKind::Folder | MediaKind::Playlist
+            ) {
+                return true;
+            }
+            if m.is_group_container() {
+                return nonempty_groups.contains(&m.id);
+            }
+            m.child_count
+                .map_or(true, |c| c > 0)
+        });
+        Ok(())
+    }
+
+    /// Whether a collection-of-collections should show in `/userviews`.
+    /// Group containers hold their children via `parent_id`, unlike regular
+    /// manual collections, which use relations.
+    ///
+    /// #414's intent was narrower than "hide any group container that
+    /// resolves to nothing": *"collection can be [...] have collections as
+    /// children. if they are all empty the parent should not show"* — i.e.
+    /// hide only when sub-collections exist and every one of them is empty.
+    /// A group container that hasn't been populated with any sub-collection
+    /// yet (just promoted, nothing added) is a different case and shows like
+    /// any other not-yet-populated library — so the root's own child list
+    /// being empty short-circuits to visible before the "all empty" check
+    /// ever applies.
+    ///
+    /// Walk groups iteratively to avoid recursion and to guard against a
+    /// malformed parent cycle. The number of promoted groups is small, while
+    /// the leaf checks reuse the normal collection query paths so smart and
+    /// policy filters keep their usual semantics.
+    async fn group_container_has_visible_content(
+        db: &SqlitePool,
+        group_id: Uuid,
+        user_id: Option<Uuid>,
+        policy_filter: Option<remux_sdks::remux::CollectionFilter>,
+    ) -> Result<bool> {
+        let mut pending = vec![group_id];
+        let mut visited = HashSet::new();
+        let mut is_root = true;
+
+        while let Some(parent_id) = pending.pop() {
+            if !visited.insert(parent_id) {
+                continue;
+            }
+
+            let children = Box::pin(Self::get_by_filter(
+                db,
+                &MediaFilter {
+                    kind: Some(vec![MediaKind::Collection]),
+                    parent_id: Some(parent_id),
+                    include_child_count: true,
+                    user_id,
+                    policy_filter: policy_filter.clone(),
+                    ..Default::default()
+                },
+            ))
+            .await?
+            .records;
+
+            if is_root && children.is_empty() {
+                return Ok(true);
+            }
+            is_root = false;
+
+            for child in children {
+                if child.is_group_container() {
+                    pending.push(child.id);
+                    continue;
+                }
+
+                let visible = match child.collection_kind {
+                    Some(CollectionKind::Smart) => child
+                        .child_count
+                        .is_some_and(|count| count > 0),
+                    Some(CollectionKind::Manual) => !Box::pin(Self::get_by_filter(
+                        db,
+                        &MediaFilter {
+                            parent_id: Some(child.id),
+                            parent: Some(child),
+                            limit: Some(1),
+                            user_id,
+                            policy_filter: policy_filter.clone(),
+                            ..Default::default()
+                        },
+                    ))
+                    .await?
+                    .records
+                    .is_empty(),
+                    // Preserve legacy collections whose storage convention
+                    // predates explicit collection kinds.
+                    None => true,
+                };
+
+                if visible {
+                    return Ok(true);
+                }
+            }
+        }
+
+        Ok(false)
+    }
+
     pub async fn get_by_filter(
+        db: &SqlitePool,
+        filter: &MediaFilter,
+    ) -> Result<FilterResult<Media>> {
+        use tokio_util::future::FutureExt;
+        Self::get_by_filter_inner(db, filter)
+            .timeout(std::time::Duration::from_secs(30))
+            .await
+            .map_err(|_| {
+                error!(?filter, "get_by_filter timed out after 30s");
+                anyhow!("get_by_filter timed out after 30s: {filter:?}")
+            })?
+    }
+
+    async fn get_by_filter_inner(
         db: &SqlitePool,
         filter: &MediaFilter,
     ) -> Result<FilterResult<Media>> {
@@ -3236,73 +3738,75 @@ impl Media {
                 })
                 .unwrap_or(false);
 
-        // Detect when a Watched=true smart-filter rule is active. In that case the
-        // DatePlayed fast path (driving FROM user_media_state) doesn't work for
-        // partially watched series — they have no series-level UMS row so they never
-        // enter the result set. We pre-fetch the effective watched-ID/date map once
-        // and use it for both membership and ordering instead.
+        // Only treat Played=true as a definite requirement when it appears inside an
+        // All-mode group within an All-mode top-level filter. If it's in an Any group,
+        // the rule is optional (other rules can satisfy the group), so the CTE path —
+        // which restricts the result set to only played items — would wrongly exclude
+        // non-played items that match the other rules in that group.
         let has_watched_true_rule = filter
             .filter_rules
-            .iter()
-            .flat_map(|cf| {
-                cf.groups
-                    .iter()
-            })
-            .flat_map(|g| {
-                g.rules
-                    .iter()
-            })
-            .any(|r| matches!(r, sdks::remux::FilterRule::Watched { value: true }));
-
-        // Pre-fetch effective watched IDs + dates when the rollup path is needed:
-        // Watched=true filter rule AND DatePlayed sort AND a user_id is set.
-        // The query rolls episode plays up to their grandparent series so partially
-        // watched series appear with the date of their most recently watched episode.
-        let watched_rollup: Option<Vec<(Uuid, Option<NaiveDateTime>)>> =
-            if has_watched_true_rule
-                && filter
-                    .sort_by
-                    .iter()
-                    .any(|s| matches!(s, api::ItemSortBy::DatePlayed))
-            {
-                if let Some(uid) = &filter.user_id {
-                    let rows: Vec<(Vec<u8>, Option<NaiveDateTime>)> = sqlx::query_as(
-                        "SELECT COALESCE(ep.grandparent_id, ums.media_id) AS effective_id, \
-                         MAX(ums.played_at) AS effective_date \
-                         FROM user_media_state ums \
-                         LEFT JOIN media ep ON ep.id = ums.media_id AND ep.kind = 'episode' \
-                         WHERE ums.user_id = ? AND ums.play_count > 0 \
-                         GROUP BY effective_id",
-                    )
-                    .bind(uid)
-                    .fetch_all(db)
-                    .await?;
-
-                    let mapped = rows
-                        .into_iter()
-                        .filter_map(|(id_bytes, dt)| {
-                            Uuid::from_slice(&id_bytes)
-                                .ok()
-                                .map(|id| (id, dt))
+            .as_ref()
+            .map(|cf| {
+                cf.match_mode == sdks::remux::FilterMatchMode::All
+                    && cf
+                        .groups
+                        .iter()
+                        .any(|g| {
+                            g.match_mode == sdks::remux::FilterMatchMode::All
+                                && g.rules
+                                    .iter()
+                                    .any(|r| {
+                                        matches!(
+                                            r,
+                                            sdks::remux::FilterRule::Played {
+                                                value: true
+                                            }
+                                        )
+                                    })
                         })
-                        .collect();
-                    Some(mapped)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
+            })
+            .unwrap_or(false);
+
+        // When Watched=true filter is active AND DatePlayed sort is requested, inject a
+        // watched_dates CTE that computes effective watched dates once (rolling episode
+        // plays up to grandparent series). The main query drives FROM watched_dates → media
+        // (PK join), skipping all unwatched rows with no per-row subquery. ORDER BY uses
+        // wd.effective_date directly. The Watched filter rule itself is suppressed (the
+        // CTE JOIN already enforces membership). Without the CTE, the dp driving table
+        // can't be used because series with only episode-level plays have no direct UMS row.
+        let use_watched_cte = has_watched_true_rule
+            && filter
+                .user_id
+                .is_some()
+            && filter
+                .sort_by
+                .iter()
+                .any(|s| matches!(s, api::ItemSortBy::DatePlayed));
+
+        let watched_cte_sql: Option<String> = if use_watched_cte {
+            filter.user_id.as_ref().map(|uid| {
+                format!(
+                    "WITH watched_dates AS (\
+                      SELECT COALESCE(ep.grandparent_id, ums.media_id) AS effective_id, \
+                             MAX(COALESCE(ums.last_played_at, ums.played_at)) AS effective_date \
+                      FROM user_media_state ums \
+                      LEFT JOIN media ep ON ep.id = ums.media_id AND ep.kind = 'episode' \
+                      WHERE ums.user_id = X'{}' AND ums.play_count > 0 \
+                      GROUP BY effective_id\
+                    ) ",
+                    uid.simple()
+                )
+            })
+        } else {
+            None
+        };
 
         // When sorting by DatePlayed, drive records_qb FROM user_media_state (dp) so
         // the result is already in last_played_at order — no correlated subquery per row,
-        // no separate sort pass. Column names in subsequent WHERE clauses (kind, parent_id,
-        // etc.) resolve unambiguously to media since dp only exposes (user_id, media_id,
-        // last_played_at). Applied to all query shapes so dp.last_played_at in ORDER BY
-        // is always valid when user_id is set.
-        // Disabled when watched_rollup is active: the fast path requires a direct
-        // user_media_state row which partially watched series don't have.
-        let date_played_uid = if watched_rollup.is_some() {
+        // no separate sort pass. Disabled when has_watched_true_rule: dp requires a direct
+        // UMS row; partially watched series (episode-only plays) have none, so they'd drop
+        // from results. The watched path uses the CTE approach above instead.
+        let date_played_uid = if has_watched_true_rule {
             None
         } else {
             filter
@@ -3317,20 +3821,19 @@ impl Media {
                 .flatten()
         };
 
-        // When sorting by a single-period popularity metric, pre-compute scores via a
-        // LEFT JOIN on a derived table so SQLite materialises popularity_agg once and
-        // joins with a hash-join rather than executing 2 correlated subqueries per
-        // qualifying row in ORDER BY. PopularityAllTime spans 3 periods and stays with
-        // the correlated-subquery path.
-        let pop_period: Option<&'static str> = filter
+        // When sorting by a RemuxDB metric, scan its dedicated descending index and
+        // probe the already-filtered media rows by primary key. This avoids sorting
+        // the complete filtered set before LIMIT can stop the scan.
+        let pop_column: Option<&'static str> = filter
             .sort_by
             .iter()
             .find_map(|s| match s {
-                api::ItemSortBy::TrendingWeek => Some("trend_week"),
-                api::ItemSortBy::TrendingMonth => Some("trend_month"),
-                api::ItemSortBy::PopularityDay => Some("daily"),
-                api::ItemSortBy::PopularityWeek => Some("weekly"),
-                api::ItemSortBy::PopularityMonth => Some("monthly"),
+                api::ItemSortBy::PopularityAllTime => Some("popularity_all_time"),
+                api::ItemSortBy::TrendingWeek => Some("trending_weekly"),
+                api::ItemSortBy::TrendingMonth => Some("trending_monthly"),
+                api::ItemSortBy::PopularityDay => Some("popularity_daily"),
+                api::ItemSortBy::PopularityWeek => Some("popularity_weekly"),
+                api::ItemSortBy::PopularityMonth => Some("popularity_monthly"),
                 _ => None,
             });
         let mut pop_joined = false;
@@ -3446,31 +3949,43 @@ impl Media {
                 records_qb.push(" WHERE 1=1");
             }
         } else {
-            count_qb = sqlx::QueryBuilder::new(
-                "SELECT COUNT(*) as count FROM media WHERE 1=1",
-            );
-            if let Some(uid) = date_played_uid {
-                records_qb = sqlx::QueryBuilder::new(
-                    "SELECT media.* FROM user_media_state dp \
-                     CROSS JOIN media WHERE dp.user_id = ",
-                );
-                records_qb.push_bind(uid);
-                records_qb.push(" AND media.id = dp.media_id AND 1=1");
-            } else if pop_period.is_some() {
-                pop_joined = true;
-                // Build a CTE over the media table so the WHERE conditions loop
-                // below can fill it once. After the loop we close the CTE and
-                // wrap it in a UNION ALL: arm 1 drives from idx_pop_agg_covering
-                // (scored items in avg-DESC order via the index walk), arm 2
-                // streams unscored items via NOT EXISTS. SQLite evaluates UNION ALL
-                // arms as coroutines — no global sort, LIMIT stops after arm 1 if
-                // there are enough scored items.
-                records_qb = sqlx::QueryBuilder::new(
-                    "WITH filtered AS (SELECT media.* FROM media WHERE 1=1",
-                );
+            if let Some(ref cte) = watched_cte_sql {
+                count_qb = sqlx::QueryBuilder::new(format!(
+                    "{cte}SELECT COUNT(*) as count \
+                     FROM watched_dates wd JOIN media ON media.id = wd.effective_id WHERE 1=1"
+                ));
+                records_qb = sqlx::QueryBuilder::new(format!(
+                    "{cte}SELECT media.* \
+                     FROM watched_dates wd JOIN media ON media.id = wd.effective_id WHERE 1=1"
+                ));
             } else {
-                records_qb = sqlx::QueryBuilder::new("SELECT * FROM media WHERE 1=1");
-            }
+                count_qb = sqlx::QueryBuilder::new(
+                    "SELECT COUNT(*) as count FROM media WHERE 1=1",
+                );
+                if let Some(uid) = date_played_uid {
+                    records_qb = sqlx::QueryBuilder::new(
+                        "SELECT media.* FROM user_media_state dp \
+                     CROSS JOIN media WHERE dp.user_id = ",
+                    );
+                    records_qb.push_bind(uid);
+                    records_qb.push(" AND media.id = dp.media_id AND 1=1");
+                } else if pop_column.is_some() {
+                    pop_joined = true;
+                    // Build a CTE over the media table so the WHERE conditions loop
+                    // below can fill it once. After the loop we close the CTE and
+                    // wrap it in a UNION ALL: arm 1 drives from the selected metrics
+                    // index (scored items in descending order), arm 2
+                    // streams unscored items via NOT EXISTS. SQLite evaluates UNION ALL
+                    // arms as coroutines — no global sort, LIMIT stops after arm 1 if
+                    // there are enough scored items.
+                    records_qb = sqlx::QueryBuilder::new(
+                        "WITH filtered AS (SELECT media.* FROM media WHERE 1=1",
+                    );
+                } else {
+                    records_qb =
+                        sqlx::QueryBuilder::new("SELECT * FROM media WHERE 1=1");
+                }
+            } // end else (non-CTE path)
         }
 
         // Pre-fetch in-progress media IDs — JOIN media so kind and date filters are applied
@@ -3613,12 +4128,37 @@ impl Media {
                     for k in related_kinds {
                         sep.push_bind(k);
                     }
-                    qb.push("))");
+                    qb.push(")");
+                    if is_genre_scope_query {
+                        if let Some(ref rules) = filter.filter_rules {
+                            qb.push(
+                                " AND item.id IN (SELECT media.id FROM media WHERE 1 = 1",
+                            );
+                            apply_filter_rules(
+                                qb,
+                                rules,
+                                filter
+                                    .user_id
+                                    .as_ref(),
+                                // Independent subquery: it does not join the
+                                // watched CTE, so the played-true rule must be
+                                // applied inline rather than suppressed.
+                                false,
+                            );
+                            qb.push(")");
+                        }
+                    }
+                    qb.push(")");
                 }
             }
             if let Some(grandparent_id) = &filter.grandparent_id {
                 qb.push(" AND grandparent_id = ")
                     .push_bind(grandparent_id);
+            }
+            if let Some(ids) = &filter.grandparent_ids {
+                if !ids.is_empty() {
+                    qb.push_in("grandparent_id", ids);
+                }
             }
             if let Some(promoted) = &filter.promoted {
                 qb.push(" AND promoted = ")
@@ -3627,6 +4167,19 @@ impl Media {
             if let Some(kind) = &filter.kind {
                 if resumable_ids.is_none() {
                     qb.push_in("kind", &kind);
+                }
+                // Scope playlist visibility: show only public playlists or those owned by the caller.
+                let has_playlist = kind
+                    .iter()
+                    .any(|k| *k == MediaKind::Playlist);
+                if has_playlist {
+                    if let Some(uid) = filter.user_id {
+                        qb.push(" AND (kind != 'playlist' OR public = 1 OR user_id = ");
+                        qb.push_bind(uid);
+                        qb.push(")");
+                    } else {
+                        qb.push(" AND (kind != 'playlist' OR public = 1)");
+                    }
                 }
             }
             if let Some(kinds) = &filter.album_kinds {
@@ -3693,29 +4246,33 @@ impl Media {
                         .push(")");
                 }
 
-                // played=true — direct row OR at least one watched episode (series rollup)
+                // played=true — non-correlated IN. Two branches unioned:
+                //   1. Direct: episodes/movies/series marked played themselves.
+                //   2. Rollup: series whose episodes have play_count > 0.
+                // Replaces a per-row EXISTS(UNION ALL) that was O(series × episodes).
                 if user_state_filter.played == Some(true) {
                     qb.push(
-                        " AND EXISTS (\
-                          SELECT 1 FROM user_media_state ums \
-                          WHERE ums.media_id = media.id",
+                        " AND media.id IN (\
+                          SELECT ums.media_id \
+                          FROM user_media_state ums \
+                          WHERE ums.play_count > 0",
                     );
                     if let Some(user_id) = &user_state_filter.user_id {
                         qb.push(" AND ums.user_id = ")
                             .push_bind(user_id);
                     }
                     qb.push(
-                        " AND ums.play_count > 0 \
-                          UNION ALL \
-                          SELECT 1 FROM user_media_state ums \
-                          JOIN media ep ON ep.id = ums.media_id \
-                          WHERE ep.grandparent_id = media.id AND ep.kind = 'episode'",
+                        " UNION \
+                          SELECT ep.grandparent_id \
+                          FROM user_media_state ums \
+                          JOIN media ep ON ep.id = ums.media_id AND ep.kind = 'episode' \
+                          WHERE ums.play_count > 0",
                     );
                     if let Some(user_id) = &user_state_filter.user_id {
                         qb.push(" AND ums.user_id = ")
                             .push_bind(user_id);
                     }
-                    qb.push(" AND ums.play_count > 0)");
+                    qb.push(" AND ep.grandparent_id IS NOT NULL)");
                 }
 
                 // played=false (unplayed).
@@ -3797,6 +4354,44 @@ impl Media {
             if let Some(s) = &filter.title_contains {
                 qb.push(" AND title LIKE ")
                     .push_bind(format!("%{}%", s));
+            }
+
+            if let Some(ids) = &filter.any_provider_ids {
+                if ids.is_empty() {
+                    qb.push(" AND 0");
+                } else {
+                    qb.push(" AND (");
+                    let mut first = true;
+                    for tmdb in &ids.tmdb {
+                        if !first {
+                            qb.push(" OR ");
+                        }
+                        first = false;
+                        qb.push(
+                            "CAST(json_extract(external_ids, '$.tmdb') AS TEXT) = ",
+                        )
+                        .push_bind(tmdb.to_string());
+                    }
+                    for imdb in &ids.imdb {
+                        if !first {
+                            qb.push(" OR ");
+                        }
+                        first = false;
+                        qb.push("json_extract(external_ids, '$.imdb') = ")
+                            .push_bind(imdb);
+                    }
+                    for tvdb in &ids.tvdb {
+                        if !first {
+                            qb.push(" OR ");
+                        }
+                        first = false;
+                        qb.push(
+                            "CAST(json_extract(external_ids, '$.tvdb') AS TEXT) = ",
+                        )
+                        .push_bind(tvdb.to_string());
+                    }
+                    qb.push(")");
+                }
             }
 
             if let Some(idx) = &filter.index_number {
@@ -3918,14 +4513,56 @@ impl Media {
                 }
             }
 
-            if let Some(ref f) = filter.filter_rules {
-                apply_filter_rules(
-                    qb,
-                    f,
-                    filter
-                        .user_id
-                        .as_ref(),
-                );
+            if let Some(after) = filter.released_after {
+                qb.push(" AND released_at >= ")
+                    .push_bind(after);
+            }
+
+            if !is_genre_scope_query {
+                if let Some(ref f) = filter.filter_rules {
+                    // When the query targets child types (episodes/seasons), the
+                    // collection filter rules describe which series qualify — not the
+                    // episode rows themselves. Apply them via a grandparent subquery so
+                    // only children of matching series are returned.
+                    let all_episode_or_season = filter
+                        .kind
+                        .as_ref()
+                        .map(|k| {
+                            !k.is_empty()
+                                && k.iter()
+                                    .all(|k| {
+                                        matches!(
+                                            k,
+                                            MediaKind::Episode | MediaKind::Season
+                                        )
+                                    })
+                        })
+                        .unwrap_or(false);
+
+                    if all_episode_or_season {
+                        if let Some(fragment) = build_filter_rules_fragment(
+                            f,
+                            filter
+                                .user_id
+                                .as_ref(),
+                            false,
+                        ) {
+                            qb.push(format!(
+                                " AND grandparent_id IN \
+                            (SELECT id FROM media WHERE kind = 'series' AND {fragment})"
+                            ));
+                        }
+                    } else {
+                        apply_filter_rules(
+                            qb,
+                            f,
+                            filter
+                                .user_id
+                                .as_ref(),
+                            use_watched_cte,
+                        );
+                    }
+                }
             }
             if let Some(ref ids) = filter.exclude_ids {
                 if !ids.is_empty() {
@@ -3976,9 +4613,9 @@ impl Media {
 
             if !container_only && has_policy {
                 if let Some(max_rating) = filter.max_parental_rating {
-                    qb.push(" AND (certification_age IS NULL OR certification_age <= ")
+                    qb.push(" AND COALESCE(certification_age, (SELECT p.certification_age FROM media p WHERE p.id = COALESCE(media.grandparent_id, media.parent_id))) <= ")
                         .push_bind(max_rating)
-                        .push(")");
+                        .push("");
                 }
 
                 if let Some(blocked) = &filter.blocked_tags {
@@ -4010,31 +4647,64 @@ impl Media {
                         filter
                             .user_id
                             .as_ref(),
+                        false,
                     );
+                }
+            }
+
+            // Hide specific collections from browse views per the user's
+            // policy — the one deliberate exception to "policy filters don't
+            // apply to containers" (see AGENTS.md). Applied here (in SQL,
+            // gated the opposite way — only when container_only) rather than
+            // as a post-query Rust filter, so it composes correctly with
+            // LIMIT/OFFSET and count_qb's total stays accurate.
+            if container_only {
+                if let Some(ref pf) = filter.policy_filter {
+                    let (deny, allow) = collection_visibility_filters(pf);
+                    if let Some(allow) = &allow {
+                        if allow.is_empty() {
+                            qb.push(" AND 0");
+                        } else {
+                            qb.push(" AND media.id IN (");
+                            let mut sep = qb.separated(", ");
+                            for id in allow {
+                                sep.push_bind(*id);
+                            }
+                            qb.push(")");
+                        }
+                    }
+                    if !deny.is_empty() {
+                        qb.push(" AND media.id NOT IN (");
+                        let mut sep = qb.separated(", ");
+                        for id in &deny {
+                            sep.push_bind(*id);
+                        }
+                        qb.push(")");
+                    }
                 }
             }
         }
 
         // Close the filtered CTE and build the UNION ALL structure.
-        // Arm 1 joins popularity_agg → filtered driving from idx_pop_agg_covering,
-        // producing scored items in avg-DESC order without a sort step.
+        // Arm 1 joins media_metrics → filtered driving from the selected metric
+        // index, producing scored items in descending order without a sort step.
         // Arm 2 streams unscored items after arm 1 is exhausted.
         if pop_joined {
-            let period = pop_period.unwrap();
-            // CROSS JOIN forces popularity_agg as the outer loop (SQLite docs:
+            let column = pop_column.unwrap();
+            // CROSS JOIN forces media_metrics as the outer loop (SQLite docs:
             // "CROSS JOIN prevents the optimizer from rearranging table order").
-            // This guarantees SQLite walks idx_pop_agg_covering in avg-DESC order
+            // This guarantees SQLite walks the selected metric index in DESC order
             // and probes the filtered CTE by PK, producing scored items in score
             // order without a sort step.
             records_qb.push(format!(
                 ") SELECT m.* FROM (\
-                 SELECT f.* FROM popularity_agg pop CROSS JOIN filtered f \
-                 WHERE f.id = pop.media_id AND pop.period = '{period}' AND pop.latest = 1 \
+                 SELECT f.* FROM media_metrics pop CROSS JOIN filtered f \
+                 WHERE f.id = pop.media_id AND pop.{column} IS NOT NULL \
                  UNION ALL \
                  SELECT f.* FROM filtered f \
                  WHERE NOT EXISTS (\
-                     SELECT 1 FROM popularity_agg p \
-                     WHERE p.media_id = f.id AND p.period = '{period}' AND p.latest = 1\
+                     SELECT 1 FROM media_metrics p \
+                     WHERE p.media_id = f.id AND p.{column} IS NOT NULL\
                  )\
                 ) m"
             ));
@@ -4083,8 +4753,21 @@ impl Media {
                         api::ItemSortBy::DateCreated => {
                             format!("datetime(created_at) {}", dir)
                         }
-                        api::ItemSortBy::PremiereDate
-                        | api::ItemSortBy::ProductionYear => {
+                        api::ItemSortBy::PremiereDate => {
+                            // Upcoming queries filter on released_at and have no
+                            // digital-release fallback. Keeping the same column
+                            // in ORDER BY lets the (kind, released_at) index serve
+                            // both the range and ordering without a temp sort.
+                            if filter.released_after.is_some() {
+                                format!("released_at {}", dir)
+                            } else {
+                                format!(
+                                    "COALESCE(released_at, digital_released_at) {}",
+                                    dir
+                                )
+                            }
+                        }
+                        api::ItemSortBy::ProductionYear => {
                             format!(
                                 "COALESCE(released_at, digital_released_at) {}",
                                 dir
@@ -4172,30 +4855,18 @@ impl Media {
                             format!("COALESCE(runtime, 0) {}", dir)
                         }
                         api::ItemSortBy::DatePlayed => {
-                            if let Some(ref rollup) = watched_rollup {
-                                // Rollup path: no dp driving table. Order by the
-                                // pre-fetched effective date via a CASE WHEN so SQLite
-                                // can resolve each row's date without a subquery.
-                                // Dates come from our own DB pre-fetch, not user input.
-                                // NULL dates use the smallest sentinel so they always
-                                // sink to the bottom regardless of sort direction.
+                            if use_watched_cte {
+                                // CTE path: watched_dates is already JOINed into the query,
+                                // wd.effective_date holds the pre-computed effective play date
+                                // (rolling episode plays up to grandparent series).
                                 let null_date = "0001-01-01 00:00:00";
-                                let mut case = String::from("CASE media.id");
-                                for (id, dt) in rollup {
-                                    let date_str = dt
-                                        .map(|d| d.to_string())
-                                        .unwrap_or_else(|| null_date.into());
-                                    case.push_str(&format!(
-                                        " WHEN X'{}' THEN '{}'",
-                                        id.simple(),
-                                        date_str
-                                    ));
-                                }
-                                case.push_str(&format!(" ELSE '{}' END {}", null_date, dir));
-                                case
+                                format!("COALESCE(wd.effective_date, '{null_date}') {dir}")
                             } else if filter.user_id.is_some() {
                                 // dp alias from the UMS-driven records_qb above.
-                                format!("dp.last_played_at {}", dir)
+                                // COALESCE with played_at: a synced/imported row may only
+                                // carry the older column, and a fully-watched item's own
+                                // completion time is still meaningful for ranking.
+                                format!("COALESCE(dp.last_played_at, dp.played_at) {}", dir)
                             } else {
                                 format!("title COLLATE NOCASE {}", dir)
                             }
@@ -4284,66 +4955,52 @@ impl Media {
                             }
                         }
                         api::ItemSortBy::PopularityAllTime => {
-                            // all-time → most recent yearly → most recent monthly → 0
-                            "COALESCE(\
-                               (SELECT pa.avg FROM popularity_agg pa WHERE pa.media_id = media.id AND pa.period = 'all' AND pa.period_key = 'all'),\
-                               (SELECT pa.avg FROM popularity_agg pa WHERE pa.media_id = media.id AND pa.period = 'yearly' ORDER BY pa.period_key DESC LIMIT 1),\
-                               (SELECT pa.avg FROM popularity_agg pa WHERE pa.media_id = media.id AND pa.period = 'monthly' ORDER BY pa.period_key DESC LIMIT 1),\
-                               0) DESC"
+                            "COALESCE((SELECT popularity_all_time FROM media_metrics \
+                              WHERE media_id = media.id), 0) DESC"
                                 .to_string()
                         }
                         api::ItemSortBy::PopularityDay => {
                             if pop_joined {
-                                "pop.avg DESC NULLS LAST".to_string()
+                                format!("pop.{} DESC NULLS LAST", pop_column.unwrap())
                             } else {
-                                "COALESCE(\
-                                   (SELECT pa.avg FROM popularity_agg pa WHERE pa.media_id = media.id AND pa.period = 'daily' AND pa.period_key = date('now')),\
-                                   (SELECT pa.avg FROM popularity_agg pa WHERE pa.media_id = media.id AND pa.period = 'daily' ORDER BY pa.period_key DESC LIMIT 1),\
-                                   0) DESC"
+                                "COALESCE((SELECT popularity_daily FROM media_metrics \
+                                  WHERE media_id = media.id), 0) DESC"
                                     .to_string()
                             }
                         }
                         api::ItemSortBy::PopularityWeek => {
                             if pop_joined {
-                                "pop.avg DESC NULLS LAST".to_string()
+                                format!("pop.{} DESC NULLS LAST", pop_column.unwrap())
                             } else {
-                                "COALESCE(\
-                                   (SELECT pa.avg FROM popularity_agg pa WHERE pa.media_id = media.id AND pa.period = 'weekly' AND pa.period_key = date('now', 'weekday 0', '-6 days')),\
-                                   (SELECT pa.avg FROM popularity_agg pa WHERE pa.media_id = media.id AND pa.period = 'weekly' ORDER BY pa.period_key DESC LIMIT 1),\
-                                   0) DESC"
+                                "COALESCE((SELECT popularity_weekly FROM media_metrics \
+                                  WHERE media_id = media.id), 0) DESC"
                                     .to_string()
                             }
                         }
                         api::ItemSortBy::PopularityMonth => {
                             if pop_joined {
-                                "pop.avg DESC NULLS LAST".to_string()
+                                format!("pop.{} DESC NULLS LAST", pop_column.unwrap())
                             } else {
-                                "COALESCE(\
-                                   (SELECT pa.avg FROM popularity_agg pa WHERE pa.media_id = media.id AND pa.period = 'monthly' AND pa.period_key = strftime('%Y-%m', 'now')),\
-                                   (SELECT pa.avg FROM popularity_agg pa WHERE pa.media_id = media.id AND pa.period = 'monthly' ORDER BY pa.period_key DESC LIMIT 1),\
-                                   0) DESC"
+                                "COALESCE((SELECT popularity_monthly FROM media_metrics \
+                                  WHERE media_id = media.id), 0) DESC"
                                     .to_string()
                             }
                         }
                         api::ItemSortBy::TrendingWeek => {
                             if pop_joined {
-                                "pop.avg DESC NULLS LAST".to_string()
+                                format!("pop.{} DESC NULLS LAST", pop_column.unwrap())
                             } else {
-                                "COALESCE(\
-                                   (SELECT pa.avg FROM popularity_agg pa WHERE pa.media_id = media.id AND pa.period = 'trend_week' AND pa.period_key = date('now')),\
-                                   (SELECT pa.avg FROM popularity_agg pa WHERE pa.media_id = media.id AND pa.period = 'trend_week' ORDER BY pa.period_key DESC LIMIT 1),\
-                                   0) DESC"
+                                "COALESCE((SELECT trending_weekly FROM media_metrics \
+                                  WHERE media_id = media.id), 0) DESC"
                                     .to_string()
                             }
                         }
                         api::ItemSortBy::TrendingMonth => {
                             if pop_joined {
-                                "pop.avg DESC NULLS LAST".to_string()
+                                format!("pop.{} DESC NULLS LAST", pop_column.unwrap())
                             } else {
-                                "COALESCE(\
-                                   (SELECT pa.avg FROM popularity_agg pa WHERE pa.media_id = media.id AND pa.period = 'trend_month' AND pa.period_key = date('now')),\
-                                   (SELECT pa.avg FROM popularity_agg pa WHERE pa.media_id = media.id AND pa.period = 'trend_month' ORDER BY pa.period_key DESC LIMIT 1),\
-                                   0) DESC"
+                                "COALESCE((SELECT trending_monthly FROM media_metrics \
+                                  WHERE media_id = media.id), 0) DESC"
                                     .to_string()
                             }
                         }
@@ -4353,8 +5010,17 @@ impl Media {
                     col
                 })
                 .collect();
+            if filter
+                .title_contains
+                .is_some()
+            {
+                order_clauses.insert(
+                    0,
+                    "CASE WHEN LOWER(kind) = 'person' THEN 1 ELSE 0 END".to_string(),
+                );
+            }
             // When pop_joined, ordering is handled inside the UNION ALL arms —
-            // arm 1 walks idx_pop_agg_covering in avg-DESC order, arm 2 follows.
+            // arm 1 walks the selected metric index in DESC order, arm 2 follows.
             // Pushing ORDER BY here would force a global sort over the whole result.
             if !pop_joined {
                 records_qb.push(" ORDER BY ");
@@ -4370,6 +5036,23 @@ impl Media {
             records_qb.push(
                 " ORDER BY (sort_order IS NULL), COALESCE(sort_order, channel_number, 999999), title COLLATE NOCASE",
             );
+        } else if filter
+            .title_contains
+            .is_some()
+        {
+            // Local searches use a contains predicate, but prefix matches are more
+            // useful than titles that only contain the term later. Keep person rows
+            // at the end because they are secondary search results in Jellyfin.
+            records_qb
+                .push(" ORDER BY CASE WHEN LOWER(kind) = 'person' THEN 2 WHEN title LIKE ")
+                .push_bind(format!(
+                    "{}%",
+                    filter
+                        .title_contains
+                        .as_deref()
+                        .unwrap_or_default()
+                ))
+                .push(" THEN 0 ELSE 1 END, title COLLATE NOCASE ASC");
         } else {
             // Universal fallback: sort by index numbers so episodes/seasons/tracks
             // always come back in natural order when the client sends no SortBy.
@@ -4609,6 +5292,7 @@ impl Media {
                         filter
                             .user_id
                             .as_ref(),
+                        false,
                     );
                 }
                 cc_qb.push(" GROUP BY parent_id");
@@ -4660,6 +5344,7 @@ impl Media {
                         filter
                             .user_id
                             .as_ref(),
+                        false,
                     );
                     pl_qb.push(")");
                 } else {
@@ -4767,6 +5452,7 @@ impl Media {
                             filter
                                 .user_id
                                 .as_ref(),
+                            false,
                         );
                     }
                     if let Some(pf) = child_policy_filter {
@@ -4776,6 +5462,7 @@ impl Media {
                             filter
                                 .user_id
                                 .as_ref(),
+                            false,
                         );
                     }
                 }
@@ -5083,23 +5770,16 @@ impl Media {
 
         // Drop empty containers when requested. child_count is already populated
         // for all container kinds (including smart/catalog) by the branches above.
-        // Structural "collection of collections" containers always show.
+        // A structural collection-of-collections is visible only when it has a
+        // non-empty descendant collection. Collections hidden by policy (see
+        // `collection_visibility_filters`) were already excluded in SQL above,
+        // so a group container whose only child is a hidden collection
+        // correctly evaluates as empty here too.
         let sql_total = count?;
 
         if filter.exclude_childless {
-            records.retain(|m| {
-                if !matches!(
-                    m.kind,
-                    MediaKind::Collection | MediaKind::Folder | MediaKind::Playlist
-                ) {
-                    return true;
-                }
-                if m.is_group_container() {
-                    return true;
-                }
-                m.child_count
-                    .map_or(true, |c| c > 0)
-            });
+            Box::pin(Self::drop_empty_group_containers(db, &mut records, filter))
+                .await?;
         }
 
         let total_count = if filter.exclude_childless {
@@ -5119,12 +5799,29 @@ impl Media {
         after_id: Option<Uuid>,
         total_count: bool,
     ) -> Result<(Vec<Self>, Option<u32>)> {
+        // The missing-digital-date branch used to retry forever with no cutoff:
+        // TMDB's release_dates data often has no Digital/Physical/TV entry at
+        // all for a title (especially older ones), so `digital_released_at`
+        // can never be filled in no matter how many times it's refetched —
+        // that alone made up the vast majority of "refreshable" items in
+        // practice. Give it a week of retries (created_at < 7 days, in case
+        // the first fetch was incomplete/rate-limited or provider data
+        // catches up shortly after import), or keep trying indefinitely while
+        // the title itself is recent enough (released_at < 1 year) that a
+        // digital release is still plausible — otherwise stop selecting it.
         const WHERE: &str = r#"
         WHERE kind IN (?, ?)
           AND (
             refreshed_at IS NULL
             OR (kind = 'series' AND (status IS NULL OR status != 'ended') AND datetime(created_at) < datetime('now', '-1 hour'))
-            OR (digital_released_at IS NULL AND datetime(created_at) < datetime('now', '-1 hour'))
+            OR (
+              digital_released_at IS NULL
+              AND datetime(created_at) < datetime('now', '-1 hour')
+              AND (
+                datetime(created_at) >= datetime('now', '-7 days')
+                OR (released_at IS NOT NULL AND datetime(released_at) >= datetime('now', '-365 days'))
+              )
+            )
           )"#;
 
         let total = if total_count {
@@ -5163,6 +5860,60 @@ impl Media {
         };
 
         Ok((rows, total))
+    }
+
+    /// Minimal per-item projection for `RefreshPopularityTask`, which only
+    /// reads each item's IMDB id and writes back rating/popularity fields.
+    /// The general-purpose `get_by_filter` this used to run through
+    /// unconditionally hydrates full `Media` rows (every JSON blob column)
+    /// plus a batched images load and a batched tags load for every page —
+    /// none of which this task touches — which meant fully materializing
+    /// every movie/series in the library (tens of thousands of rows) just to
+    /// read two fields off each one. This selects only what's actually
+    /// needed: `title`/`kind` must still be carried because `Media::upsert`
+    /// overwrites them unconditionally (not `COALESCE`d) on conflict, and
+    /// `external_ratings` must be carried because it's replaced whole-column
+    /// (also not merged in SQL) — the caller's own merge logic depends on
+    /// starting from the real stored value, not an empty default.
+    pub async fn list_for_popularity_sync(
+        db: &SqlitePool,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<Self>> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            id: Uuid,
+            title: String,
+            kind: MediaKind,
+            #[sqlx(json)]
+            external_ids: ExternalIds,
+            #[sqlx(json(nullable))]
+            external_ratings: Option<ExternalRatings>,
+        }
+
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT id, title, kind, external_ids, external_ratings FROM media \
+             WHERE kind IN (?, ?) AND json_extract(external_ids, '$.imdb') IS NOT NULL \
+             ORDER BY id LIMIT ? OFFSET ?",
+        )
+        .bind(MediaKind::Movie)
+        .bind(MediaKind::Series)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(db)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| Self {
+                id: r.id,
+                title: r.title,
+                kind: r.kind,
+                external_ids: r.external_ids,
+                external_ratings: r.external_ratings,
+                ..Default::default()
+            })
+            .collect())
     }
 
     pub async fn get_by_jellyfin_filter(
@@ -5570,6 +6321,7 @@ impl Media {
                     && !filter
                         .include_childless
                         .unwrap_or(false),
+                any_provider_ids: filter.any_provider_ids(),
                 ..Default::default()
             },
         )
@@ -5599,10 +6351,9 @@ impl Media {
                     self.idx
                         .unwrap_or(0)
                 ),
-                MediaKind::Season => format!(
-                    "Season {}",
+                MediaKind::Season => crate::addons::season_title(
                     self.idx
-                        .unwrap_or(0)
+                        .unwrap_or(0),
                 ),
                 _ => self
                     .title
@@ -6406,6 +7157,7 @@ impl From<sdks::stremio::Stream> for Media {
             usenet_indexer: None,
             nzb_url: None,
             binge_group: None,
+            stream_addon: None,
             torrent_info_hash: None,
             torrent_file_idx: None,
             service_id: None,
@@ -6642,24 +7394,6 @@ impl TryFrom<sdks::stremio::Meta> for Media {
         };
 
         let mut media = media;
-        {
-            let raw = super::MediaIdRaw {
-                kind: media
-                    .kind
-                    .clone(),
-                external_ids: media
-                    .external_ids
-                    .clone(),
-                season: None,
-                episode: None,
-            };
-            if raw
-                .canonical()
-                .is_some()
-            {
-                media.id = Uuid::from(&raw);
-            }
-        }
         if let Some(url) = meta
             .poster
             .or(meta.thumbnail)
@@ -6695,22 +7429,6 @@ pub fn stremio_meta_to_medias(meta: sdks::stremio::Meta) -> Result<Vec<Media>> {
         media
             .external_ids
             .custom_stremio_id = Some(custom_id.clone());
-        {
-            let raw = super::MediaIdRaw {
-                kind: media
-                    .kind
-                    .clone(),
-                external_ids: media
-                    .external_ids
-                    .clone(),
-                season: None,
-                episode: None,
-            };
-            media.id = raw
-                .canonical()
-                .map(|_| Uuid::from(&raw))
-                .unwrap_or_else(Uuid::new_v4);
-        }
         let series_key = media.series_canonical_key();
         let mut media_instances = vec![media.clone()];
         if let MediaKind::Series = media.kind {
@@ -6734,7 +7452,7 @@ pub fn stremio_meta_to_medias(meta: sdks::stremio::Meta) -> Result<Vec<Media>> {
                     let season_id = Media::season_id(&series_key, season_idx);
                     let mut season = Media {
                         id: season_id,
-                        title: format!("Season {}", season_idx),
+                        title: crate::addons::season_title(season_idx),
                         kind: MediaKind::Season,
                         idx: Some(season_idx),
                         parent_id: Some(media.id),
@@ -6778,6 +7496,7 @@ pub fn stremio_meta_to_medias(meta: sdks::stremio::Meta) -> Result<Vec<Media>> {
                                 ep.id
                                     .clone(),
                             ),
+                            tvdb: ep.tvdb_id,
                             ..Default::default()
                         };
                         episode.parent_id = Some(season_id);
@@ -6799,22 +7518,6 @@ pub fn stremio_meta_to_medias(meta: sdks::stremio::Meta) -> Result<Vec<Media>> {
 
     let imdb_id = imdb_id.unwrap();
 
-    {
-        let raw = super::MediaIdRaw {
-            kind: media
-                .kind
-                .clone(),
-            external_ids: media
-                .external_ids
-                .clone(),
-            season: None,
-            episode: None,
-        };
-        media.id = raw
-            .canonical()
-            .map(|_| Uuid::from(&raw))
-            .unwrap_or_else(Uuid::new_v4);
-    }
     let series_key = media.series_canonical_key();
 
     let mut media_instances = Vec::new();
@@ -6842,7 +7545,7 @@ pub fn stremio_meta_to_medias(meta: sdks::stremio::Meta) -> Result<Vec<Media>> {
                 let season_id = Media::season_id(&series_key, season_idx);
                 let mut season = Media {
                     id: season_id,
-                    title: format!("Season {}", season_idx),
+                    title: crate::addons::season_title(season_idx),
                     kind: MediaKind::Season,
                     idx: Some(season_idx),
                     grandparent_id: Some(media.id),
@@ -6887,6 +7590,7 @@ pub fn stremio_meta_to_medias(meta: sdks::stremio::Meta) -> Result<Vec<Media>> {
                             ep.id
                                 .clone(),
                         ),
+                        tvdb: ep.tvdb_id,
                         ..Default::default()
                     };
                     episode.grandparent_id = Some(media.id);
@@ -6962,7 +7666,7 @@ pub fn stremio_meta_seasons(
 
         let mut season = Media {
             id: season_id,
-            title: format!("Season {}", season_idx),
+            title: crate::addons::season_title(season_idx),
             kind: MediaKind::Season,
             idx: Some(season_idx),
             parent_id: Some(series_id),
@@ -7052,6 +7756,11 @@ pub fn stremio_meta_episode(
                 ep.id
                     .clone(),
             ),
+            // The only id here that names the episode to anyone else. The
+            // stremio id is ours, and TMDB's season listing carries no
+            // `external_ids` per episode, so without this an episode reaches a
+            // provider identified by nothing at all.
+            tvdb: ep.tvdb_id,
             ..Default::default()
         };
         // UUID anchored to stable canonical series key + season/episode indices
@@ -7148,6 +7857,49 @@ pub fn push_release_date_filter(
     }
 }
 
+/// Collects `CollectionId` rules from a policy filter into (deny, allow) id
+/// sets, ignoring the filter's AND/OR group structure — this is a deliberate,
+/// narrow exception to "policy filters don't apply to container queries"
+/// (see AGENTS.md): it hides the *collection row itself* from browse views
+/// (userviews, boxset listings), never its member content, which stays
+/// visible everywhere else it would otherwise appear. Applied by
+/// `get_by_filter_inner` as a SQL `WHERE` condition (gated on `container_only`,
+/// the opposite of the general policy-filter gate) inside the `count_qb` /
+/// `records_qb` loop, so it composes correctly with LIMIT/OFFSET and
+/// `count_qb`'s total — a post-query Rust-side retain would silently produce
+/// short pages and an inaccurate total once a query is paginated.
+fn collection_visibility_filters(
+    pf: &remux_sdks::remux::CollectionFilter,
+) -> (HashSet<Uuid>, Option<HashSet<Uuid>>) {
+    use remux_sdks::remux::{FilterRule, SetOp};
+
+    let mut deny = HashSet::new();
+    let mut allow: Option<HashSet<Uuid>> = None;
+    for group in &pf.groups {
+        for rule in &group.rules {
+            if let FilterRule::CollectionId { op, ids } = rule {
+                if ids.is_empty() {
+                    continue;
+                }
+                if matches!(op, SetOp::IsNot | SetOp::NotIn) {
+                    deny.extend(
+                        ids.iter()
+                            .copied(),
+                    );
+                } else {
+                    allow
+                        .get_or_insert_with(HashSet::new)
+                        .extend(
+                            ids.iter()
+                                .copied(),
+                        );
+                }
+            }
+        }
+    }
+    (deny, allow)
+}
+
 /// Append WHERE clauses for a set of `FilterRule`s onto a query builder.
 ///
 /// Called once for both the count and records builders inside `get_by_filter`.
@@ -7162,6 +7914,7 @@ pub fn apply_filter_rules(
     qb: &mut sqlx::QueryBuilder<sqlx::Sqlite>,
     filter: &remux_sdks::remux::CollectionFilter,
     user_id: Option<&Uuid>,
+    skip_watched_true: bool,
 ) {
     use remux_sdks::remux::FilterMatchMode;
 
@@ -7180,7 +7933,7 @@ pub fn apply_filter_rules(
             let rules: Vec<_> = g
                 .rules
                 .iter()
-                .filter_map(|r| filter_rule_to_sql(r, user_id))
+                .filter_map(|r| filter_rule_to_sql(r, user_id, skip_watched_true))
                 .collect();
             if rules.is_empty() {
                 None
@@ -7227,6 +7980,72 @@ pub fn apply_filter_rules(
     qb.push(")");
 }
 
+/// Build a self-contained SQL fragment string from a `CollectionFilter`.
+///
+/// Unlike `apply_filter_rules`, this returns a `String` rather than pushing to a
+/// `QueryBuilder`. This allows the fragment to be embedded as a subquery (e.g.
+/// `grandparent_id IN (SELECT id FROM media WHERE kind = 'series' AND <fragment>)`).
+/// All values are escaped inline via `esc()` — no bound parameters.
+///
+/// Returns `None` when there are no valid rule groups, meaning the filter places
+/// no restriction (all items qualify).
+fn build_filter_rules_fragment(
+    filter: &remux_sdks::remux::CollectionFilter,
+    user_id: Option<&Uuid>,
+    skip_watched_true: bool,
+) -> Option<String> {
+    use remux_sdks::remux::FilterMatchMode;
+
+    let group_sep = match filter.match_mode {
+        FilterMatchMode::All => " AND ",
+        FilterMatchMode::Any => " OR ",
+    };
+
+    let valid_groups: Vec<_> = filter
+        .groups
+        .iter()
+        .filter_map(|g| {
+            let rules: Vec<_> = g
+                .rules
+                .iter()
+                .filter_map(|r| filter_rule_to_sql(r, user_id, skip_watched_true))
+                .collect();
+            if rules.is_empty() {
+                None
+            } else {
+                Some((g, rules))
+            }
+        })
+        .collect();
+
+    if valid_groups.is_empty() {
+        return None;
+    }
+
+    let group_strs: Vec<String> = valid_groups
+        .iter()
+        .map(|(g, rules)| {
+            let rule_sep = match g.match_mode {
+                FilterMatchMode::All => " AND ",
+                FilterMatchMode::Any => " OR ",
+            };
+            let rule_strs: Vec<String> = rules
+                .iter()
+                .map(|(sql, negated)| {
+                    if *negated {
+                        format!("NOT ({sql})")
+                    } else {
+                        sql.clone()
+                    }
+                })
+                .collect();
+            format!("({})", rule_strs.join(rule_sep))
+        })
+        .collect();
+
+    Some(format!("({})", group_strs.join(group_sep)))
+}
+
 /// Translate one `FilterRule` into a raw SQL fragment.
 ///
 /// Values are embedded directly — no string parsing needed since the rule carries typed values.
@@ -7235,8 +8054,15 @@ pub fn apply_filter_rules(
 fn filter_rule_to_sql(
     rule: &remux_sdks::remux::FilterRule,
     user_id: Option<&Uuid>,
+    skip_watched_true: bool,
 ) -> Option<(String, bool)> {
     use remux_sdks::remux::{FilterRule as R, NumericOp, SetOp};
+
+    if skip_watched_true {
+        if matches!(rule, R::Played { value: true }) {
+            return None;
+        }
+    }
 
     fn esc(s: &str) -> String {
         s.replace('\'', "''")
@@ -7297,8 +8123,12 @@ fn filter_rule_to_sql(
                 NumericOp::Eq | NumericOp::NotEq => {
                     format!("certification_age = {value}")
                 }
-                NumericOp::Gt => format!("certification_age > {value}"),
-                NumericOp::Lt => format!("certification_age <= {value}"),
+                NumericOp::Gt => format!(
+                    "COALESCE(certification_age, (SELECT p.certification_age FROM media p WHERE p.id = COALESCE(media.grandparent_id, media.parent_id))) > {value}"
+                ),
+                NumericOp::Lt => format!(
+                    "COALESCE(certification_age, (SELECT p.certification_age FROM media p WHERE p.id = COALESCE(media.grandparent_id, media.parent_id))) <= {value}"
+                ),
             };
             Some((sql, negated))
         }
@@ -7483,19 +8313,12 @@ fn filter_rule_to_sql(
             let sql = "media.parent_id IS NOT NULL".to_string();
             Some((sql, !value))
         }
-        R::CollectionMember { op, collection_ids } if !collection_ids.is_empty() => {
-            let in_clause = collection_ids
-                .iter()
-                .map(|id| format!("X'{}'", id.simple()))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let sql = format!(
-                "media.id IN (SELECT mr.right_media_id FROM media_relations mr \
-                 WHERE mr.role = 'collection' AND mr.left_media_id IN ({in_clause}))"
-            );
-            let negated = matches!(op, SetOp::IsNot | SetOp::NotIn);
-            Some((sql, negated))
-        }
+        // Disabled: only ever matches manual collections (media_relations has
+        // no rows for smart collections — their contents are computed from
+        // their own filter at query time, never materialized), so this
+        // silently filtered nothing for anyone using it on a smart collection.
+        // No-op regardless of content so any rule already saved in a user's
+        // policy stops being applied rather than half-working.
         R::CollectionMember { .. } => None,
         R::CollectionId { op, ids } if !ids.is_empty() => {
             let in_clause = ids
@@ -7524,20 +8347,20 @@ fn filter_rule_to_sql(
             };
             Some((sql, false))
         }
-        R::Watched { value } => {
+        R::Played { value } => {
             let user_clause = user_id
                 .map(|id| format!(" AND ums.user_id = X'{}'", id.simple()))
                 .unwrap_or_default();
             let sql = if *value {
                 format!(
-                    "EXISTS (\
-                      SELECT 1 FROM user_media_state ums \
-                      WHERE ums.media_id = media.id{user_clause} AND ums.play_count > 0 \
-                      UNION ALL \
-                      SELECT 1 FROM user_media_state ums \
+                    "media.id IN (\
+                      SELECT ums.media_id FROM user_media_state ums \
+                      WHERE ums.play_count > 0{user_clause} \
+                      UNION \
+                      SELECT ep.grandparent_id FROM user_media_state ums \
                       JOIN media ep ON ep.id = ums.media_id \
-                      WHERE ep.grandparent_id = media.id{user_clause} \
-                        AND ep.kind = 'episode' AND ums.play_count > 0\
+                      WHERE ep.kind = 'episode' AND ep.grandparent_id IS NOT NULL \
+                        AND ums.play_count > 0{user_clause}\
                     )"
                 )
             } else {
@@ -7673,6 +8496,66 @@ pub(crate) fn build_genre_relations_from_names(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn movie_and_series_accept_known_external_ids() {
+        for kind in [MediaKind::Movie, MediaKind::Series] {
+            for external_ids in [
+                ExternalIds {
+                    imdb: NonEmptyString::try_new("tt446001".to_string()).ok(),
+                    ..Default::default()
+                },
+                ExternalIds {
+                    tmdb: Some(446001),
+                    ..Default::default()
+                },
+                ExternalIds {
+                    tvdb: Some(446001),
+                    ..Default::default()
+                },
+                ExternalIds {
+                    kitsu: Some(446001),
+                    ..Default::default()
+                },
+                ExternalIds {
+                    custom_stremio_id: Some("custom:446001".into()),
+                    ..Default::default()
+                },
+            ] {
+                let media = Media {
+                    kind: kind.clone(),
+                    external_ids,
+                    ..Default::default()
+                };
+                assert!(
+                    media
+                        .validate()
+                        .is_ok(),
+                    "{:?}",
+                    media.external_ids
+                );
+            }
+            for external_ids in [
+                ExternalIds::default(),
+                ExternalIds {
+                    youtube_id: Some("unrelated".into()),
+                    ..Default::default()
+                },
+            ] {
+                assert!(
+                    Media {
+                        kind: kind.clone(),
+                        external_ids,
+                        ..Default::default()
+                    }
+                    .validate()
+                    .is_err()
+                );
+            }
+        }
+    }
+
+    use super::*;
     use crate::db::MediaIdRaw;
 
     /// `stremio_meta_episode` is the per-episode fast path used by meta refresh;
@@ -7781,113 +8664,127 @@ mod tests {
         }
     }
 
-    /// The recall side of #235: episode state rows must be findable under every
-    /// UUID the importer could have written — the nested parent-anchored scheme
-    /// (old), flat external-ID keys (new), and the episode's own Stremio ID.
+    /// Cinemeta sends `tvdb_id` on every video and it is the only id an
+    /// episode row carries that names it to anyone outside remux. The wire
+    /// name is snake_case against the struct's `rename_all`, so this covers
+    /// the deserialise as much as the mapping.
     #[test]
-    fn episode_uuid_candidates_cover_nested_flat_and_stremio_id() {
-        let series_id = Uuid::from_u128(77);
-        let mut series = Media {
-            id: series_id,
-            kind: MediaKind::Series,
-            external_ids: ExternalIds {
-                imdb: Some(NonEmptyString::try_new("tt1234567".to_string()).unwrap()),
-                custom_stremio_id: Some("fk:27".to_string()),
-                tmdb: Some(12345),
-                ..Default::default()
-            },
+    fn an_episode_keeps_the_tvdb_id_cinemeta_sent() {
+        let ext = ExternalIds {
+            imdb: Some(NonEmptyString::try_new("tt0045373".to_string()).unwrap()),
             ..Default::default()
         };
-        series.id = Uuid::from(&MediaIdRaw {
-            kind: series
-                .kind
-                .clone(),
-            external_ids: series
-                .external_ids
-                .clone(),
-            season: None,
-            episode: None,
-        });
-
+        let series_key = Media::series_canonical_key_ext(&ext).unwrap();
         let season_id = crate::common::stable_media_uuid(
             &MediaKind::Season,
-            &format!("{}:1", series_id),
+            &format!("{series_key}:0"),
         );
-        let episode = Media {
-            id: crate::common::stable_media_uuid(&MediaKind::Episode, &"deadbeef"),
-            kind: MediaKind::Episode,
-            idx: Some(3),
-            parent_idx: Some(1),
-            parent_id: Some(season_id),
-            grandparent_id: Some(series_id),
-            external_ids: ExternalIds {
-                custom_stremio_id: Some("fk-ep-3".to_string()),
-                ..Default::default()
-            },
-            grandparent: Some(Box::new(series.clone())),
-            ..Default::default()
-        };
+        let video: sdks::stremio::Episode = serde_json::from_value(serde_json::json!({
+            "id": "tt0045373:0:1",
+            "name": "Bob Hope Special - April 9 1950",
+            "season": 0,
+            "number": 1,
+            "episode": 1,
+            "tvdb_id": 5711666,
+        }))
+        .expect("fixture video");
 
-        let candidates = Media::ext_id_uuid_candidates(&episode);
-
-        // (1) nested / old Stremio scheme
-        let nested = crate::common::stable_media_uuid(
-            &MediaKind::Episode,
-            &format!("{season_id}:3"),
-        );
-        assert!(candidates.contains(&nested), "missing nested candidate");
-
-        // (2) flat keys from every grandparent external ID
-        for key in ["tt1234567:1:3", "fk:27:1:3", "tmdb:12345:1:3"] {
-            let flat = crate::common::stable_media_uuid(&MediaKind::Episode, key);
-            assert!(candidates.contains(&flat), "missing flat candidate {key}");
-        }
-
-        // (3) the episode's own Stremio ID
-        let own = crate::common::stable_media_uuid(&MediaKind::Episode, "fk-ep-3");
-        assert!(
-            candidates.contains(&own),
-            "missing own stremio-id candidate"
+        assert_eq!(
+            video.tvdb_id,
+            Some(5711666),
+            "the wire name is tvdb_id, not tvdbId"
         );
 
-        // The current id itself must never be returned as a candidate.
-        assert!(!candidates.contains(&episode.id));
+        let ep = stremio_meta_episode(&video, Uuid::from_u128(1), season_id, 0, &ext)
+            .unwrap();
+        assert_eq!(
+            ep.external_ids
+                .tvdb,
+            Some(5711666)
+        );
+        assert_eq!(
+            ep.external_ids
+                .custom_stremio_id
+                .as_deref(),
+            Some("tt0045373:0:1"),
+            "the stremio id is still what the row is keyed on"
+        );
     }
 
+    /// `stremio_meta_to_medias` builds episodes by its own route rather than
+    /// through `stremio_meta_episode`, so the id has to survive that path too.
     #[test]
-    fn season_uuid_candidates_cover_nested_and_flat() {
-        let series_id = Uuid::from_u128(88);
-        let series = Media {
-            id: series_id,
-            kind: MediaKind::Series,
-            external_ids: ExternalIds {
-                imdb: Some(NonEmptyString::try_new("tt1234567".to_string()).unwrap()),
-                custom_stremio_id: Some("fk:27".to_string()),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let season = Media {
-            id: crate::common::stable_media_uuid(&MediaKind::Season, &"deadbeef"),
-            kind: MediaKind::Season,
-            idx: Some(1),
-            parent_id: Some(series_id),
-            grandparent_id: Some(series_id),
-            grandparent: Some(Box::new(series)),
-            ..Default::default()
-        };
-        let candidates = Media::ext_id_uuid_candidates(&season);
+    fn a_whole_series_import_keeps_its_episode_tvdb_ids() {
+        let meta: sdks::stremio::Meta = serde_json::from_value(serde_json::json!({
+            "id": "tt0045373",
+            "imdb_id": "tt0045373",
+            "type": "series",
+            "name": "The Bob Hope Show",
+            "videos": [
+                { "id": "tt0045373:0:1", "season": 0, "episode": 1,
+                  "number": 1, "tvdb_id": 5711666 },
+                { "id": "tt0045373:0:2", "season": 0, "episode": 2,
+                  "number": 2 },
+            ],
+        }))
+        .expect("fixture meta");
 
-        let nested = crate::common::stable_media_uuid(
-            &MediaKind::Season,
-            &format!("{series_id}:1"),
+        let medias = stremio_meta_to_medias(meta).expect("converts");
+        let episodes: Vec<&Media> = medias
+            .iter()
+            .filter(|m| m.kind == MediaKind::Episode)
+            .collect();
+        assert_eq!(episodes.len(), 2);
+
+        let first = episodes
+            .iter()
+            .find(|m| m.idx == Some(1))
+            .expect("episode 1");
+        assert_eq!(
+            first
+                .external_ids
+                .tvdb,
+            Some(5711666),
+            "the id was dropped on the whole-series path"
         );
-        assert!(candidates.contains(&nested), "missing nested candidate");
-        for key in ["tt1234567:1", "fk:27:1"] {
-            let flat = crate::common::stable_media_uuid(&MediaKind::Season, key);
-            assert!(candidates.contains(&flat), "missing flat candidate {key}");
-        }
-        assert!(!candidates.contains(&season.id));
+        assert_eq!(
+            episodes
+                .iter()
+                .find(|m| m.idx == Some(2))
+                .expect("episode 2")
+                .external_ids
+                .tvdb,
+            None
+        );
+    }
+
+    /// A video without one must not invent it.
+    #[test]
+    fn an_episode_with_no_tvdb_id_carries_none() {
+        let ext = ExternalIds {
+            imdb: Some(NonEmptyString::try_new("tt1234567".to_string()).unwrap()),
+            ..Default::default()
+        };
+        let video: sdks::stremio::Episode = serde_json::from_value(serde_json::json!({
+            "id": "tt1234567:2:3",
+            "season": 2,
+            "episode": 3,
+        }))
+        .expect("fixture video");
+
+        let ep = stremio_meta_episode(
+            &video,
+            Uuid::from_u128(1),
+            Uuid::from_u128(2),
+            2,
+            &ext,
+        )
+        .unwrap();
+        assert_eq!(
+            ep.external_ids
+                .tvdb,
+            None
+        );
     }
 
     #[test]
@@ -8494,6 +9391,355 @@ mod tests {
             titles.contains(&"Has Digital Release"),
             "movie with digital release date must be shown; got: {:?}",
             titles
+        );
+    }
+
+    /// Two existing rows can each hold a *disjoint* external id for the same
+    /// real title (row A: imdb only, row B: tmdb only) — neither collides
+    /// with the other's unique index alone. Once a refreshed item arrives
+    /// carrying both ids and gets remapped onto row A (the ambiguous-match
+    /// winner), `merge_conflicting_duplicate` must find row B, reparent its
+    /// children onto row A, and delete it — rather than leaving both rows to
+    /// collide identically on every future refresh.
+    #[tokio::test]
+    async fn merge_conflicting_duplicate_reconciles_disjoint_id_rows() {
+        let (_server, guard) = crate::integration_test::new_test_server()
+            .await
+            .unwrap();
+        let db = &guard
+            .0
+            .db;
+
+        let ext_a = ExternalIds {
+            imdb: Some(NonEmptyString::try_new("tt9990101".to_string()).unwrap()),
+            ..Default::default()
+        };
+        let id_a = Uuid::from(&MediaIdRaw {
+            kind: MediaKind::Series,
+            external_ids: ext_a.clone(),
+            season: None,
+            episode: None,
+        });
+        let ext_b = ExternalIds {
+            tmdb: Some(9990101),
+            ..Default::default()
+        };
+        let id_b = Uuid::from(&MediaIdRaw {
+            kind: MediaKind::Series,
+            external_ids: ext_b.clone(),
+            season: None,
+            episode: None,
+        });
+
+        let mut row_a = Media {
+            id: id_a,
+            title: "Row A".to_string(),
+            kind: MediaKind::Series,
+            external_ids: ext_a.clone(),
+            ..Default::default()
+        };
+        row_a
+            .save(db)
+            .await
+            .unwrap();
+        let mut row_b = Media {
+            id: id_b,
+            title: "Row B".to_string(),
+            kind: MediaKind::Series,
+            external_ids: ext_b.clone(),
+            ..Default::default()
+        };
+        row_b
+            .save(db)
+            .await
+            .unwrap();
+
+        // A season under row B, to verify it gets reparented onto the winner.
+        let season_id = get_uuid();
+        let mut season_b = Media {
+            id: season_id,
+            title: "Season 1".to_string(),
+            kind: MediaKind::Season,
+            parent_id: Some(id_b),
+            grandparent_id: Some(id_b),
+            idx: Some(1),
+            ..Default::default()
+        };
+        season_b
+            .save(db)
+            .await
+            .unwrap();
+
+        // The refreshed item carries both ids and was already remapped onto
+        // row A's id by the ambiguous-match winner-pick.
+        let merged_ext = ExternalIds {
+            imdb: ext_a.imdb,
+            tmdb: ext_b.tmdb,
+            ..Default::default()
+        };
+        let incoming = Media {
+            id: id_a,
+            title: "Row A".to_string(),
+            kind: MediaKind::Series,
+            external_ids: merged_ext,
+            ..Default::default()
+        };
+
+        let merged = Media::merge_conflicting_duplicate(db, &incoming).await;
+        assert!(
+            merged,
+            "expected the disjoint-id duplicate row to be found and merged"
+        );
+
+        assert!(
+            Media::get_by_id(db, &id_b)
+                .await
+                .unwrap()
+                .is_none(),
+            "loser row should be deleted"
+        );
+        assert!(
+            Media::get_by_id(db, &id_a)
+                .await
+                .unwrap()
+                .is_some(),
+            "winner row should remain"
+        );
+
+        let reparented = Media::get_by_id(db, &season_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reparented.parent_id,
+            Some(id_a),
+            "season should be reparented onto the winner"
+        );
+        assert_eq!(
+            reparented.grandparent_id,
+            Some(id_a),
+            "season's grandparent_id should be reparented onto the winner"
+        );
+    }
+
+    /// A missing `digital_released_at` used to make an item refreshable
+    /// forever: TMDB's release_dates data often has no Digital/Physical/TV
+    /// entry at all for a title (especially older ones), so the field could
+    /// never be filled in no matter how many times it was refetched.
+    /// `get_refreshable` must stop selecting such an item once it's had a
+    /// fair shot — a week of retries since it was added, or indefinitely
+    /// while the title itself is recent enough that a digital release is
+    /// still plausible — without ever fabricating a value for the field
+    /// itself.
+    #[tokio::test]
+    async fn get_refreshable_gives_up_on_old_items_with_no_digital_date() {
+        let (_server, guard) = crate::integration_test::new_test_server()
+            .await
+            .unwrap();
+        let db = &guard
+            .0
+            .db;
+        let now = chrono::Utc::now().naive_utc();
+
+        let make_ids = |imdb: &str| {
+            let ext = ExternalIds {
+                imdb: Some(NonEmptyString::try_new(imdb.to_string()).unwrap()),
+                ..Default::default()
+            };
+            let id = uuid::Uuid::from(&MediaIdRaw {
+                kind: MediaKind::Movie,
+                external_ids: ext.clone(),
+                season: None,
+                episode: None,
+            });
+            (id, ext)
+        };
+
+        // Old release, imported a month ago, never got a digital date — past
+        // its week-long grace period and not recent enough to keep trying.
+        let (id_stale, ext_stale) = make_ids("tt9990201");
+        let mut stale = Media {
+            id: id_stale,
+            title: "Ancient, Long Imported".to_string(),
+            kind: MediaKind::Movie,
+            external_ids: ext_stale,
+            released_at: Some(now - chrono::Duration::days(3650)),
+            digital_released_at: None,
+            created_at: now - chrono::Duration::days(30),
+            refreshed_at: Some(now - chrono::Duration::days(30)),
+            ..Default::default()
+        };
+        stale
+            .save(db)
+            .await
+            .unwrap();
+
+        // Old release, but only imported yesterday — still within its
+        // week-long grace period regardless of how old the content is.
+        let (id_new, ext_new) = make_ids("tt9990202");
+        let mut recently_added = Media {
+            id: id_new,
+            title: "Ancient, Just Imported".to_string(),
+            kind: MediaKind::Movie,
+            external_ids: ext_new,
+            released_at: Some(now - chrono::Duration::days(3650)),
+            digital_released_at: None,
+            created_at: now - chrono::Duration::days(1),
+            refreshed_at: Some(now - chrono::Duration::days(1)),
+            ..Default::default()
+        };
+        recently_added
+            .save(db)
+            .await
+            .unwrap();
+
+        // Recent release, imported a month ago — a digital date is still
+        // plausible, so it must keep being retried regardless of import age.
+        let (id_recent_release, ext_recent) = make_ids("tt9990203");
+        let mut recent_release = Media {
+            id: id_recent_release,
+            title: "Recent Release".to_string(),
+            kind: MediaKind::Movie,
+            external_ids: ext_recent,
+            released_at: Some(now - chrono::Duration::days(30)),
+            digital_released_at: None,
+            created_at: now - chrono::Duration::days(30),
+            refreshed_at: Some(now - chrono::Duration::days(30)),
+            ..Default::default()
+        };
+        recent_release
+            .save(db)
+            .await
+            .unwrap();
+
+        let (batch, _) = Media::get_refreshable(db, 100, None, false)
+            .await
+            .unwrap();
+        let ids: HashSet<Uuid> = batch
+            .iter()
+            .map(|m| m.id)
+            .collect();
+
+        assert!(
+            !ids.contains(&id_stale),
+            "old item with no digital date, long imported, must stop being retried"
+        );
+        assert!(
+            ids.contains(&id_new),
+            "recently-imported item must still get its week-long grace period"
+        );
+        assert!(
+            ids.contains(&id_recent_release),
+            "recently-released item must keep being retried regardless of import age"
+        );
+    }
+
+    /// `list_for_popularity_sync` must carry `title`/`kind`/`external_ratings`
+    /// through its minimal projection, not just `id`/`external_ids` — those
+    /// fields aren't optional extras: `Media::upsert` overwrites `title`/
+    /// `kind` unconditionally on conflict (not `COALESCE`d) and replaces
+    /// `external_ratings` whole-column rather than merging it in SQL, so a
+    /// caller that fetched a blank/default value for any of them and wrote
+    /// it back would silently clobber the real title or wipe out unrelated
+    /// rating sources (e.g. TMDB) that a popularity sync never touches.
+    #[tokio::test]
+    async fn list_for_popularity_sync_round_trips_without_clobbering_other_fields() {
+        let (_server, guard) = crate::integration_test::new_test_server()
+            .await
+            .unwrap();
+        let db = &guard
+            .0
+            .db;
+
+        let ext = ExternalIds {
+            imdb: Some(NonEmptyString::try_new("tt9990301".to_string()).unwrap()),
+            ..Default::default()
+        };
+        let id = Uuid::from(&MediaIdRaw {
+            kind: MediaKind::Movie,
+            external_ids: ext.clone(),
+            season: None,
+            episode: None,
+        });
+        let mut original = Media {
+            id,
+            title: "Real Title".to_string(),
+            kind: MediaKind::Movie,
+            external_ids: ext,
+            external_ratings: Some(ExternalRatings {
+                tmdb: Some(Rating {
+                    score: 8.5,
+                    vote_count: Some(1200),
+                }),
+                remuxdb: None,
+            }),
+            ..Default::default()
+        };
+        original
+            .save(db)
+            .await
+            .unwrap();
+
+        let page = Media::list_for_popularity_sync(db, 10, 0)
+            .await
+            .unwrap();
+        let mut fetched = page
+            .into_iter()
+            .find(|m| m.id == id)
+            .expect("item should be returned by the projection");
+
+        assert_eq!(fetched.title, "Real Title");
+        assert_eq!(fetched.kind, MediaKind::Movie);
+        assert_eq!(
+            fetched
+                .external_ratings
+                .as_ref()
+                .and_then(|r| r
+                    .tmdb
+                    .as_ref())
+                .map(|r| r.score),
+            Some(8.5),
+            "pre-existing tmdb rating must survive the minimal projection"
+        );
+
+        // Mimic what `persist_metrics` does: merge a new remuxdb rating into
+        // whatever was already there, then upsert the whole object back.
+        fetched
+            .external_ratings
+            .get_or_insert_default()
+            .remuxdb = Some(RemuxDbRatings {
+            score: Some(7.0),
+            score_average: Some(7.0),
+            tomatoes: None,
+            sources: vec![],
+            updated_at: None,
+        });
+        Media::upsert(db, &[fetched])
+            .await
+            .unwrap();
+
+        let stored = Media::get_by_id(db, &id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.title, "Real Title", "title must not be clobbered");
+        assert_eq!(stored.kind, MediaKind::Movie, "kind must not be clobbered");
+        let ratings = stored
+            .external_ratings
+            .expect("external_ratings must survive the round trip");
+        assert_eq!(
+            ratings
+                .tmdb
+                .map(|r| r.score),
+            Some(8.5),
+            "unrelated tmdb rating must not be wiped out by the popularity sync"
+        );
+        assert_eq!(
+            ratings
+                .remuxdb
+                .and_then(|r| r.score),
+            Some(7.0),
+            "new remuxdb rating must be persisted"
         );
     }
 
@@ -9428,9 +10674,13 @@ mod tests {
             );
         }
 
-        /// `external_ids` has been found holding `''`, which `sqlx` cannot decode.
+        /// The `idx_media_ext_*` expression indexes (migration `202609030002`)
+        /// make SQLite validate `external_ids` as JSON on every write — it
+        /// errors while maintaining the index rather than silently accepting
+        /// malformed JSON. `widen_external_ids`'s `json_valid` fallback stays
+        /// only to repair rows written before those indexes existed.
         #[tokio::test]
-        async fn a_row_holding_invalid_json_is_repaired() {
+        async fn malformed_external_ids_are_rejected_by_the_db() {
             let (_s, guard) = new_test_server()
                 .await
                 .unwrap();
@@ -9443,30 +10693,16 @@ mod tests {
                 },
             )
             .await;
-            sqlx::query("UPDATE media SET external_ids = '' WHERE id = ?1")
+
+            let err = sqlx::query("UPDATE media SET external_ids = '' WHERE id = ?1")
                 .bind(id)
                 .execute(&ctx.db)
                 .await
-                .unwrap();
-
-            let merged = Media::widen_external_ids(
-                &ctx.db,
-                &id,
-                &ExternalIds {
-                    tmdb: Some(949),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap()
-            .unwrap();
-
-            assert_eq!(merged.tmdb, Some(949));
-            assert_eq!(
-                stored(ctx, &id)
-                    .await
-                    .tmdb,
-                Some(949)
+                .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("malformed JSON"),
+                "unexpected error: {err}"
             );
         }
     }
@@ -9606,5 +10842,474 @@ mod tests {
             titles.is_empty(),
             "another user's favorite must not bleed through"
         );
+    }
+
+    // ── Watched filter rule tests ─────────────────────────────────────
+
+    async fn watched_filter(
+        db: &sqlx::SqlitePool,
+        kind: MediaKind,
+        user_id: uuid::Uuid,
+        sort_by: Vec<api::ItemSortBy>,
+    ) -> Vec<String> {
+        let filter = remux_sdks::remux::CollectionFilter {
+            groups: vec![remux_sdks::remux::FilterGroup {
+                rules: vec![remux_sdks::remux::FilterRule::Played { value: true }],
+                match_mode: remux_sdks::remux::FilterMatchMode::All,
+            }],
+            match_mode: remux_sdks::remux::FilterMatchMode::All,
+        };
+        Media::get_by_filter(
+            db,
+            &MediaFilter {
+                kind: Some(vec![kind]),
+                filter_rules: Some(filter),
+                user_id: Some(user_id),
+                sort_by,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .records
+        .into_iter()
+        .map(|m| m.title)
+        .collect()
+    }
+
+    /// Watched=true + DatePlayed sort for a user with no watched items must
+    /// return an empty list without panicking or returning a 500 (was: invalid
+    /// SQL "CASE media.id ELSE ... END" when the rollup is empty).
+    #[tokio::test]
+    async fn watched_empty_user_no_crash() {
+        let (_server, guard) = crate::integration_test::new_test_server()
+            .await
+            .unwrap();
+        let db = &guard
+            .0
+            .db;
+        let uid = uuid::Uuid::new_v4();
+
+        let mut m = media_row(MediaKind::Movie, "Unwatched", "tt9990101");
+        m.save(db)
+            .await
+            .unwrap();
+
+        let titles = watched_filter(
+            db,
+            MediaKind::Movie,
+            uid,
+            vec![api::ItemSortBy::DatePlayed],
+        )
+        .await;
+
+        assert!(
+            titles.is_empty(),
+            "no watched items → empty result, not a crash"
+        );
+    }
+
+    /// Watched=true returns only movies with play_count > 0 for the requesting
+    /// user; unwatched movies and another user's watched movies are excluded.
+    #[tokio::test]
+    async fn watched_filter_returns_watched_movies() {
+        let (_server, guard) = crate::integration_test::new_test_server()
+            .await
+            .unwrap();
+        let db = &guard
+            .0
+            .db;
+        let uid = uuid::Uuid::new_v4();
+        let other = uuid::Uuid::new_v4();
+
+        let mut a = media_row(MediaKind::Movie, "Alpha", "tt9990201");
+        a.save(db)
+            .await
+            .unwrap();
+        let mut b = media_row(MediaKind::Movie, "Beta", "tt9990202");
+        b.save(db)
+            .await
+            .unwrap();
+        let mut c = media_row(MediaKind::Movie, "Gamma", "tt9990203");
+        c.save(db)
+            .await
+            .unwrap();
+
+        insert_user_state(db, uid, a.id, 1, false).await;
+        insert_user_state(db, uid, b.id, 0, false).await; // not watched
+        insert_user_state(db, other, c.id, 1, false).await; // different user
+
+        let mut titles =
+            watched_filter(db, MediaKind::Movie, uid, vec![api::ItemSortBy::SortName])
+                .await;
+        titles.sort();
+
+        assert_eq!(titles, vec!["Alpha"], "only uid's watched movies");
+    }
+
+    /// A watched episode must cause its grandparent series to appear when
+    /// querying with Watched=true on the Series kind.
+    #[tokio::test]
+    async fn watched_episode_rolls_up_to_series() {
+        let (_server, guard) = crate::integration_test::new_test_server()
+            .await
+            .unwrap();
+        let db = &guard
+            .0
+            .db;
+        let uid = uuid::Uuid::new_v4();
+
+        let mut series = media_row(MediaKind::Series, "Show", "tt9990301");
+        series
+            .save(db)
+            .await
+            .unwrap();
+
+        let ep_ext = ExternalIds {
+            imdb: Some(NonEmptyString::try_new("tt9990302".to_string()).unwrap()),
+            ..Default::default()
+        };
+        let ep_id = uuid::Uuid::from(&MediaIdRaw {
+            kind: MediaKind::Episode,
+            external_ids: ep_ext.clone(),
+            season: Some(1),
+            episode: Some(1),
+        });
+        let mut episode = Media {
+            id: ep_id,
+            title: "Pilot".to_string(),
+            kind: MediaKind::Episode,
+            external_ids: ep_ext,
+            grandparent_id: Some(series.id),
+            idx: Some(1),
+            ..Default::default()
+        };
+        episode
+            .save(db)
+            .await
+            .unwrap();
+
+        // Only the episode is watched — not the series row itself.
+        insert_user_state(db, uid, episode.id, 1, false).await;
+
+        let titles = watched_filter(
+            db,
+            MediaKind::Series,
+            uid,
+            vec![api::ItemSortBy::DatePlayed],
+        )
+        .await;
+
+        assert_eq!(
+            titles,
+            vec!["Show"],
+            "watched episode must roll up to series"
+        );
+    }
+
+    /// Watched=true + DatePlayed sort must complete well within 1 s even with
+    /// a large number of media rows and UMS rows. Run with:
+    ///   cargo test -p remux-server watched_date_played_perf -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "perf test — run manually to compare before/after"]
+    async fn watched_date_played_perf() {
+        let (_server, guard) = crate::integration_test::new_test_server()
+            .await
+            .unwrap();
+        let db = &guard
+            .0
+            .db;
+        let uid = uuid::Uuid::new_v4();
+
+        let n_total: usize = 30_000;
+        let n_watched: usize = 3_000;
+        let page_size: u32 = 50; // realistic client page size
+        let mut ids = Vec::with_capacity(n_total);
+        for i in 0..n_total {
+            let imdb = format!("tt{:07}", 7_000_000 + i);
+            let mut m = media_row(MediaKind::Movie, &format!("Movie {i}"), &imdb);
+            m.save(db)
+                .await
+                .unwrap();
+            ids.push(m.id);
+        }
+        for id in ids
+            .iter()
+            .take(n_watched)
+        {
+            insert_user_state(db, uid, *id, 1, false).await;
+        }
+
+        let filter_rules = remux_sdks::remux::CollectionFilter {
+            groups: vec![remux_sdks::remux::FilterGroup {
+                rules: vec![remux_sdks::remux::FilterRule::Played { value: true }],
+                match_mode: remux_sdks::remux::FilterMatchMode::All,
+            }],
+            match_mode: remux_sdks::remux::FilterMatchMode::All,
+        };
+
+        let start = std::time::Instant::now();
+        let result = Media::get_by_filter(
+            db,
+            &MediaFilter {
+                kind: Some(vec![MediaKind::Movie]),
+                filter_rules: Some(filter_rules),
+                user_id: Some(uid),
+                sort_by: vec![api::ItemSortBy::DatePlayed],
+                limit: Some(page_size),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(
+            result
+                .records
+                .len(),
+            page_size as usize,
+            "must return exactly limit rows"
+        );
+        println!(
+            "watched DatePlayed query over {n_total} rows (page {page_size}): {elapsed:?}"
+        );
+        assert!(
+            elapsed.as_millis() < 150,
+            "query took {elapsed:?}, expected < 150 ms — correlated subquery regression?"
+        );
+    }
+}
+
+#[cfg(test)]
+mod dedup_tests {
+    use super::*;
+    use crate::{db::MediaIdRaw, integration_test::new_test_server};
+
+    /// Phase 2: a stored row richer than the incoming item must still be
+    /// found. Stored has `{imdb, kitsu}`, keyed under its kitsu-derived id;
+    /// incoming only carries `{imdb}`. The old candidate-UUID scheme only
+    /// ever generated candidates from the incoming item, so this always
+    /// missed — the bug this phase fixes.
+    #[tokio::test]
+    async fn finds_a_stored_row_richer_than_the_incoming_item() {
+        let (_s, guard) = new_test_server()
+            .await
+            .unwrap();
+        let ctx = &guard.0;
+
+        let imdb = NonEmptyString::try_new("tt37532356".to_string()).unwrap();
+        let stored_ext = ExternalIds {
+            imdb: Some(imdb.clone()),
+            kitsu: Some(50023),
+            ..Default::default()
+        };
+        let stored_raw = MediaIdRaw {
+            kind: MediaKind::Series,
+            external_ids: stored_ext.clone(),
+            season: None,
+            episode: None,
+        };
+        let mut stored = Media {
+            id: Uuid::from(&stored_raw),
+            title: "Stored".into(),
+            kind: MediaKind::Series,
+            external_ids: stored_ext,
+            ..Default::default()
+        };
+        stored
+            .save(&ctx.db)
+            .await
+            .unwrap();
+
+        let incoming_ext = ExternalIds {
+            imdb: Some(imdb),
+            ..Default::default()
+        };
+
+        let found =
+            Media::find_by_external_ids(&ctx.db, &MediaKind::Series, &incoming_ext)
+                .await
+                .expect("stored row should be found by its imdb id alone");
+        assert_eq!(found, stored.id);
+
+        let incoming = Media {
+            id: Uuid::new_v4(),
+            title: "Incoming".into(),
+            kind: MediaKind::Series,
+            external_ids: incoming_ext,
+            ..Default::default()
+        };
+        let existing = Media::find_existing_id_by_ext(&ctx.db, &incoming).await;
+        assert_eq!(
+            existing,
+            Some(stored.id),
+            "find_existing_id_by_ext must delegate to the external-id lookup"
+        );
+    }
+
+    /// Multi-match: incoming carries two ids that resolve to two different
+    /// stored rows. The stronger id (imdb over custom_stremio_id) wins, per
+    /// priority. Both stored rows carry an id from {imdb, custom_stremio_id}
+    /// so each independently satisfies the Movie external-ID requirement.
+    #[tokio::test]
+    async fn strongest_id_wins_on_ambiguous_match() {
+        let (_s, guard) = new_test_server()
+            .await
+            .unwrap();
+        let ctx = &guard.0;
+
+        let imdb_ext = ExternalIds {
+            imdb: Some(NonEmptyString::try_new("tt9999999".to_string()).unwrap()),
+            ..Default::default()
+        };
+        let imdb_raw = MediaIdRaw {
+            kind: MediaKind::Movie,
+            external_ids: imdb_ext.clone(),
+            season: None,
+            episode: None,
+        };
+        let mut imdb_row = Media {
+            id: Uuid::from(&imdb_raw),
+            title: "By imdb".into(),
+            kind: MediaKind::Movie,
+            external_ids: imdb_ext.clone(),
+            ..Default::default()
+        };
+        imdb_row
+            .save(&ctx.db)
+            .await
+            .unwrap();
+
+        let stremio_ext = ExternalIds {
+            custom_stremio_id: Some("addon:other".to_string()),
+            ..Default::default()
+        };
+        let stremio_raw = MediaIdRaw {
+            kind: MediaKind::Movie,
+            external_ids: stremio_ext.clone(),
+            season: None,
+            episode: None,
+        };
+        let mut stremio_row = Media {
+            id: Uuid::from(&stremio_raw),
+            title: "By stremio id".into(),
+            kind: MediaKind::Movie,
+            external_ids: stremio_ext.clone(),
+            ..Default::default()
+        };
+        stremio_row
+            .save(&ctx.db)
+            .await
+            .unwrap();
+
+        let incoming_ext = ExternalIds {
+            imdb: imdb_ext.imdb,
+            custom_stremio_id: stremio_ext.custom_stremio_id,
+            ..Default::default()
+        };
+
+        let found =
+            Media::find_by_external_ids(&ctx.db, &MediaKind::Movie, &incoming_ext)
+                .await
+                .expect("ambiguous match should still resolve");
+        assert_eq!(found, imdb_row.id, "imdb outranks custom_stremio_id");
+    }
+
+    /// Regression: `json_extract` returns SQLite's INTEGER storage class for
+    /// a numeric field like tmdb/tvdb/kitsu/deezer_*. Binding the probe as
+    /// TEXT made the comparison `INTEGER = '123'` — SQLite never coerces
+    /// across storage classes in a bare `=`, so this could never match.
+    #[tokio::test]
+    async fn matches_a_stored_row_by_tmdb_id_alone() {
+        let (_s, guard) = new_test_server()
+            .await
+            .unwrap();
+        let ctx = &guard.0;
+
+        let mut stored = Media {
+            id: Uuid::new_v4(),
+            title: "Heat".into(),
+            kind: MediaKind::Movie,
+            external_ids: ExternalIds {
+                imdb: Some(NonEmptyString::try_new("tt0113277".to_string()).unwrap()),
+                tmdb: Some(949),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        stored
+            .save(&ctx.db)
+            .await
+            .unwrap();
+
+        let incoming_ext = ExternalIds {
+            tmdb: Some(949),
+            ..Default::default()
+        };
+        let found =
+            Media::find_by_external_ids(&ctx.db, &MediaKind::Movie, &incoming_ext)
+                .await;
+        assert_eq!(found, Some(stored.id));
+    }
+
+    /// Phase 4: Artist/Album/Track dedup now runs through the same indexed
+    /// external-id lookup as Movie/Series, not the deleted UUID-candidate
+    /// fallback.
+    #[tokio::test]
+    async fn finds_a_stored_artist_by_deezer_id() {
+        let (_s, guard) = new_test_server()
+            .await
+            .unwrap();
+        let ctx = &guard.0;
+
+        let ext = ExternalIds {
+            deezer_artist: Some(123456),
+            ..Default::default()
+        };
+        let mut artist = Media {
+            id: Uuid::new_v4(),
+            title: "Test Artist".into(),
+            kind: MediaKind::Artist,
+            external_ids: ext.clone(),
+            ..Default::default()
+        };
+        artist
+            .save(&ctx.db)
+            .await
+            .unwrap();
+
+        let found =
+            Media::find_by_external_ids(&ctx.db, &MediaKind::Artist, &ext).await;
+        assert_eq!(found, Some(artist.id));
+    }
+
+    /// Album/Track accept either a deezer id or a youtube id (see
+    /// `validate()`); both must be reachable by `find_by_external_ids`.
+    #[tokio::test]
+    async fn finds_a_stored_album_by_youtube_id_alone() {
+        let (_s, guard) = new_test_server()
+            .await
+            .unwrap();
+        let ctx = &guard.0;
+
+        let ext = ExternalIds {
+            youtube_id: Some("PLxyz".to_string()),
+            ..Default::default()
+        };
+        let mut album = Media {
+            id: Uuid::new_v4(),
+            title: "Test Album".into(),
+            kind: MediaKind::Album,
+            external_ids: ext.clone(),
+            ..Default::default()
+        };
+        album
+            .save(&ctx.db)
+            .await
+            .unwrap();
+
+        let found = Media::find_by_external_ids(&ctx.db, &MediaKind::Album, &ext).await;
+        assert_eq!(found, Some(album.id));
     }
 }

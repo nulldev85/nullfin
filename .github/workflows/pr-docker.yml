@@ -17,13 +17,36 @@ permissions:
   pull-requests: write
 
 jobs:
+  resolve-ref:
+    if: inputs.cleanup == false
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.pr.outputs.sha }}
+    steps:
+      # workflow_dispatch runs against whatever branch is selected in the "Run
+      # workflow" dropdown (main, by default) — it has no inherent link to
+      # pr_number. Without this, build.yml's checkout steps fall back to that
+      # dispatch ref instead of the PR's actual head commit, so the resulting
+      # image silently doesn't contain the PR's changes.
+      - name: Resolve PR head SHA
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          sha=$(gh pr view "${{ inputs.pr_number }}" \
+            --repo "${{ github.repository }}" \
+            --json headRefOid -q .headRefOid)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: resolve-ref
     if: inputs.cleanup == false
     uses: ./.github/workflows/build.yml
     with:
       version: pr-${{ inputs.pr_number }}
       docker_tags: "-t ghcr.io/${{ github.repository }}:pr-${{ inputs.pr_number }}"
       desktop: false
+      ref: ${{ needs.resolve-ref.outputs.sha }}
     secrets: inherit
 
   comment:
@@ -70,7 +93,7 @@ jobs:
             --jq ".[] | select(.metadata.container.tags[] == \"pr-${PR_NUMBER}\") | .id" \
             2>/dev/null | head -1)
           if [ -n "$VERSION_ID" ]; then
-            gh api --method DELETE /orgs/${{ github.repository_owner }}/packages/container/remux/versions/$VERSION_ID
+            gh api --method DELETE /user/packages/container/remux/versions/$VERSION_ID
             echo "Removed ghcr.io/${{ github.repository }}:pr-${PR_NUMBER}"
           else
             echo "No image found for pr-${PR_NUMBER}, skipping"

@@ -12,7 +12,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use csv_async::{AsyncDeserializer, AsyncReaderBuilder};
 use reqwest::Client;
 use serde::de::DeserializeOwned;
-use std::{path::Path, pin::Pin};
+use std::{collections::HashMap, path::Path, pin::Pin};
 //use std::task::{Context, Poll};
 use tempfile;
 use tokio::{
@@ -39,6 +39,39 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use uuid::Uuid;
 
 static SERVER_ID: OnceLock<String> = OnceLock::new();
+static TMDB_RATE_LIMIT: OnceLock<sdks::SharedRateLimit> = OnceLock::new();
+static ADDON_RATE_LIMITS: OnceLock<
+    std::sync::Mutex<HashMap<Uuid, sdks::SharedRateLimit>>,
+> = OnceLock::new();
+
+/// TMDB clients are built in a few independent paths. They must still share
+/// one cooldown, otherwise concurrent metadata refreshes each evade a 429 by
+/// constructing their own client.
+pub(crate) fn tmdb_rate_limit() -> sdks::SharedRateLimit {
+    TMDB_RATE_LIMIT
+        .get_or_init(sdks::SharedRateLimit::new)
+        .clone()
+}
+
+/// Addon clients (see `StremioAddon::service`) are built fresh on every call
+/// rather than cached, so without this each concurrent or sequential call to
+/// the same addon starts with no memory of a prior 429 — the exact problem
+/// `SharedRateLimit` exists to solve, just never wired up per addon.
+///
+/// Keyed by addon id, not host: two addon configs can point at the same host
+/// under different auth/quotas, and must not share a cooldown meant for a
+/// different budget. The cost is the mirror case — two configs that really do
+/// share one backend account won't coordinate — an acceptable miss since
+/// remux has no way to know they share a quota.
+pub(crate) fn addon_rate_limit(addon_id: Uuid) -> sdks::SharedRateLimit {
+    ADDON_RATE_LIMITS
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .entry(addon_id)
+        .or_insert_with(sdks::SharedRateLimit::new)
+        .clone()
+}
 
 pub(crate) fn set_server_id(id: String) {
     let _ = SERVER_ID.set(id);
@@ -310,6 +343,15 @@ pub fn tmdb_client_from_config(
                 .with_retry(
                     sdks::ExponentialBackoff::builder().build_with_max_retries(3),
                 )
+                // TMDB does not send Retry-After on 429, so use its short
+                // throttle window instead of the SDK's generic 60-second
+                // fallback. Must match `addons/tmdb.rs`'s own client factory:
+                // both now feed the same shared cooldown, and a 429 seen on
+                // either one installs this value as the block duration — two
+                // different fallbacks would make the effective cooldown
+                // depend on which client happened to see the 429 first.
+                .with_default_retry_after(std::time::Duration::from_secs(2))
+                .with_shared_rate_limit(tmdb_rate_limit())
         })
 }
 
@@ -358,6 +400,60 @@ impl ProgressReporter {
         let start = idx as f64 / total * 100.0;
         let end = (idx + 1) as f64 / total * 100.0;
         self.scaled(start, end)
+    }
+}
+
+/// Drives a `ProgressReporter` from a single running item count against a
+/// total that can be revised after the fact — unlike `scaled`/`step`, whose
+/// bounds are fixed forever at creation. Meant for a task made of several
+/// phases (e.g. index refresh, catalog import, metadata refresh) whose
+/// individual sizes aren't all known upfront: seed the total with a best
+/// guess (or 0), hand out a `child` reporter per phase weighted by its
+/// estimated share, and correct the total via `adjust_total` once a phase's
+/// real size becomes known — every already-created child keeps working
+/// correctly against the corrected total from then on.
+#[derive(Clone)]
+pub struct ItemProgress {
+    reporter: ProgressReporter,
+    total: Arc<std::sync::atomic::AtomicI64>,
+}
+
+impl ItemProgress {
+    pub fn new(reporter: ProgressReporter, initial_total: usize) -> Self {
+        Self {
+            reporter,
+            total: Arc::new(std::sync::atomic::AtomicI64::new(initial_total as i64)),
+        }
+    }
+
+    /// A child reporter covering `weight` items starting at `base` items
+    /// already accounted for elsewhere. When the child reports `pct`, this
+    /// maps to `(base + weight * pct/100) / total` against the *current*
+    /// total — so a later `adjust_total` call still corrects this child's
+    /// contribution to the overall percentage, not just future ones.
+    pub fn child(&self, base: usize, weight: usize) -> ProgressReporter {
+        let total = self
+            .total
+            .clone();
+        let reporter = self
+            .reporter
+            .clone();
+        ProgressReporter(Arc::new(move |pct: f64| {
+            let total = (total
+                .load(Ordering::Relaxed)
+                .max(1)) as f64;
+            let processed = base as f64 + weight as f64 * pct.clamp(0.0, 100.0) / 100.0;
+            reporter.set(processed / total * 100.0);
+        }))
+    }
+
+    /// Correct the total by `delta` (positive or negative) — e.g. replacing
+    /// an upfront guess with a phase's real size once it's known. Does not
+    /// itself move the displayed percentage; the next report through any
+    /// child reflects the corrected total.
+    pub fn adjust_total(&self, delta: i64) {
+        self.total
+            .fetch_add(delta, Ordering::Relaxed);
     }
 }
 
@@ -418,5 +514,55 @@ impl HideConsole for std::process::Command {
 impl HideConsole for tokio::process::Command {
     fn hide_console(&mut self) -> &mut Self {
         self
+    }
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+
+    fn reporter() -> (ProgressReporter, Arc<AtomicU64>) {
+        let atomic = Arc::new(AtomicU64::new(0));
+        (ProgressReporter::new(atomic.clone()), atomic)
+    }
+
+    fn read(atomic: &Arc<AtomicU64>) -> f64 {
+        f64::from_bits(atomic.load(Ordering::Relaxed))
+    }
+
+    #[test]
+    fn item_progress_child_reports_weighted_share_of_total() {
+        let (root, atomic) = reporter();
+        let item_progress = ItemProgress::new(root, 100);
+        let child_a = item_progress.child(0, 60);
+        let child_b = item_progress.child(60, 40);
+
+        child_a.report(50, 100); // 50% of a 60-item slice = 30 of 100 total.
+        assert_eq!(read(&atomic), 30.0);
+
+        child_b.set(100.0); // finishes the remaining 40-item slice.
+        assert_eq!(read(&atomic), 100.0);
+    }
+
+    #[test]
+    fn item_progress_adjust_total_corrects_already_created_children() {
+        let (root, atomic) = reporter();
+        let item_progress = ItemProgress::new(root, 100);
+        let child = item_progress.child(0, 50);
+
+        child.set(100.0);
+        assert_eq!(read(&atomic), 50.0, "50 of 100 items done");
+
+        // Total revised upward (e.g. a phase's estimate corrected against its
+        // real size) — the *same* child, re-reporting the same percentage of
+        // its own slice, must reflect the corrected total, not the one it was
+        // created against.
+        item_progress.adjust_total(50);
+        child.set(100.0);
+        assert!(
+            (read(&atomic) - 33.3).abs() < 0.2,
+            "expected ~33.3%, got {}",
+            read(&atomic)
+        );
     }
 }

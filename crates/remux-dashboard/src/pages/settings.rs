@@ -7,8 +7,8 @@ use remux_sdks::remux::{
     CountryInfo, CultureDto, EmbeddedSubtitleHandling, EncodingOptions, GetCountries,
     GetCultures, GetEncodingConfiguration, GetIntroConfiguration,
     GetSystemConfiguration, HardwareAccelerationType, IntroOptions, IntroOrder,
-    IntroTriggers, ServerConfiguration, StartTask, UpdateEncodingConfiguration,
-    UpdateIntroConfiguration, UpdateSystemConfiguration,
+    IntroTriggers, ServerConfiguration, SortMediaSourcesMode, StartTask,
+    UpdateEncodingConfiguration, UpdateIntroConfiguration, UpdateSystemConfiguration,
 };
 
 #[component]
@@ -20,12 +20,13 @@ pub fn ServerSettingsCard(app_state: AppState) -> Element {
     let mut countries: Signal<Vec<CountryInfo>> = use_signal(Vec::new);
     let mut cultures: Signal<Vec<CultureDto>> = use_signal(Vec::new);
     let mut catalog_max_items = use_signal(|| 100_i64);
-    let mut meta_concurrency = use_signal(|| 12_i64);
-    let mut delivery_concurrency = use_signal(|| 8_i64);
+    let mut meta_concurrency = use_signal(|| 20_i64);
+    let mut addon_fetch_timeout_secs = use_signal(|| 5_i64);
     let mut filter_digital_release = use_signal(|| true);
     let mut digital_release_buffer = use_signal(|| 0_i64);
     let mut subtitle_languages = use_signal(String::new);
     let mut quick_connect_enabled = use_signal(|| true);
+    let mut enable_next_up_in_continue_watching = use_signal(|| false);
     let mut loading = use_signal(|| true);
     let mut saving = use_signal(|| false);
     let mut error = use_signal(|| Option::<String>::None);
@@ -60,7 +61,10 @@ pub fn ServerSettingsCard(app_state: AppState) -> Element {
                             .unwrap_or(100),
                     );
                     meta_concurrency.set(cfg.meta_concurrency);
-                    delivery_concurrency.set(cfg.delivery_concurrency);
+                    addon_fetch_timeout_secs.set(
+                        cfg.addon_fetch_timeout_secs
+                            .unwrap_or(5),
+                    );
                     filter_digital_release.set(cfg.filter_by_digital_release_date);
                     digital_release_buffer.set(cfg.digital_release_buffer_days);
                     subtitle_languages.set(
@@ -72,6 +76,10 @@ pub fn ServerSettingsCard(app_state: AppState) -> Element {
                     quick_connect_enabled.set(
                         cfg.quick_connect_available
                             .unwrap_or(true),
+                    );
+                    enable_next_up_in_continue_watching.set(
+                        cfg.enable_next_up_in_continue_watching
+                            .unwrap_or(false),
                     );
                     base_cfg.set(Some(cfg));
                 }
@@ -107,13 +115,14 @@ pub fn ServerSettingsCard(app_state: AppState) -> Element {
             .clone();
         let max = *catalog_max_items.peek();
         let concurrency = *meta_concurrency.peek();
-        let delivery = *delivery_concurrency.peek();
+        let addon_timeout = *addon_fetch_timeout_secs.peek();
         let filter_dr = *filter_digital_release.peek();
         let dr_buffer = *digital_release_buffer.peek();
         let sub_langs_str = subtitle_languages
             .peek()
             .clone();
         let qc_enabled = *quick_connect_enabled.peek();
+        let next_up_unified = *enable_next_up_in_continue_watching.peek();
 
         let mut cfg = base_cfg
             .peek()
@@ -123,9 +132,10 @@ pub fn ServerSettingsCard(app_state: AppState) -> Element {
         cfg.metadata_country_code = Some(country);
         cfg.preferred_metadata_language = Some(language);
         cfg.quick_connect_available = Some(qc_enabled);
+        cfg.enable_next_up_in_continue_watching = Some(next_up_unified);
         cfg.catalog_max_items = Some(max);
         cfg.meta_concurrency = concurrency;
-        cfg.delivery_concurrency = delivery;
+        cfg.addon_fetch_timeout_secs = Some(addon_timeout);
         cfg.filter_by_digital_release_date = filter_dr;
         cfg.digital_release_buffer_days = dr_buffer;
         cfg.subtitle_languages = Some(
@@ -248,36 +258,31 @@ pub fn ServerSettingsCard(app_state: AppState) -> Element {
                         }
 
                         div { class: "field",
-                            label { class: "field-label", r#for: "s-delivery-concurrency", "Delivery Concurrency" }
+                            label { class: "field-label", r#for: "s-addon-timeout", "Addon Fetch Timeout (seconds)" }
                             input {
-                                id: "s-delivery-concurrency",
+                                id: "s-addon-timeout",
                                 r#type: "number",
                                 class: "field-input",
                                 min: "1",
-                                max: "200",
-                                value: "{delivery_concurrency}",
+                                max: "120",
+                                value: "{addon_fetch_timeout_secs}",
                                 oninput: move |e| {
                                     if let Ok(n) = e.value().parse::<i64>() {
-                                        delivery_concurrency.set(n);
+                                        addon_fetch_timeout_secs.set(n);
                                     }
                                 },
                             }
                             p { class: "field-hint",
-                                "Number of media trackers whose queued watch activity is sent concurrently. One tracker's events are always sent in order, one at a time, so this only controls how many trackers are worked on at once. Default: 8."
+                                "Max time to wait for a single metadata addon's response before treating it as failed and moving on. Lower values keep a slow or unreachable addon from stalling a refresh; higher values give slow addons more room to respond. Default: 5."
                             }
                         }
 
                         div { class: "field",
-                            label { class: "field-label",
-                                input {
-                                    r#type: "checkbox",
-                                    checked: *filter_digital_release.read(),
-                                    oninput: move |e| filter_digital_release.set(e.checked()),
-                                }
-                                " Filter by digital release date"
-                            }
-                            p { class: "field-hint",
-                                "Hide items that haven't been digitally released yet. Items released theatrically within the past year are always hidden when no digital date is available."
+                            ToggleRow {
+                                label: "Filter by digital release date",
+                                description: "Hide items that haven't been digitally released yet. Items released theatrically within the past year are always hidden when no digital date is available.",
+                                checked: *filter_digital_release.read(),
+                                on_change: move |v| filter_digital_release.set(v),
                             }
                         }
 
@@ -321,16 +326,20 @@ pub fn ServerSettingsCard(app_state: AppState) -> Element {
                         }
 
                         div { class: "field",
-                            label { class: "field-label",
-                                input {
-                                    r#type: "checkbox",
-                                    checked: *quick_connect_enabled.read(),
-                                    oninput: move |e| quick_connect_enabled.set(e.checked()),
-                                }
-                                " Enable QuickConnect"
+                            ToggleRow {
+                                label: "Enable QuickConnect",
+                                description: "Allow clients to log in by entering a code shown on the login screen.",
+                                checked: *quick_connect_enabled.read(),
+                                on_change: move |v| quick_connect_enabled.set(v),
                             }
-                            p { class: "field-hint",
-                                "Allow clients to log in by entering a code shown on the login screen."
+                        }
+
+                        div { class: "field",
+                            ToggleRow {
+                                label: "Include Next Up in Continue Watching",
+                                description: "Add the next released episode of a started series when that series has no episode currently in progress. Disabled by default.",
+                                checked: *enable_next_up_in_continue_watching.read(),
+                                on_change: move |v| enable_next_up_in_continue_watching.set(v),
                             }
                         }
 
@@ -580,47 +589,29 @@ pub fn PlaybackSettingsCard(app_state: AppState) -> Element {
             } else {
                 form { onsubmit: on_submit, style: "display:flex;flex-direction:column;gap:14px",
                         div { class: "field",
-                            label { class: "field-label", "Video Transcoding" }
-                            div { class: "field-hint",
-                                "Allow the server to re-encode video streams. When disabled, the video track is always copied as-is (remux). Per-user policy can restrict this further."
-                            }
-                            label { style: "display:flex;align-items:center;gap:8px",
-                                input {
-                                    r#type: "checkbox",
-                                    checked: *enable_video_transcoding.read(),
-                                    onchange: move |e| enable_video_transcoding.set(e.checked()),
-                                }
-                                "Enable video transcoding"
+                            ToggleRow {
+                                label: "Video Transcoding",
+                                description: "Allow the server to re-encode video streams. When disabled, the video track is always copied as-is (remux). Per-user policy can restrict this further.",
+                                checked: *enable_video_transcoding.read(),
+                                on_change: move |v| enable_video_transcoding.set(v),
                             }
                         }
 
                         div { class: "field",
-                            label { class: "field-label", "Audio Transcoding" }
-                            div { class: "field-hint",
-                                "Allow the server to re-encode audio streams. When disabled, audio is always copied as-is. Per-user policy can restrict this further."
-                            }
-                            label { style: "display:flex;align-items:center;gap:8px",
-                                input {
-                                    r#type: "checkbox",
-                                    checked: *enable_audio_transcoding.read(),
-                                    onchange: move |e| enable_audio_transcoding.set(e.checked()),
-                                }
-                                "Enable audio transcoding"
+                            ToggleRow {
+                                label: "Audio Transcoding",
+                                description: "Allow the server to re-encode audio streams. When disabled, audio is always copied as-is. Per-user policy can restrict this further.",
+                                checked: *enable_audio_transcoding.read(),
+                                on_change: move |v| enable_audio_transcoding.set(v),
                             }
                         }
 
                         div { class: "field",
-                            label { class: "field-label", "Remuxing" }
-                            div { class: "field-hint",
-                                "Allow the server to remux streams (copy video and audio into a different container). When disabled, only direct play is served. Per-user policy can restrict this further."
-                            }
-                            label { style: "display:flex;align-items:center;gap:8px",
-                                input {
-                                    r#type: "checkbox",
-                                    checked: *enable_remuxing.read(),
-                                    onchange: move |e| enable_remuxing.set(e.checked()),
-                                }
-                                "Enable remuxing"
+                            ToggleRow {
+                                label: "Remuxing",
+                                description: "Allow the server to remux streams (copy video and audio into a different container). When disabled, only direct play is served. Per-user policy can restrict this further.",
+                                checked: *enable_remuxing.read(),
+                                on_change: move |v| enable_remuxing.set(v),
                             }
                         }
 
@@ -644,13 +635,10 @@ pub fn PlaybackSettingsCard(app_state: AppState) -> Element {
                             div { class: "field-hint",
                                 "GPU-accelerated video encoding. When auto-detect is on, the server probes available hardware at startup and selects the best option."
                             }
-                            label { style: "display:flex;align-items:center;gap:8px;margin-bottom:8px",
-                                input {
-                                    r#type: "checkbox",
-                                    checked: *auto_detect.read(),
-                                    onchange: move |e| auto_detect.set(e.checked()),
-                                }
-                                "Auto-detect at startup"
+                            ToggleRow {
+                                label: "Auto-detect at startup",
+                                checked: *auto_detect.read(),
+                                on_change: move |v| auto_detect.set(v),
                             }
                             select {
                                 id: "hw-accel",
@@ -697,21 +685,15 @@ pub fn PlaybackSettingsCard(app_state: AppState) -> Element {
                         div { class: "field",
                             label { class: "field-label", "Codec Gates" }
                             div { class: "field-hint", "Allow these codecs for hardware/software encoding." }
-                            label { style: "display:flex;align-items:center;gap:8px;margin-bottom:6px",
-                                input {
-                                    r#type: "checkbox",
-                                    checked: *allow_hevc_encoding.read(),
-                                    onchange: move |e| allow_hevc_encoding.set(e.checked()),
-                                }
-                                "Allow HEVC (H.265) encoding"
+                            ToggleRow {
+                                label: "Allow HEVC (H.265) encoding",
+                                checked: *allow_hevc_encoding.read(),
+                                on_change: move |v| allow_hevc_encoding.set(v),
                             }
-                            label { style: "display:flex;align-items:center;gap:8px",
-                                input {
-                                    r#type: "checkbox",
-                                    checked: *allow_av1_encoding.read(),
-                                    onchange: move |e| allow_av1_encoding.set(e.checked()),
-                                }
-                                "Allow AV1 encoding"
+                            ToggleRow {
+                                label: "Allow AV1 encoding",
+                                checked: *allow_av1_encoding.read(),
+                                on_change: move |v| allow_av1_encoding.set(v),
                             }
                         }
 
@@ -757,36 +739,26 @@ pub fn PlaybackSettingsCard(app_state: AppState) -> Element {
                         }
 
                         div { class: "field",
-                            label { class: "field-label", "Audio Loudness Normalization" }
-                            div { class: "field-hint", "Normalize transcoded audio to a consistent volume level. May increase time to first segment. Has no effect when audio is stream-copied." }
-                            label { style: "display:flex;align-items:center;gap:8px",
-                                input {
-                                    r#type: "checkbox",
-                                    checked: *normalize_audio_loudness.read(),
-                                    onchange: move |e| normalize_audio_loudness.set(e.checked()),
-                                }
-                                "Normalize audio loudness to -14 LUFS"
+                            ToggleRow {
+                                label: "Audio Loudness Normalization",
+                                description: "Normalize transcoded audio to a consistent volume level. May increase time to first segment. Has no effect when audio is stream-copied.",
+                                checked: *normalize_audio_loudness.read(),
+                                on_change: move |v| normalize_audio_loudness.set(v),
                             }
                         }
 
                         div { class: "field",
                             label { class: "field-label", "HDR Tone Mapping" }
                             div { class: "field-hint", "Convert HDR content to SDR using tone mapping. Without tone mapping, colour metadata is rewritten so clients treat the stream as SDR (may look washed out on some content)." }
-                            label { style: "display:flex;align-items:center;gap:8px;margin-bottom:6px",
-                                input {
-                                    r#type: "checkbox",
-                                    checked: *enable_tonemapping.read(),
-                                    onchange: move |e| enable_tonemapping.set(e.checked()),
-                                }
-                                "Software tone mapping (tonemapx, CPU)"
+                            ToggleRow {
+                                label: "Software tone mapping (tonemapx, CPU)",
+                                checked: *enable_tonemapping.read(),
+                                on_change: move |v| enable_tonemapping.set(v),
                             }
-                            label { style: "display:flex;align-items:center;gap:8px;margin-bottom:8px",
-                                input {
-                                    r#type: "checkbox",
-                                    checked: *enable_vpp_tonemapping.read(),
-                                    onchange: move |e| enable_vpp_tonemapping.set(e.checked()),
-                                }
-                                "Hardware VPP tone mapping (tonemap_vaapi, Intel VAAPI/QSV)"
+                            ToggleRow {
+                                label: "Hardware VPP tone mapping (tonemap_vaapi, Intel VAAPI/QSV)",
+                                checked: *enable_vpp_tonemapping.read(),
+                                on_change: move |v| enable_vpp_tonemapping.set(v),
                             }
                             if *enable_tonemapping.read() && !*enable_vpp_tonemapping.read() {
                                 div { style: "margin-top:4px",
@@ -926,6 +898,133 @@ pub fn PlaybackSettingsCard(app_state: AppState) -> Element {
 }
 
 #[component]
+pub fn StreamSortingSettingsCard(app_state: AppState) -> Element {
+    let mut base_cfg: Signal<Option<ServerConfiguration>> = use_signal(|| None);
+    let mut sort_mode = use_signal(|| SortMediaSourcesMode::Best);
+    let mut show_decision = use_signal(|| true);
+    let mut loading = use_signal(|| true);
+    let mut saving = use_signal(|| false);
+    let mut error: Signal<Option<String>> = use_signal(|| None);
+
+    let app_state_load = app_state.clone();
+    use_effect(move || {
+        let client = app_state_load.clone();
+        spawn(async move {
+            match client
+                .execute(GetSystemConfiguration)
+                .await
+            {
+                Ok(cfg) => {
+                    sort_mode.set(
+                        cfg.sort_media_sources
+                            .unwrap_or_default(),
+                    );
+                    show_decision.set(
+                        cfg.show_playback_decision_in_title
+                            .unwrap_or(true),
+                    );
+                    base_cfg.set(Some(cfg));
+                }
+                Err(e) => error.set(Some(format!("Failed to load settings: {e}"))),
+            }
+            loading.set(false);
+        });
+    });
+
+    let description = match *sort_mode.read() {
+        SortMediaSourcesMode::Disabled => {
+            "MediaSources stay in probe/addon order — no capability-based sorting."
+        }
+        SortMediaSourcesMode::Best => {
+            "Direct Play and Direct Stream count equally (Direct Stream is just a low-overhead container remux), so quality picks the winner between them — a higher-bitrate remux can outrank a lower-bitrate direct play. A version that actually needs a re-encode still ranks below both. Recommended for most setups."
+        }
+        SortMediaSourcesMode::Compatibility => {
+            "Never prefer a version that needs any transcode over a direct play, and never prefer a remux over a true direct play, even if the transcode-needing one is technically higher quality."
+        }
+        SortMediaSourcesMode::Quality => {
+            "Best quality (resolution, HDR, bit depth, audio) always wins, even if it means transcoding."
+        }
+    };
+
+    rsx! {
+        Card { title: "General",
+            if *loading.read() {
+                LoadingText {}
+            } else {
+                div { style: "display:flex;flex-direction:column;gap:14px",
+                    div { class: "field",
+                        label { class: "field-label", r#for: "sort-media-sources", "Sort streams by device capability" }
+                        div { class: "field-hint", "{description}" }
+                        select {
+                            id: "sort-media-sources",
+                            class: "select-input",
+                            disabled: *saving.read(),
+                            value: "{sort_mode.read().to_string()}",
+                            onchange: {
+                                let client = app_state.clone();
+                                move |e: Event<FormData>| {
+                                    let Ok(mode) = e.value().parse::<SortMediaSourcesMode>() else { return };
+                                    sort_mode.set(mode);
+                                    let Some(cfg) = base_cfg.peek().clone() else { return };
+                                    let updated = ServerConfiguration {
+                                        sort_media_sources: Some(mode),
+                                        ..cfg
+                                    };
+                                    saving.set(true);
+                                    error.set(None);
+                                    let c = client.clone();
+                                    spawn(async move {
+                                        match c.execute(UpdateSystemConfiguration { config: updated.clone() }).await {
+                                            Ok(_) => base_cfg.set(Some(updated)),
+                                            Err(e) => error.set(Some(format!("Failed to save: {e}"))),
+                                        }
+                                        saving.set(false);
+                                    });
+                                }
+                            },
+                            option { value: "Disabled", selected: *sort_mode.read() == SortMediaSourcesMode::Disabled, "Disabled" }
+                            option { value: "Best", selected: *sort_mode.read() == SortMediaSourcesMode::Best, "Best" }
+                            option { value: "Compatibility", selected: *sort_mode.read() == SortMediaSourcesMode::Compatibility, "Compatibility" }
+                            option { value: "Quality", selected: *sort_mode.read() == SortMediaSourcesMode::Quality, "Quality" }
+                        }
+                    }
+                    ToggleRow {
+                        label: "Show playback decision in title",
+                        description: "Append \"(Direct Play)\", \"(Direct Stream)\", or \"(Transcode)\" to each stream's display title, judged against the device's last known DeviceProfile. Enabled by default.",
+                        checked: *show_decision.read(),
+                        disabled: *saving.read(),
+                        on_change: {
+                            let client = app_state.clone();
+                            move |v| {
+                                show_decision.set(v);
+                                let Some(cfg) = base_cfg.peek().clone() else { return };
+                                let updated = ServerConfiguration {
+                                    show_playback_decision_in_title: Some(v),
+                                    ..cfg
+                                };
+                                saving.set(true);
+                                error.set(None);
+                                let c = client.clone();
+                                spawn(async move {
+                                    match c.execute(UpdateSystemConfiguration { config: updated.clone() }).await {
+                                        Ok(_) => base_cfg.set(Some(updated)),
+                                        Err(e) => error.set(Some(format!("Failed to save: {e}"))),
+                                    }
+                                    saving.set(false);
+                                });
+                            }
+                        }
+                    }
+                    if let Some(err) = error.read().as_ref() {
+                        ErrorAlert { message: err.clone() }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
 pub fn ProbeSettingsCard(app_state: AppState) -> Element {
     let mut base_cfg: Signal<Option<ServerConfiguration>> = use_signal(|| None);
     let mut probe_timeout = use_signal(|| 20_i64);
@@ -1048,17 +1147,11 @@ pub fn ProbeSettingsCard(app_state: AppState) -> Element {
                         }
 
                         div { class: "field",
-                            label { class: "field-label", "Auto Next Stream on Probe Fail" }
-                            div { class: "field-hint",
-                                "When a stream probe fails, automatically try the next stream with matching resolution and type."
-                            }
-                            label { style: "display:flex;align-items:center;gap:8px",
-                                input {
-                                    r#type: "checkbox",
-                                    checked: *auto_next_stream.read(),
-                                    onchange: move |e| auto_next_stream.set(e.checked()),
-                                }
-                                "Enabled"
+                            ToggleRow {
+                                label: "Auto Next Stream on Probe Fail",
+                                description: "When a stream probe fails, automatically try the next stream with matching resolution and type.",
+                                checked: *auto_next_stream.read(),
+                                on_change: move |v| auto_next_stream.set(v),
                             }
                         }
 
@@ -1150,7 +1243,7 @@ pub fn SearchSettingsCard(app_state: AppState) -> Element {
             .peek()
             .clone()
             .unwrap_or_default();
-        let mut remote_enabled: Vec<String> = vec!["person".to_string()];
+        let mut remote_enabled: Vec<String> = Vec::new();
         if *movies_remote.peek() {
             remote_enabled.push("movie".to_string());
         }
@@ -1494,15 +1587,12 @@ pub fn P2pSettingsCard(app_state: AppState) -> Element {
             } else {
                 form { onsubmit: on_submit, style: "display:flex;flex-direction:column;gap:14px",
                         div { class: "field",
-                            label { class: "field-label",
-                                input {
-                                    r#type: "checkbox",
-                                    checked: *p2p_enabled.read(),
-                                    oninput: move |e| p2p_enabled.set(e.checked()),
-                                }
-                                " Enable P2P Streams"
+                            ToggleRow {
+                                label: "Enable P2P Streams",
+                                description: "Allow torrent/magnet streams from AIO sources.",
+                                checked: *p2p_enabled.read(),
+                                on_change: move |v| p2p_enabled.set(v),
                             }
-                            p { class: "field-hint", "Allow torrent/magnet streams from AIO sources." }
                         }
 
                         if *p2p_enabled.read() {
@@ -1688,41 +1778,29 @@ pub fn IntroSettingsCard(app_state: AppState) -> Element {
                     div { class: "field",
                         label { class: "field-label", "Play Before" }
                         div { class: "field-hint", "Which content types trigger an intro." }
-                        label { style: "display:flex;align-items:center;gap:8px;margin-bottom:6px",
-                            input {
-                                r#type: "checkbox",
-                                checked: *movies.read(),
-                                onchange: move |e| movies.set(e.checked()),
-                            }
-                            "Movies"
+                        ToggleRow {
+                            label: "Movies",
+                            checked: *movies.read(),
+                            on_change: move |v| movies.set(v),
                         }
-                        label { style: "display:flex;align-items:center;gap:8px;margin-bottom:6px",
-                            input {
-                                r#type: "checkbox",
-                                checked: *season_premieres.read(),
-                                onchange: move |e| season_premieres.set(e.checked()),
-                            }
-                            "Season premieres (episode 1 of each season)"
+                        ToggleRow {
+                            label: "Season premieres (episode 1 of each season)",
+                            checked: *season_premieres.read(),
+                            on_change: move |v| season_premieres.set(v),
                         }
-                        label { style: "display:flex;align-items:center;gap:8px",
-                            input {
-                                r#type: "checkbox",
-                                checked: *all_episodes.read(),
-                                onchange: move |e| all_episodes.set(e.checked()),
-                            }
-                            "All episodes"
+                        ToggleRow {
+                            label: "All episodes",
+                            checked: *all_episodes.read(),
+                            on_change: move |v| all_episodes.set(v),
                         }
                     }
 
                     div { class: "field",
-                        label { class: "field-label", "Resume Behaviour" }
-                        label { style: "display:flex;align-items:center;gap:8px",
-                            input {
-                                r#type: "checkbox",
-                                checked: *skip_resume.read(),
-                                onchange: move |e| skip_resume.set(e.checked()),
-                            }
-                            "Skip intro when user is resuming from a saved position"
+                        ToggleRow {
+                            label: "Skip intro when resuming",
+                            description: "Skip intro when user is resuming from a saved position.",
+                            checked: *skip_resume.read(),
+                            on_change: move |v| skip_resume.set(v),
                         }
                     }
 
@@ -1818,15 +1896,12 @@ pub fn RemuxdbSettingsCard(app_state: AppState) -> Element {
                         "Want to help populate the DB faster? You can run a worker! Join Discord for more info."
                     }
                     div { class: "field",
-                        label { class: "field-label",
-                            input {
-                                r#type: "checkbox",
-                                checked: *enabled.read(),
-                                oninput: move |e| enabled.set(e.checked()),
-                            }
-                            " Enable RemuxDB"
+                        ToggleRow {
+                            label: "Enable RemuxDB",
+                            description: "Submit probe data to RemuxDB after each live probe.",
+                            checked: *enabled.read(),
+                            on_change: move |v| enabled.set(v),
                         }
-                        p { class: "field-hint", "Submit probe data to RemuxDB after each live probe." }
                     }
                     if let Some(err) = error.read().as_ref() {
                         ErrorAlert { message: err.clone() }

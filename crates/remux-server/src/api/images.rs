@@ -1,4 +1,5 @@
 use axum::{
+    Json,
     extract::{Path, State},
     http::{StatusCode, header},
     response::IntoResponse,
@@ -6,11 +7,13 @@ use axum::{
 use axum_extra::extract::Query;
 use remux_macros::{delete, get, post};
 use serde::Deserialize;
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
     AppState, OptionExt, ResultExt, api, db,
     db::{ImageKind, auth},
+    sdks,
     services::image::{ImageProcessOptions, ImageService},
 };
 use axum_anyhow::ApiResult as Result;
@@ -103,12 +106,37 @@ async fn items_images_inner(
                     .to_string()
                     .parse()
                     .unwrap_or(ImageKind::Primary);
-                // If Thumb is requested but not stored, fall back to Primary.
+                let is_collection = matches!(media.kind, db::MediaKind::Collection);
+                // Thumb falls back to a synthesized Backdrop+Logo composite
+                // (below) when a Backdrop exists; only falls back to Primary
+                // outright when there's no Backdrop to synthesize from either.
+                // Collections have no dedicated Thumb of their own — Thumb is
+                // just the generated Primary artwork (same image, same tag;
+                // see `ImageTags` in api/models.rs). Backdrop, unlike Thumb, is
+                // NOT derived from Primary: a collection's backdrop must be a
+                // real, separately-uploaded image (typically textless) or none
+                // at all — it must never silently alias the text-overlaid
+                // Primary artwork.
                 let img_row = media
                     .images
                     .get(kind)
                     .or_else(|| {
-                        if kind == ImageKind::Thumb {
+                        if kind == ImageKind::Thumb
+                            && !is_collection
+                            && media
+                                .images
+                                .get(ImageKind::Backdrop)
+                                .is_none()
+                        {
+                            media
+                                .images
+                                .get(ImageKind::Primary)
+                        } else {
+                            None
+                        }
+                    })
+                    .or_else(|| {
+                        if kind == ImageKind::Thumb && is_collection {
                             media
                                 .images
                                 .get(ImageKind::Primary)
@@ -117,34 +145,90 @@ async fn items_images_inner(
                         }
                     });
 
-                if let Some(img) = img_row {
-                    let source_key = img
-                        .id
-                        .to_string();
-                    if img
-                        .path
-                        .starts_with('/')
-                    {
-                        let path = std::path::PathBuf::from(&img.path);
-                        let (b, ct) = ImageService::serve_local(&path)
-                            .await
-                            .context_not_found("image file not found")?;
-                        (b, ct.to_string(), source_key, false)
-                    } else {
-                        // Always proxy external URLs rather than redirecting — some clients
-                        // (e.g. Infuse) do not follow redirects for image requests.
-                        let (b, ct) = fetch_upstream(&img.path)
-                            .await
-                            .context_not_found("image fetch failed")?;
-                        (b, ct, source_key, true)
+                // A collection's Primary/Thumb can always be regenerated on
+                // demand (see the `library_image` branch below) — so for a
+                // collection, a DB row whose file has since gone missing (or
+                // whose remote URL no longer resolves) should fall through to
+                // regenerating it instead of 404ing outright, same as having no
+                // row at all. Backdrop is deliberately excluded: it must be a
+                // real, separately-uploaded image or nothing — never silently
+                // substituted with the (text-overlaid) generated artwork.
+                let can_regenerate = is_collection
+                    && matches!(
+                        image_type,
+                        api::ImageType::Primary | api::ImageType::Thumb
+                    );
+                let served_from_row = match img_row {
+                    Some(img) => {
+                        let source_key = img
+                            .id
+                            .to_string();
+                        if img
+                            .path
+                            .starts_with('/')
+                        {
+                            let path = std::path::PathBuf::from(&img.path);
+                            match ImageService::serve_local(&path).await {
+                                Ok((b, ct)) => {
+                                    Some((b, ct.to_string(), source_key, false))
+                                }
+                                Err(e) if can_regenerate => {
+                                    warn!(id = %id, error = %e, "stored collection image file missing, regenerating");
+                                    None
+                                }
+                                Err(e) => {
+                                    return Err(e)
+                                        .context_not_found("image file not found");
+                                }
+                            }
+                        } else {
+                            // Always proxy external URLs rather than redirecting — some clients
+                            // (e.g. Infuse) do not follow redirects for image requests.
+                            match fetch_upstream(&img.path).await {
+                                Ok((b, ct)) => Some((b, ct, source_key, true)),
+                                Err(e) if can_regenerate => {
+                                    warn!(id = %id, error = %e, "stored collection image fetch failed, regenerating");
+                                    None
+                                }
+                                Err(e) => {
+                                    return Err(e)
+                                        .context_not_found("image fetch failed");
+                                }
+                            }
+                        }
                     }
-                } else if matches!(
-                    image_type,
-                    api::ImageType::Primary | api::ImageType::Thumb
-                ) && matches!(
-                    media.kind,
-                    db::MediaKind::Collection | db::MediaKind::Folder
-                ) {
+                    None => None,
+                };
+
+                if let Some(t) = served_from_row {
+                    t
+                } else if kind == ImageKind::Thumb
+                    && !is_collection
+                    && let Some(backdrop) = media
+                        .images
+                        .get(ImageKind::Backdrop)
+                {
+                    let logo = media
+                        .images
+                        .get(ImageKind::Logo);
+                    let (bytes, cache_key) = ImageService::cached_synthetic_thumb(
+                        &state
+                            .ctx
+                            .config
+                            .data_dir,
+                        backdrop.id,
+                        logo.map(|l| l.id),
+                        &backdrop.path,
+                        logo.map(|l| {
+                            l.path
+                                .as_str()
+                        }),
+                        &media.title,
+                    )
+                    .await
+                    .context_internal("thumb generation failed")?;
+                    (bytes, "image/jpeg".to_string(), cache_key, false)
+                } else if can_regenerate {
                     let b = ImageService::library_image(
                         &state
                             .ctx
@@ -331,6 +415,52 @@ pub async fn items_images_indexed(
     items_images_inner(state, id, image_type, q).await
 }
 
+/// Render a collection's generated image from draft, unsaved config — nothing
+/// is written to disk or the DB. Lets the dashboard's "Update preview" show
+/// what a config/filter change would produce without persisting it; only the
+/// real Save action (`PATCH /items/{id}`) commits anything.
+#[post("/items/{id}/imagepreview")]
+pub async fn preview_collection_image(
+    State(state): State<AppState>,
+    _session: auth::AdminSession,
+    Path(id): Path<Uuid>,
+    Json(payload): Json<sdks::remux::PreviewCollectionImagePayload>,
+) -> Result<impl IntoResponse> {
+    let media = db::Media::get_by_id(
+        &state
+            .ctx
+            .db,
+        &id,
+    )
+    .await?
+    .context_not_found("item not found")?;
+
+    let (bytes, content_type) = ImageService::generate_preview(
+        id,
+        &media.title,
+        &state
+            .ctx
+            .db,
+        &payload.image_config,
+        payload
+            .smart_filter
+            .as_ref(),
+    )
+    .await
+    .context_internal("failed to generate preview")?;
+
+    // The dashboard SDK client always reads responses as JSON text (see
+    // Client::execute_arc), so raw image bytes can't go back as the body —
+    // base64-envelope them instead. The dashboard turns this straight back
+    // into a `data:` URL, matching the format its local-file picker already
+    // produces client-side.
+    use base64::Engine;
+    Ok(axum::Json(api::CollectionImagePreviewResponse {
+        content_type: content_type.to_string(),
+        data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+    }))
+}
+
 // --- POST (upload) ---
 
 async fn upload_item_image_inner(
@@ -339,13 +469,50 @@ async fn upload_item_image_inner(
     kind: ImageKind,
     image: api::image::JellyfinImage,
 ) -> Result<impl IntoResponse> {
+    // A GIF poster is always served as-is to preserve animation, so it can
+    // never be composite source material for the collection image
+    // configurator (which flattens everything to a static JPEG). Gate on the
+    // upload itself rather than a mode/setting so this can't be misconfigured.
+    let is_gif = crate::api::image::detect_content_type(&image.bytes) == "image/gif";
+    let (is_collection_kind, is_collection_source, title) = {
+        let media = db::Media::get_by_id(
+            &state
+                .ctx
+                .db,
+            &id,
+        )
+        .await?
+        .context_not_found("item not found")?;
+        let is_collection_kind = kind == ImageKind::Primary
+            && matches!(
+                media.kind,
+                db::MediaKind::Collection | db::MediaKind::Folder
+            );
+        (
+            is_collection_kind,
+            is_collection_kind
+                && !is_gif
+                && media
+                    .collection_image_config
+                    .is_some(),
+            media
+                .title
+                .clone(),
+        )
+    };
+    let storage_kind = if is_collection_source {
+        ImageKind::Backdrop
+    } else {
+        kind
+    };
+
     ImageService::save_image(
         &state
             .ctx
             .config
             .data_dir,
         id,
-        kind,
+        storage_kind,
         &image.bytes,
         &state
             .ctx
@@ -353,6 +520,50 @@ async fn upload_item_image_inner(
     )
     .await
     .context_internal("failed to save image")?;
+
+    if is_collection_source {
+        // Keep the uploaded file as the source image and regenerate Primary
+        // from it whenever the collection overlay changes.
+        ImageService::delete_image(
+            &state
+                .ctx
+                .config
+                .data_dir,
+            id,
+            ImageKind::Primary,
+            &state
+                .ctx
+                .db,
+        )
+        .await
+        .context_internal("failed to clear generated image")?;
+        ImageService::library_image(
+            &state
+                .ctx
+                .config
+                .data_dir,
+            id,
+            &title,
+            &state
+                .ctx
+                .db,
+        )
+        .await
+        .context_internal("failed to generate collection image")?;
+    } else if is_collection_kind && is_gif {
+        // Drop any existing image config: it no longer applies once the
+        // collection has a raw GIF poster, and this also hides the
+        // layout/overlay configurator in the dashboard for it.
+        sqlx::query("UPDATE media SET collection_image_config = NULL WHERE id = ?")
+            .bind(id)
+            .execute(
+                &state
+                    .ctx
+                    .db,
+            )
+            .await
+            .context_internal("failed to clear collection image config")?;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -383,6 +594,26 @@ async fn delete_item_image_inner(
     id: Uuid,
     kind: ImageKind,
 ) -> Result<impl IntoResponse> {
+    let has_collection_source = {
+        let media = db::Media::get_by_id(
+            &state
+                .ctx
+                .db,
+            &id,
+        )
+        .await?;
+        kind == ImageKind::Primary
+            && media
+                .as_ref()
+                .is_some_and(|item| {
+                    matches!(
+                        item.kind,
+                        db::MediaKind::Collection | db::MediaKind::Folder
+                    ) && item
+                        .collection_image_config
+                        .is_some()
+                })
+    };
     ImageService::delete_image(
         &state
             .ctx
@@ -396,6 +627,21 @@ async fn delete_item_image_inner(
     )
     .await
     .context_internal("failed to delete image")?;
+    if has_collection_source {
+        ImageService::delete_image(
+            &state
+                .ctx
+                .config
+                .data_dir,
+            id,
+            ImageKind::Backdrop,
+            &state
+                .ctx
+                .db,
+        )
+        .await
+        .context_internal("failed to delete custom collection source")?;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 

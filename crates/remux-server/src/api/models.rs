@@ -199,6 +199,9 @@ pub fn db_user_to_dto(data_dir: &std::path::Path, user: db::User) -> UserDto {
         .map(|p| p.0)
         .unwrap_or_default();
     policy.is_administrator = user.is_admin;
+    if user.is_admin {
+        policy.enable_collection_management = true;
+    }
     // SyncPlay requires group lifecycle, playback commands, and websocket
     // coordination. Do not advertise it while those server APIs are absent.
     policy.sync_play_access = SyncPlayUserAccessType::None;
@@ -268,9 +271,10 @@ pub fn db_state_to_dto(
         .filter(|&r| r > 0)
         .map(|r| (state.playback_position as f32 / r as f32 * 100.0).clamp(0.0, 100.0));
     UserItemDataDto {
-        played: state
-            .played_at
-            .is_some(),
+        played: state.play_count > 0
+            || state
+                .played_at
+                .is_some(),
         last_played_date: state
             .last_played_at
             .or(state.played_at)
@@ -322,6 +326,36 @@ pub fn db_media_to_item(media: db::Media, hide_sources: bool) -> BaseItemDto {
         .kind
         .clone()
         .into();
+
+    let primary_tag = media_image_tag(&media, db::ImageKind::Primary).or_else(|| {
+        if media.kind == db::MediaKind::Track {
+            // Tracks inherit album art when they have no dedicated cover.
+            parent_image_tag(
+                media
+                    .parent
+                    .as_deref(),
+                db::ImageKind::Primary,
+            )
+        } else if matches!(
+            media.kind,
+            db::MediaKind::Collection | db::MediaKind::Folder
+        ) {
+            // For collections/folders with no poster image, set a synthetic
+            // tag so clients know to request the generated placeholder.
+            // Include updated_at so deleting an image (which touches it)
+            // produces a new tag and busts the client cache.
+            Some(format!(
+                "{}-{}",
+                media.id,
+                media
+                    .updated_at
+                    .and_utc()
+                    .timestamp()
+            ))
+        } else {
+            None
+        }
+    });
 
     let mut item = BaseItemDto {
         id: media
@@ -442,38 +476,21 @@ pub fn db_media_to_item(media: db::Media, hide_sources: bool) -> BaseItemDto {
             .clone(),
         parent_index_number: media.parent_idx,
         image_tags: Some(ImageTags {
-            primary: media_image_tag(&media, db::ImageKind::Primary).or_else(|| {
-                if media.kind == db::MediaKind::Track {
-                    // Tracks inherit album art when they have no dedicated cover.
-                    parent_image_tag(
-                        media
-                            .parent
-                            .as_deref(),
-                        db::ImageKind::Primary,
-                    )
-                } else if matches!(
-                    media.kind,
-                    db::MediaKind::Collection | db::MediaKind::Folder
-                ) {
-                    // For collections/folders with no poster image, set a synthetic
-                    // tag so clients know to request the generated placeholder.
-                    // Include updated_at so deleting an image (which touches it)
-                    // produces a new tag and busts the client cache.
-                    Some(format!(
-                        "{}-{}",
-                        media.id,
-                        media
-                            .updated_at
-                            .and_utc()
-                            .timestamp()
-                    ))
+            primary: primary_tag.clone(),
+            logo: media_image_tag(&media, db::ImageKind::Logo),
+            backdrop: media_image_tag(&media, db::ImageKind::Backdrop),
+            // A collection has no dedicated Thumb of its own — Thumb is just
+            // the generated Primary artwork (see the matching serve-time
+            // fallback in api/images.rs), so report the identical tag rather
+            // than nothing, or a value a client would treat as a distinct
+            // image and cache separately.
+            thumb: media_image_tag(&media, db::ImageKind::Thumb).or_else(|| {
+                if media.kind == db::MediaKind::Collection {
+                    primary_tag.clone()
                 } else {
                     None
                 }
             }),
-            logo: media_image_tag(&media, db::ImageKind::Logo),
-            backdrop: media_image_tag(&media, db::ImageKind::Backdrop),
-            thumb: media_image_tag(&media, db::ImageKind::Thumb),
         }),
         index_number: media.idx,
         is_folder: media
@@ -895,6 +912,9 @@ pub fn db_media_to_item(media: db::Media, hide_sources: bool) -> BaseItemDto {
                 .clone(),
             collection_default_sort_order: media
                 .collection_default_sort_order
+                .clone(),
+            image_config: media
+                .collection_image_config
                 .clone(),
         }),
         enable_media_source_display: Some(true),

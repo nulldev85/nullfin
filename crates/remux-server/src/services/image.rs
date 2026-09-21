@@ -1,11 +1,20 @@
-use std::{io::Cursor, path::PathBuf};
+use std::{collections::HashSet, io::Cursor, path::PathBuf};
 
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
-use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
+use futures::StreamExt;
+use image::{DynamicImage, ImageFormat, Rgb, RgbImage, Rgba, RgbaImage};
 use imageproc::drawing::draw_text_mut;
 use uuid::Uuid;
 
-use crate::{api::image::detect_content_type, db, db::ImageKind};
+use crate::{
+    api::image::detect_content_type,
+    db,
+    db::ImageKind,
+    sdks::remux::{
+        CollectionFilter, CollectionFontFamily, CollectionFontWeight,
+        CollectionImageConfig, CollectionOverlay, CollectionPosterLayout,
+    },
+};
 
 /// Width/height of generated library placeholder images (16:9).
 const OUT_W: u32 = 960;
@@ -17,8 +26,190 @@ const OVERLAY_ALPHA: f32 = 0x78 as f32 / 255.0;
 /// Maximum text width as a fraction of image width before scaling down.
 const MAX_TEXT_FRACTION: f32 = 0.90;
 
-static FONT_DATA: &[u8] = include_bytes!("../../assets/fonts/LiberationSans-Bold.ttf");
+/// Standard poster dimensions (2:3 ratio) used in fan layout.
+const POSTER_W: u32 = 190;
+const POSTER_H: u32 = 285;
 
+/// A three-by-three poster sheet gives the grid enough depth to overflow the frame.
+const GRID_POSTER_LIMIT: usize = 9;
+/// A grid cell should use its own source poster whenever the collection has
+/// enough artwork. Repeating posters makes the projected sheet look synthetic.
+const GRID_SOURCE_POSTER_LIMIT: usize = GRID_POSTER_LIMIT;
+const GRID_COLUMNS: usize = 3;
+const GRID_POSTER_W: u32 = 260;
+const GRID_POSTER_H: u32 = 390;
+const GRID_GUTTER: u32 = 10;
+
+/// Inset for text overlays, so copy does not sit flush with the image edge.
+const TEXT_LEFT_MARGIN: i32 = 115;
+
+/// Side of the square buffer used for rotation (must exceed sqrt(POSTER_W²+POSTER_H²) ≈ 342).
+const ROTATION_CANVAS: u32 = 380;
+
+/// Rounded-corner radius on each poster (pixels).
+const CORNER_RADIUS: u32 = 10;
+
+/// Left text area: left edge of posters starts here (fan occupies right ~55% of canvas).
+const TEXT_AREA_END: u32 = (OUT_W as f32 * 0.42) as u32;
+
+static FONT_BOLD: &[u8] = include_bytes!("../../assets/fonts/LiberationSans-Bold.ttf");
+static FONT_ROBOTO: &[u8] = include_bytes!("../../assets/fonts/Roboto.ttf");
+static FONT_OPEN_SANS: &[u8] = include_bytes!("../../assets/fonts/OpenSans.ttf");
+static FONT_LATO: &[u8] = include_bytes!("../../assets/fonts/Lato.ttf");
+static FONT_MONTSERRAT: &[u8] = include_bytes!("../../assets/fonts/Montserrat.ttf");
+static FONT_POPPINS: &[u8] = include_bytes!("../../assets/fonts/Poppins.ttf");
+static FONT_OSWALD: &[u8] = include_bytes!("../../assets/fonts/Oswald.ttf");
+static FONT_RALEWAY: &[u8] = include_bytes!("../../assets/fonts/Raleway.ttf");
+static FONT_MERRIWEATHER: &[u8] = include_bytes!("../../assets/fonts/Merriweather.ttf");
+static FONT_PLAYFAIR_DISPLAY: &[u8] =
+    include_bytes!("../../assets/fonts/PlayfairDisplay.ttf");
+static FONT_BEBAS_NEUE: &[u8] = include_bytes!("../../assets/fonts/BebasNeue.ttf");
+
+/// Glyph-coverage fallback chain for text overlays: `ab_glyph` renders a
+/// whole string with one font, so a codepoint missing from the user's chosen
+/// font (a symbol like ♥ that not every display font includes) draws as
+/// nothing rather than falling back to a font that has it. Tried in this
+/// order for any character the primary font lacks; Merriweather is first
+/// since it happens to carry the widest symbol coverage of the bundled set.
+/// This does not add support for color/pictographic emoji — `ab_glyph` can
+/// only rasterize monochrome vector outlines, so a true emoji codepoint has
+/// no glyph in any of these fonts either and still renders as nothing.
+const FALLBACK_FONT_BYTES: &[&[u8]] = &[
+    FONT_MERRIWEATHER,
+    FONT_ROBOTO,
+    FONT_OPEN_SANS,
+    FONT_LATO,
+    FONT_MONTSERRAT,
+    FONT_POPPINS,
+    FONT_OSWALD,
+    FONT_RALEWAY,
+    FONT_PLAYFAIR_DISPLAY,
+    FONT_BEBAS_NEUE,
+    FONT_BOLD,
+];
+static PROVIDER_LOGO_NETFLIX: &[u8] =
+    include_bytes!("../../assets/provider-logos/netflix.png");
+static PROVIDER_LOGO_PRIME_VIDEO: &[u8] =
+    include_bytes!("../../assets/provider-logos/prime-video.png");
+static PROVIDER_LOGO_DISNEY_PLUS: &[u8] =
+    include_bytes!("../../assets/provider-logos/disney-plus.png");
+static PROVIDER_LOGO_MAX: &[u8] = include_bytes!("../../assets/provider-logos/max.png");
+static PROVIDER_LOGO_HULU: &[u8] =
+    include_bytes!("../../assets/provider-logos/hulu.png");
+static PROVIDER_LOGO_PARAMOUNT_PLUS: &[u8] =
+    include_bytes!("../../assets/provider-logos/paramount-plus.png");
+static PROVIDER_LOGO_CRUNCHYROLL: &[u8] =
+    include_bytes!("../../assets/provider-logos/crunchyroll.png");
+static PROVIDER_LOGO_APPLE_TV: &[u8] =
+    include_bytes!("../../assets/provider-logos/apple-tv.png");
+static PROVIDER_LOGO_VIAPLAY: &[u8] =
+    include_bytes!("../../assets/provider-logos/viaplay.png");
+static PROVIDER_LOGO_SKYSHOWTIME: &[u8] =
+    include_bytes!("../../assets/provider-logos/skyshowtime.png");
+static PROVIDER_LOGO_PEACOCK: &[u8] =
+    include_bytes!("../../assets/provider-logos/peacock.png");
+static PROVIDER_LOGO_MUBI: &[u8] =
+    include_bytes!("../../assets/provider-logos/mubi.png");
+static PROVIDER_LOGO_PLUTO_TV: &[u8] =
+    include_bytes!("../../assets/provider-logos/pluto-tv.png");
+static PROVIDER_LOGO_YOUTUBE: &[u8] =
+    include_bytes!("../../assets/provider-logos/youtube.png");
+// Transparent wordmarks sourced from Wikimedia Commons (see
+// assets/provider-logos/commons/original/ for the full downloaded catalog
+// and its raw imageinfo). Only assets that are genuinely alpha-transparent —
+// verified by inspection, not just declared PNG — are curated here; TMDB's
+// own logo tiles are opaque and are never used as a fallback.
+static PROVIDER_LOGO_AMC_PLUS: &[u8] =
+    include_bytes!("../../assets/provider-logos/commons/curated/amc-plus.png");
+static PROVIDER_LOGO_ADN: &[u8] =
+    include_bytes!("../../assets/provider-logos/commons/curated/adn.png");
+static PROVIDER_LOGO_FUNIMATION_NOW: &[u8] =
+    include_bytes!("../../assets/provider-logos/commons/curated/funimation-now.png");
+static PROVIDER_LOGO_ILLICO_PLUS: &[u8] =
+    include_bytes!("../../assets/provider-logos/commons/curated/illico-plus.png");
+static PROVIDER_LOGO_SKY_MAIS: &[u8] =
+    include_bytes!("../../assets/provider-logos/commons/curated/sky-mais.png");
+static PROVIDER_LOGO_C_MORE: &[u8] =
+    include_bytes!("../../assets/provider-logos/commons/curated/c-more.png");
+static PROVIDER_LOGO_FOXTEL_NOW: &[u8] =
+    include_bytes!("../../assets/provider-logos/commons/curated/foxtel-now.png");
+static PROVIDER_LOGO_JIOHOTSTAR: &[u8] =
+    include_bytes!("../../assets/provider-logos/commons/curated/jiohotstar.png");
+static PROVIDER_LOGO_WETV: &[u8] =
+    include_bytes!("../../assets/provider-logos/commons/curated/wetv.png");
+static PROVIDER_LOGO_CHORKI: &[u8] =
+    include_bytes!("../../assets/provider-logos/commons/curated/chorki.png");
+static PROVIDER_LOGO_TVP_VOD: &[u8] =
+    include_bytes!("../../assets/provider-logos/commons/curated/tvp-vod.png");
+static PROVIDER_LOGO_KWELITV: &[u8] =
+    include_bytes!("../../assets/provider-logos/commons/curated/kwelitv.png");
+static PROVIDER_LOGO_VIDIO: &[u8] =
+    include_bytes!("../../assets/provider-logos/commons/curated/vidio.png");
+static PROVIDER_LOGO_VIVAMAX: &[u8] =
+    include_bytes!("../../assets/provider-logos/commons/curated/vivamax.png");
+static PROVIDER_LOGO_RUUTU: &[u8] =
+    include_bytes!("../../assets/provider-logos/commons/curated/ruutu.png");
+static PROVIDER_LOGO_SAMSUNG_TV_PLUS: &[u8] =
+    include_bytes!("../../assets/provider-logos/commons/curated/samsung-tv-plus.png");
+static PROVIDER_LOGO_CRAFTSY: &[u8] =
+    include_bytes!("../../assets/provider-logos/commons/curated/craftsy.png");
+static PROVIDER_LOGO_MX_PLAYER: &[u8] =
+    include_bytes!("../../assets/provider-logos/commons/curated/mx-player.png");
+static PROVIDER_LOGO_AXN_NOW: &[u8] =
+    include_bytes!("../../assets/provider-logos/commons/curated/axn-now.png");
+static PROVIDER_LOGO_CLARO_VIDEO: &[u8] =
+    include_bytes!("../../assets/provider-logos/commons/curated/claro-video.png");
+static PROVIDER_LOGO_DIMSUM: &[u8] =
+    include_bytes!("../../assets/provider-logos/commons/curated/dimsum.png");
+static PROVIDER_LOGO_CATCHPLAY: &[u8] =
+    include_bytes!("../../assets/provider-logos/commons/curated/catchplay.png");
+static PROVIDER_LOGO_FANATIZ: &[u8] =
+    include_bytes!("../../assets/provider-logos/commons/curated/fanatiz.png");
+static PROVIDER_LOGO_MOVISTAR_PLUS: &[u8] =
+    include_bytes!("../../assets/provider-logos/commons/curated/movistar-plus.png");
+static PROVIDER_LOGO_DISCOVERY_PLUS: &[u8] =
+    include_bytes!("../../assets/provider-logos/commons/curated/discovery-plus.png");
+static PROVIDER_LOGO_KOCOWA: &[u8] =
+    include_bytes!("../../assets/provider-logos/commons/curated/kocowa.png");
+static PROVIDER_LOGO_TOKU: &[u8] =
+    include_bytes!("../../assets/provider-logos/commons/curated/toku.png");
+static PROVIDER_LOGO_WATCHA: &[u8] =
+    include_bytes!("../../assets/provider-logos/commons/curated/watcha.png");
+static PROVIDER_LOGO_WAKANIM: &[u8] =
+    include_bytes!("../../assets/provider-logos/commons/curated/wakanim.png");
+static PROVIDER_LOGO_DPLAY: &[u8] =
+    include_bytes!("../../assets/provider-logos/commons/curated/dplay.png");
+static PROVIDER_LOGO_FILMDOO: &[u8] =
+    include_bytes!("../../assets/provider-logos/commons/curated/filmdoo.png");
+static PROVIDER_LOGO_GLOBOPLAY: &[u8] =
+    include_bytes!("../../assets/provider-logos/commons/curated/globoplay.png");
+static PROVIDER_LOGO_MTV_KATSOMO: &[u8] =
+    include_bytes!("../../assets/provider-logos/commons/curated/mtv-katsomo.png");
+static PROVIDER_LOGO_U_NEXT: &[u8] =
+    include_bytes!("../../assets/provider-logos/commons/curated/u-next.png");
+static PROVIDER_LOGO_RCTI_PLUS: &[u8] =
+    include_bytes!("../../assets/provider-logos/commons/curated/rcti-plus.png");
+static PROVIDER_LOGO_NFL_PLUS: &[u8] =
+    include_bytes!("../../assets/provider-logos/commons/curated/nfl-plus.png");
+static PROVIDER_LOGO_NASA_PLUS: &[u8] =
+    include_bytes!("../../assets/provider-logos/commons/curated/nasa-plus.png");
+static PROVIDER_LOGO_IWANTTFC: &[u8] =
+    include_bytes!("../../assets/provider-logos/commons/curated/iwanttfc.png");
+static PROVIDER_LOGO_KAPAMILYA_ONLINE_LIVE: &[u8] = include_bytes!(
+    "../../assets/provider-logos/commons/curated/kapamilya-online-live.png"
+);
+static PROVIDER_LOGO_HAYU: &[u8] =
+    include_bytes!("../../assets/provider-logos/commons/curated/hayu.png");
+static PROVIDER_LOGO_WATCH_IT: &[u8] =
+    include_bytes!("../../assets/provider-logos/commons/curated/watch-it.png");
+static PROVIDER_LOGO_STAN: &[u8] =
+    include_bytes!("../../assets/provider-logos/commons/curated/stan.png");
+static PROVIDER_LOGO_SHUDDER: &[u8] =
+    include_bytes!("../../assets/provider-logos/commons/curated/shudder.png");
+static PROVIDER_LOGO_ROXI: &[u8] =
+    include_bytes!("../../assets/provider-logos/commons/curated/roxi.png");
+
+#[allow(clippy::incompatible_msrv)]
 static HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> =
     std::sync::LazyLock::new(|| {
         reqwest::Client::builder()
@@ -27,6 +218,21 @@ static HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> =
             .build()
             .expect("failed to build image http client")
     });
+
+fn collection_font_bytes(font: CollectionFontFamily) -> &'static [u8] {
+    match font {
+        CollectionFontFamily::Roboto => FONT_ROBOTO,
+        CollectionFontFamily::OpenSans => FONT_OPEN_SANS,
+        CollectionFontFamily::Lato => FONT_LATO,
+        CollectionFontFamily::Montserrat => FONT_MONTSERRAT,
+        CollectionFontFamily::Poppins => FONT_POPPINS,
+        CollectionFontFamily::Oswald => FONT_OSWALD,
+        CollectionFontFamily::Raleway => FONT_RALEWAY,
+        CollectionFontFamily::Merriweather => FONT_MERRIWEATHER,
+        CollectionFontFamily::PlayfairDisplay => FONT_PLAYFAIR_DISPLAY,
+        CollectionFontFamily::BebasNeue => FONT_BEBAS_NEUE,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Image processing options
@@ -52,7 +258,17 @@ pub struct ImageProcessOptions {
 
 impl ImageProcessOptions {
     /// Returns true when any transformation is requested.
+    ///
+    /// Disabled below (always `false`): different clients request wildly
+    /// different exact dimensions for the same item, and `apply_sizing`'s
+    /// crop-to-fill can cut into a generated collection image's text overlay
+    /// depending on which aspect ratio a given client happens to ask for
+    /// (#435). Until sizing is reworked to never crop into overlay content,
+    /// not resizing at all is safer than resizing inconsistently per client.
+    /// The real logic is kept below, dead, for when that rework happens.
+    #[allow(unreachable_code)]
     pub fn needs_processing(&self) -> bool {
+        return false;
         self.fill_width
             .is_some()
             || self
@@ -107,7 +323,7 @@ impl ImageProcessOptions {
     /// Stable cache key derived from source identifier + all transform params.
     fn cache_key(&self, source: &str) -> String {
         let key_data = format!(
-            "{}|fw={:?}|fh={:?}|w={:?}|h={:?}|mw={:?}|mh={:?}|q={:?}|bl={:?}|bg={:?}|fmt={:?}",
+            "v2|{}|fw={:?}|fh={:?}|w={:?}|h={:?}|mw={:?}|mh={:?}|q={:?}|bl={:?}|bg={:?}|fmt={:?}",
             source,
             self.fill_width,
             self.fill_height,
@@ -155,20 +371,25 @@ impl ImageService {
     }
 
     /// Generate the library placeholder image, write it to disk, save the path
-    /// to `media_images` in the DB, and return the JPEG bytes.
+    /// to `media_images` in the DB, and return the bytes.
     pub async fn library_image(
         data_dir: &std::path::Path,
         id: Uuid,
         name: &str,
         db: &sqlx::SqlitePool,
     ) -> anyhow::Result<Vec<u8>> {
-        let path = Self::image_path(data_dir, id, "primary", "jpg");
-
-        if path.exists() {
-            return Ok(tokio::fs::read(&path).await?);
+        // Check for an existing generated file (either jpg or png).
+        for ext in ["jpg", "png"] {
+            let p = Self::image_path(data_dir, id, "primary", ext);
+            if p.exists() {
+                return Ok(tokio::fs::read(&p).await?);
+            }
         }
 
-        let bytes = Self::generate(id, name, db).await?;
+        let bytes = Self::generate(id, name, db, None, None, None).await?;
+        let ct = detect_content_type(&bytes);
+        let ext = ext_for_content_type(ct);
+        let path = Self::image_path(data_dir, id, "primary", ext);
         Self::write_image_to_disk(&path, &bytes).await?;
         // INSERT OR IGNORE — don't replace if already exists (stable UUID for cache)
         sqlx::query(
@@ -183,6 +404,117 @@ impl ImageService {
         .await?;
 
         Ok(bytes)
+    }
+
+    /// Render a collection image from draft, unsaved state — no disk write, no
+    /// DB write, no cache row. `config`/`smart_filter` override whatever is
+    /// currently stored on the collection, so the caller can preview an
+    /// in-progress edit before it's saved. Used by the dashboard's "Update
+    /// preview" action, which must never mutate the live collection.
+    pub async fn generate_preview(
+        id: Uuid,
+        name: &str,
+        db: &sqlx::SqlitePool,
+        config: &CollectionImageConfig,
+        smart_filter: Option<&CollectionFilter>,
+    ) -> anyhow::Result<(Vec<u8>, &'static str)> {
+        let bytes =
+            Self::generate(id, name, db, Some(config), smart_filter, None).await?;
+        let ct = detect_content_type(&bytes);
+        Ok((bytes, ct))
+    }
+
+    /// Disk-cached wrapper around `synthetic_thumb`, keyed on the *source*
+    /// Backdrop/Logo row ids rather than the media id: `sync_from_media`
+    /// regenerates an image's id whenever a refresh replaces it, so keying
+    /// on those ids means a stale composite is never served — a changed
+    /// Backdrop or Logo naturally misses the old cache file and regenerates.
+    /// Never registered in `media_images` — purely a cache entry, wiped like
+    /// any other by `ClearImageCacheTask`. Returns the derived cache key
+    /// alongside the bytes so the caller can reuse it as `process_image`'s
+    /// `source_key`, giving per-size variants the same change-detection.
+    pub async fn cached_synthetic_thumb(
+        data_dir: &std::path::Path,
+        backdrop_id: Uuid,
+        logo_id: Option<Uuid>,
+        backdrop_path: &str,
+        logo_path: Option<&str>,
+        title: &str,
+    ) -> anyhow::Result<(Vec<u8>, String)> {
+        let cache_key = Uuid::new_v5(
+            &Uuid::NAMESPACE_URL,
+            format!("synthetic-thumb|{backdrop_id}|{logo_id:?}").as_bytes(),
+        )
+        .to_string();
+        let path = Self::cache_dir(data_dir).join(format!("{cache_key}.jpg"));
+        if path.exists() {
+            return Ok((tokio::fs::read(&path).await?, cache_key));
+        }
+        let bytes = Self::synthetic_thumb(backdrop_path, logo_path, title).await?;
+        Self::write_image_to_disk(&path, &bytes).await?;
+        Ok((bytes, cache_key))
+    }
+
+    /// Composite a landscape Thumb from a Backdrop and, if available, a Logo —
+    /// for items with no dedicated Thumb (TMDB has no matching English
+    /// title-card backdrop for them). Runs entirely in memory: no disk write,
+    /// no `media_images` row. A later refresh that adds a real Thumb, or a
+    /// better Backdrop/Logo, is picked up on the very next request with
+    /// nothing to invalidate.
+    pub async fn synthetic_thumb(
+        backdrop_path: &str,
+        logo_path: Option<&str>,
+        title: &str,
+    ) -> anyhow::Result<Vec<u8>> {
+        let backdrop = if backdrop_path.contains("://") {
+            Self::fetch_rgb(backdrop_path).await?
+        } else {
+            Self::read_rgb(backdrop_path).await?
+        };
+        let logo = match logo_path {
+            Some(path) if path.contains("://") => Self::fetch_rgba(path)
+                .await
+                .ok(),
+            Some(path) => Self::read_rgba(path)
+                .await
+                .ok(),
+            None => None,
+        };
+
+        let title = title.to_string();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
+            let resized = image::imageops::resize(
+                &backdrop,
+                OUT_W,
+                OUT_H,
+                image::imageops::FilterType::Lanczos3,
+            );
+            let dimmed = apply_dark_overlay(resized);
+
+            match logo {
+                Some(logo) => {
+                    let mut canvas = DynamicImage::ImageRgb8(dimmed).into_rgba8();
+                    let max_logo_h = OUT_H * 3 / 4;
+                    let max_logo_w = (OUT_W as f32 * 0.9) as u32;
+                    let scale = (max_logo_h as f32 / logo.height() as f32)
+                        .min(max_logo_w as f32 / logo.width() as f32);
+                    let lw = (logo.width() as f32 * scale) as u32;
+                    let lh = (logo.height() as f32 * scale) as u32;
+                    let scaled = image::imageops::resize(
+                        &logo,
+                        lw,
+                        lh,
+                        image::imageops::FilterType::Lanczos3,
+                    );
+                    let lx = (OUT_W.saturating_sub(lw) / 2) as i64;
+                    let ly = (OUT_H.saturating_sub(lh) / 2) as i64;
+                    image::imageops::overlay(&mut canvas, &scaled, lx, ly);
+                    encode_jpeg_rgba(canvas)
+                }
+                None => encode_jpeg(draw_label(dimmed, &title)?),
+            }
+        })
+        .await?
     }
 
     /// Save an uploaded image for `id`/`image_type`, write to disk, update DB.
@@ -333,77 +665,328 @@ impl ImageService {
         Ok(())
     }
 
+    /// Regenerate the collection image: delete cached file and DB row, then
+    /// re-generate on next request. Call after `collection_image_config` changes.
+    pub async fn invalidate_collection_image(
+        data_dir: &std::path::Path,
+        id: Uuid,
+        db: &sqlx::SqlitePool,
+    ) -> anyhow::Result<()> {
+        Self::delete_image(data_dir, id, ImageKind::Primary, db).await
+    }
+
+    /// `config_override`/`smart_filter_override` take precedence over whatever
+    /// is stored on the collection row when present — the preview path
+    /// (`generate_preview`) supplies unsaved draft state this way, while the
+    /// persisting path (`library_image`) passes `None` for both and reads the
+    /// stored config as before. `background_override` similarly stands in for
+    /// a locally-picked-but-not-yet-uploaded custom background.
     async fn generate(
         id: Uuid,
         name: &str,
         db: &sqlx::SqlitePool,
+        config_override: Option<&CollectionImageConfig>,
+        smart_filter_override: Option<&CollectionFilter>,
+        background_override: Option<Vec<u8>>,
     ) -> anyhow::Result<Vec<u8>> {
-        let bg = match find_backdrop_url(id, db).await {
-            Err(_) => solid_background(),
-            Ok(src) => {
-                let result = if src.contains("://") {
-                    Self::fetch_and_resize(&src).await
+        let collection = db::Media::get_by_id(db, &id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("collection {id} not found"))?;
+        let config = config_override
+            .cloned()
+            .or_else(|| {
+                collection
+                    .collection_image_config
+                    .clone()
+            });
+        let layout = config
+            .as_ref()
+            .map(|c| c.layout)
+            .unwrap_or_default();
+        let background_color = config
+            .as_ref()
+            .and_then(|config| {
+                config
+                    .background_color
+                    .as_ref()
+                    .and_then(|color| parse_hex_color(color.as_ref()))
+            })
+            .or_else(|| {
+                config
+                    .as_ref()
+                    .and_then(|config| match &config.overlay {
+                        CollectionOverlay::StreamingLogo { provider_name, .. } => {
+                            provider_name
+                                .as_deref()
+                                .and_then(crate::services::stream_provider::StreamProvider::brand_color)
+                        }
+                        _ => None,
+                    })
+                    .and_then(parse_hex_color)
+            })
+            .unwrap_or([0, 0, 0]);
+
+        // Resolve a custom background before looking up the poster grid. It is
+        // the entire composition when present, so poster downloads would be
+        // wasted work.
+        let custom_background = if let Some(bytes) = background_override {
+            image::load_from_memory(&bytes)
+                .ok()
+                .map(|img| img.into_rgba8())
+        } else {
+            let custom_background_path = config
+                .as_ref()
+                .and_then(|_| {
+                    collection
+                        .images
+                        .get(ImageKind::Backdrop)
+                        .map(|image| {
+                            image
+                                .path
+                                .clone()
+                        })
+                });
+            if let Some(path) = custom_background_path {
+                let result = if path.contains("://") {
+                    Self::fetch_rgba(&path).await
                 } else {
-                    Self::read_local_and_resize(&src).await
+                    Self::read_rgba(&path).await
                 };
-                match result {
-                    Ok(img) => apply_dark_overlay(img),
-                    Err(_) => solid_background(),
-                }
+                result.ok()
+            } else {
+                None
             }
         };
-        let img = draw_label(bg, name)?;
-        encode_jpeg(img)
+
+        let poster_limit = if layout == CollectionPosterLayout::Grid {
+            GRID_SOURCE_POSTER_LIMIT as u32
+        } else {
+            4u32
+        };
+        let poster_urls =
+            if custom_background.is_none() && layout != CollectionPosterLayout::None {
+                collect_poster_urls(
+                    id,
+                    &collection,
+                    db,
+                    poster_limit,
+                    smart_filter_override,
+                )
+                .await
+            } else {
+                Vec::new()
+            };
+
+        if poster_urls.is_empty() && config.is_none() {
+            // Fallback: single backdrop with label (original behaviour).
+            let bg = match find_backdrop_url_from_collection(&collection, db).await {
+                Ok(src) => {
+                    let result = if src.contains("://") {
+                        Self::fetch_rgb(&src).await
+                    } else {
+                        Self::read_rgb(&src).await
+                    };
+                    match result {
+                        Ok(img) => {
+                            let resized = image::imageops::resize(
+                                &img,
+                                OUT_W,
+                                OUT_H,
+                                image::imageops::FilterType::Lanczos3,
+                            );
+                            apply_dark_overlay(resized)
+                        }
+                        Err(_) => solid_background(),
+                    }
+                }
+                Err(_) => solid_background(),
+            };
+            let img = draw_label(bg, name)?;
+            return encode_jpeg(img);
+        }
+
+        let posters =
+            Self::load_poster_images(&poster_urls, poster_limit as usize).await;
+
+        // Bundled provider wordmarks are transparent and avoid TMDB's opaque app tiles.
+        let logo_image: Option<RgbaImage> = match config
+            .as_ref()
+            .map(|c| &c.overlay)
+        {
+            Some(CollectionOverlay::StreamingLogo { provider_name, .. }) => {
+                provider_wordmark(provider_name.as_deref())
+            }
+            _ => None,
+        };
+
+        // CPU-bound fan composition + PNG encode runs on the blocking pool.
+        let name_owned = name.to_string();
+        let config_owned = config;
+        let bytes = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
+            let has_custom_background = custom_background.is_some();
+            let mut canvas = custom_background
+                .map(|image| {
+                    DynamicImage::ImageRgba8(image)
+                        .resize_to_fill(
+                            OUT_W,
+                            OUT_H,
+                            image::imageops::FilterType::Lanczos3,
+                        )
+                        .into_rgba8()
+                })
+                .unwrap_or_else(|| gradient_background(background_color));
+
+            let max_n = if layout == CollectionPosterLayout::Grid {
+                GRID_POSTER_LIMIT
+            } else {
+                4
+            };
+            let n = posters
+                .len()
+                .min(max_n);
+            if layout != CollectionPosterLayout::None && n > 0 && !has_custom_background
+            {
+                if layout == CollectionPosterLayout::Grid {
+                    stamp_grid(&mut canvas, &posters[..n]);
+                } else {
+                    let positions = layout_positions(layout, n);
+                    for idx in (0..n).rev() {
+                        let (cx, cy, angle_deg) = positions[idx];
+                        let resized = image::imageops::resize(
+                            &posters[idx],
+                            POSTER_W,
+                            POSTER_H,
+                            image::imageops::FilterType::Lanczos3,
+                        );
+                        rotate_and_stamp(&mut canvas, resized, cx, cy, angle_deg);
+                    }
+                }
+            }
+
+            let overlay = config_owned
+                .as_ref()
+                .map(|c| &c.overlay)
+                .unwrap_or(&CollectionOverlay::None);
+            apply_overlay_sync(
+                &mut canvas,
+                overlay,
+                &name_owned,
+                logo_image,
+                layout == CollectionPosterLayout::None,
+            )?;
+
+            encode_jpeg_rgba(canvas)
+        })
+        .await??;
+
+        Ok(bytes)
+    }
+
+    async fn load_poster_images(urls: &[String], limit: usize) -> Vec<RgbaImage> {
+        futures::stream::iter(
+            urls.iter()
+                .take(limit)
+                .cloned()
+                .map(|url| async move {
+                    let img = if url.contains("://") {
+                        Self::fetch_rgba(&url).await
+                    } else {
+                        Self::read_rgba(&url).await
+                    };
+                    img
+                }),
+        )
+        // Keep source order stable while downloading up to eight images at
+        // once. The old serial loop made a single generated image wait for
+        // every remote poster in sequence.
+        .buffered(8)
+        .filter_map(|image| async move { image.ok() })
+        .collect()
+        .await
+    }
+
+    async fn fetch_rgb(url: &str) -> anyhow::Result<RgbImage> {
+        let bytes = HTTP_CLIENT
+            .get(url)
+            .send()
+            .await?
+            .bytes()
+            .await?;
+        Ok(image::load_from_memory(&bytes)?.into_rgb8())
+    }
+
+    async fn read_rgb(path: &str) -> anyhow::Result<RgbImage> {
+        let bytes = tokio::fs::read(path).await?;
+        Ok(image::load_from_memory(&bytes)?.into_rgb8())
+    }
+
+    async fn fetch_rgba(url: &str) -> anyhow::Result<RgbaImage> {
+        let bytes = HTTP_CLIENT
+            .get(url)
+            .send()
+            .await?
+            .bytes()
+            .await?;
+        Ok(image::load_from_memory(&bytes)?.into_rgba8())
+    }
+
+    async fn read_rgba(path: &str) -> anyhow::Result<RgbaImage> {
+        let bytes = tokio::fs::read(path).await?;
+        Ok(image::load_from_memory(&bytes)?.into_rgba8())
     }
 
     async fn fetch_and_resize(url: &str) -> anyhow::Result<RgbImage> {
-        let resp = HTTP_CLIENT
-            .get(url)
-            .send()
-            .await?;
-        let bytes = resp
-            .bytes()
-            .await?;
-        let decoded = image::load_from_memory(&bytes)?.into_rgb8();
-        let resized = image::imageops::resize(
-            &decoded,
+        let img = Self::fetch_rgb(url).await?;
+        Ok(image::imageops::resize(
+            &img,
             OUT_W,
             OUT_H,
             image::imageops::FilterType::Lanczos3,
-        );
-        Ok(resized)
+        ))
     }
 
     async fn read_local_and_resize(path: &str) -> anyhow::Result<RgbImage> {
-        let bytes = tokio::fs::read(path).await?;
-        let decoded = image::load_from_memory(&bytes)?.into_rgb8();
-        let resized = image::imageops::resize(
-            &decoded,
+        let img = Self::read_rgb(path).await?;
+        Ok(image::imageops::resize(
+            &img,
             OUT_W,
             OUT_H,
             image::imageops::FilterType::Lanczos3,
-        );
-        Ok(resized)
+        ))
     }
 }
 
-/// Query up to 8 items belonging to the collection and return the first
-/// backdrop/poster URL found (backdrops preferred).
-///
-/// Smart collections (kind = Collection) contain items matched by
-/// `collection_media_kind`, not by `parent_id`. Folder items use `parent_id`.
-async fn find_backdrop_url(
-    collection_id: Uuid,
-    db: &sqlx::SqlitePool,
-) -> anyhow::Result<String> {
-    // Look up the collection itself to understand its kind.
-    let collection = db::Media::get_by_id(db, &collection_id)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("collection {collection_id} not found"))?;
-
-    let filter = match &collection.kind {
+/// Builds the query that finds a collection's own member items, for poster
+/// selection. Regression: this used to filter only by `collection_media_kind`
+/// with no membership scoping at all (no `parent_id`, no `filter_rules`), so
+/// the generated collage pulled arbitrary movies/shows matching that kind from
+/// the whole library rather than this collection's actual members. Mirrors the
+/// scoping `/items?parentId=` already uses (`api/items.rs`):
+/// - A "collection of collections" group container holds children via
+///   `parent_id`, regardless of its own `collection_kind` — same as
+///   `group_container_has_visible_content`'s walk above.
+/// - A Manual collection holds members via `media_relations`; `parent` (in
+///   addition to `parent_id`) is what makes `get_by_filter_inner` take that
+///   join path instead of a literal `parent_id` scan.
+/// - A Smart collection floats freely (no `parent_id`) and is scoped by
+///   `filter_rules` alone. `smart_filter_override` lets a caller preview an
+///   unsaved filter edit without it ever being persisted.
+fn collection_item_filter(
+    collection: &db::Media,
+    smart_filter_override: Option<&CollectionFilter>,
+) -> db::MediaFilter {
+    match &collection.kind {
         db::MediaKind::Collection => {
-            // Smart collection — items are matched by their media kind.
+            if collection.collection_media_kind
+                == Some(db::CollectionMediaKind::Collection)
+            {
+                return db::MediaFilter {
+                    kind: Some(vec![db::MediaKind::Collection]),
+                    parent_id: Some(collection.id),
+                    limit: Some(8),
+                    ..Default::default()
+                };
+            }
             let kinds = match &collection.collection_media_kind {
                 Some(db::CollectionMediaKind::Movie) => vec![db::MediaKind::Movie],
                 Some(db::CollectionMediaKind::Series) => vec![db::MediaKind::Series],
@@ -413,35 +996,99 @@ async fn find_backdrop_url(
                 Some(db::CollectionMediaKind::Music) => {
                     vec![db::MediaKind::Album, db::MediaKind::Artist]
                 }
-                Some(db::CollectionMediaKind::Collection) => {
-                    vec![db::MediaKind::Collection]
-                }
                 Some(db::CollectionMediaKind::Playlist) => {
                     vec![db::MediaKind::Playlist]
                 }
+                Some(db::CollectionMediaKind::Collection) => {
+                    unreachable!("handled above")
+                }
                 None => vec![db::MediaKind::Movie, db::MediaKind::Series],
             };
-            db::MediaFilter {
-                kind: Some(kinds),
-                limit: Some(8),
-                ..Default::default()
+            if collection.collection_kind == Some(db::CollectionKind::Manual) {
+                db::MediaFilter {
+                    kind: Some(kinds),
+                    parent_id: Some(collection.id),
+                    parent: Some(collection.clone()),
+                    limit: Some(8),
+                    ..Default::default()
+                }
+            } else {
+                db::MediaFilter {
+                    kind: Some(kinds),
+                    filter_rules: smart_filter_override
+                        .cloned()
+                        .or_else(|| {
+                            collection
+                                .parse_smart_filter()
+                                .cloned()
+                        }),
+                    limit: Some(8),
+                    ..Default::default()
+                }
             }
         }
-        _ => {
-            // Folder or other container — items have parent_id = collection_id.
-            db::MediaFilter {
-                parent_id: Some(collection_id),
-                limit: Some(8),
-                ..Default::default()
-            }
-        }
-    };
+        _ => db::MediaFilter {
+            parent_id: Some(collection.id),
+            limit: Some(8),
+            ..Default::default()
+        },
+    }
+}
 
+/// Collect distinct poster image paths/URLs from collection items.
+async fn collect_poster_urls(
+    _id: Uuid,
+    collection: &db::Media,
+    db: &sqlx::SqlitePool,
+    limit: u32,
+    smart_filter_override: Option<&CollectionFilter>,
+) -> Vec<String> {
+    // Inspect extra records so duplicate artwork does not consume a grid cell.
+    let filter = db::MediaFilter {
+        limit: Some(limit.saturating_mul(2)),
+        ..collection_item_filter(collection, smart_filter_override)
+    };
+    let Ok(result) = db::Media::get_by_filter(db, &filter).await else {
+        return Vec::new();
+    };
+    let mut seen = HashSet::new();
+    result
+        .records
+        .iter()
+        .filter_map(|m| {
+            m.images
+                .get(ImageKind::Primary)
+                .map(|i| {
+                    i.path
+                        .clone()
+                })
+                .or_else(|| {
+                    m.images
+                        .get(ImageKind::Backdrop)
+                        .map(|i| {
+                            i.path
+                                .clone()
+                        })
+                })
+        })
+        .filter(|path| seen.insert(path.clone()))
+        .take(limit as usize)
+        .collect()
+}
+
+/// Find a backdrop or poster URL from collection items (for the legacy single-image path).
+async fn find_backdrop_url_from_collection(
+    collection: &db::Media,
+    db: &sqlx::SqlitePool,
+) -> anyhow::Result<String> {
+    let filter = db::MediaFilter {
+        limit: Some(8),
+        ..collection_item_filter(collection, None)
+    };
     let items = db::Media::get_by_filter(db, &filter)
         .await?
         .records;
 
-    // Prefer backdrop, then fall back to primary (poster).
     items
         .iter()
         .find_map(|m| {
@@ -465,14 +1112,519 @@ async fn find_backdrop_url(
                 })
         })
         .ok_or_else(|| {
-            anyhow::anyhow!(
-                "no backdrop or poster found for collection {collection_id}"
-            )
+            anyhow::anyhow!("no image found for collection {}", collection.id)
         })
 }
 
+/// Poster positions (canvas center_x, center_y, clockwise angle°) for a given layout and n posters.
+fn layout_positions(layout: CollectionPosterLayout, n: usize) -> Vec<(i64, i64, f32)> {
+    let positions = match layout {
+        // No posters are stamped for either layout — None skips them entirely,
+        // and Grid is rendered as one transformed 3×3 plane by `stamp_grid`.
+        CollectionPosterLayout::None | CollectionPosterLayout::Grid => Vec::new(),
+        // Clean horizontal shelf, barely overlapping.
+        CollectionPosterLayout::Row => match n {
+            1 => vec![(720, 270, 0.0)],
+            2 => vec![(645, 270, 0.0), (795, 270, 0.0)],
+            3 => vec![(570, 270, 0.0), (715, 270, 0.0), (860, 270, 0.0)],
+            _ => vec![
+                (515, 270, 0.0),
+                (638, 270, 0.0),
+                (762, 270, 0.0),
+                (885, 270, 0.0),
+            ],
+        },
+        // Wide artistic scatter with bold angles and height variation.
+        CollectionPosterLayout::Scatter => match n {
+            1 => vec![(720, 270, 0.0)],
+            2 => vec![(628, 288, -14.0), (808, 248, 16.0)],
+            3 => vec![(570, 298, -17.0), (718, 245, 10.0), (850, 285, -11.0)],
+            _ => vec![
+                (545, 302, -19.0),
+                (668, 240, 13.0),
+                (778, 296, -9.0),
+                (882, 244, 17.0),
+            ],
+        },
+    };
+
+    if matches!(
+        layout,
+        CollectionPosterLayout::Row | CollectionPosterLayout::Scatter
+    ) {
+        positions
+            .into_iter()
+            .map(|(x, y, angle)| (x + 50, y, angle))
+            .collect()
+    } else {
+        positions
+    }
+}
+
+/// Apply rounded corners (CORNER_RADIUS px) to an RGBA image in-place.
+fn apply_rounded_corners(img: &mut RgbaImage) {
+    let w = img.width();
+    let h = img.height();
+    let r = CORNER_RADIUS as f32;
+    for py in 0..h {
+        for px in 0..w {
+            let fx = px as f32;
+            let fy = py as f32;
+            let in_corner = (fx < r && fy < r)
+                || (fx > w as f32 - r - 1.0 && fy < r)
+                || (fx < r && fy > h as f32 - r - 1.0)
+                || (fx > w as f32 - r - 1.0 && fy > h as f32 - r - 1.0);
+            if in_corner {
+                let cx = if fx < r { r } else { w as f32 - r - 1.0 };
+                let cy = if fy < r { r } else { h as f32 - r - 1.0 };
+                if ((fx - cx).powi(2) + (fy - cy).powi(2)).sqrt() > r {
+                    img.get_pixel_mut(px, py)[3] = 0;
+                }
+            }
+        }
+    }
+}
+
+/// Build a non-overlapping 3×3 poster sheet, then project it as a single
+/// skewed plane. The plane starts beyond the text area and is intentionally
+/// larger than the output canvas, so it reads as a background element.
+fn stamp_grid(canvas: &mut RgbaImage, posters: &[RgbaImage]) {
+    let (grid_w, grid_h) = grid_dimensions();
+    let mut grid = RgbaImage::new(grid_w, grid_h);
+
+    let prepared_posters: Vec<RgbaImage> = posters
+        .iter()
+        .map(|poster| {
+            let mut resized = image::imageops::resize(
+                poster,
+                GRID_POSTER_W,
+                GRID_POSTER_H,
+                image::imageops::FilterType::Lanczos3,
+            );
+            apply_rounded_corners(&mut resized);
+            resized
+        })
+        .collect();
+
+    // Smaller collections still need a complete background plane. Reuse their
+    // prepared posters cyclically instead of resizing the same image per cell.
+    for idx in 0..GRID_POSTER_LIMIT {
+        let poster = &prepared_posters[idx % prepared_posters.len()];
+        let col = idx % GRID_COLUMNS;
+        let row = idx / GRID_COLUMNS;
+        let x = col as u32 * (GRID_POSTER_W + GRID_GUTTER);
+        let y = row as u32 * (GRID_POSTER_H + GRID_GUTTER);
+        image::imageops::overlay(&mut grid, poster, x.into(), y.into());
+    }
+
+    // An affine projection with a subtle clockwise rotation and horizontal
+    // shear. Its centre sits off the right edge; most of the 3×3 sheet is
+    // therefore clipped, leaving roughly the right third of the image visible.
+    let (a, b, c, d) = (0.74f32, -0.23f32, 0.23f32, 0.71f32);
+    let determinant = a * d - b * c;
+    let centre_x = 835.0;
+    let centre_y = 320.0;
+    let half_w = grid_w as f32 / 2.0;
+    let half_h = grid_h as f32 / 2.0;
+    let mut projected = RgbaImage::new(OUT_W, OUT_H);
+
+    for y in 0..OUT_H {
+        for x in 0..OUT_W {
+            let dx = x as f32 - centre_x;
+            let dy = y as f32 - centre_y;
+            let src_x = (d * dx - b * dy) / determinant + half_w;
+            let src_y = (-c * dx + a * dy) / determinant + half_h;
+            if src_x < 0.0
+                || src_y < 0.0
+                || src_x >= (grid_w - 1) as f32
+                || src_y >= (grid_h - 1) as f32
+            {
+                continue;
+            }
+
+            let x0 = src_x as u32;
+            let y0 = src_y as u32;
+            let x1 = x0 + 1;
+            let y1 = y0 + 1;
+            let tx = src_x.fract();
+            let ty = src_y.fract();
+            let interpolate = |p00: u8, p10: u8, p01: u8, p11: u8| {
+                let top = p00 as f32 + (p10 as f32 - p00 as f32) * tx;
+                let bottom = p01 as f32 + (p11 as f32 - p01 as f32) * tx;
+                (top + (bottom - top) * ty) as u8
+            };
+            let p00 = grid
+                .get_pixel(x0, y0)
+                .0;
+            let p10 = grid
+                .get_pixel(x1, y0)
+                .0;
+            let p01 = grid
+                .get_pixel(x0, y1)
+                .0;
+            let p11 = grid
+                .get_pixel(x1, y1)
+                .0;
+            projected.put_pixel(
+                x,
+                y,
+                Rgba([
+                    interpolate(p00[0], p10[0], p01[0], p11[0]),
+                    interpolate(p00[1], p10[1], p01[1], p11[1]),
+                    interpolate(p00[2], p10[2], p01[2], p11[2]),
+                    interpolate(p00[3], p10[3], p01[3], p11[3]),
+                ]),
+            );
+        }
+    }
+
+    image::imageops::overlay(canvas, &projected, 0, 0);
+}
+
+fn grid_dimensions() -> (u32, u32) {
+    let rows = GRID_POSTER_LIMIT.div_ceil(GRID_COLUMNS) as u32;
+    (
+        GRID_COLUMNS as u32 * GRID_POSTER_W + (GRID_COLUMNS as u32 - 1) * GRID_GUTTER,
+        rows * GRID_POSTER_H + (rows - 1) * GRID_GUTTER,
+    )
+}
+
+/// Rotate `poster` by `angle_deg` (clockwise) and stamp it onto `canvas`
+/// so its centre lands at (`cx`, `cy`).
+fn rotate_and_stamp(
+    canvas: &mut RgbaImage,
+    mut poster: RgbaImage,
+    cx: i64,
+    cy: i64,
+    angle_deg: f32,
+) {
+    apply_rounded_corners(&mut poster);
+
+    let pw = poster.width();
+    let ph = poster.height();
+
+    // Embed the poster centred in a square big enough that rotation never clips it.
+    let buf_size = ROTATION_CANVAS;
+    let ox = ((buf_size - pw) / 2) as i64;
+    let oy = ((buf_size - ph) / 2) as i64;
+    let mut buf = RgbaImage::new(buf_size, buf_size);
+    image::imageops::overlay(&mut buf, &poster, ox, oy);
+
+    // Bilinear inverse-mapping rotation (no external imageproc dep needed).
+    let bx = buf_size as i32;
+    let by = buf_size as i32;
+    let half_x = buf_size as f32 / 2.0;
+    let half_y = buf_size as f32 / 2.0;
+    let theta = angle_deg * std::f32::consts::PI / 180.0;
+    let cos_a = theta.cos();
+    let sin_a = theta.sin();
+    let mut rotated = RgbaImage::new(buf_size, buf_size);
+    for oy in 0..buf_size {
+        for ox in 0..buf_size {
+            let fx = ox as f32 - half_x;
+            let fy = oy as f32 - half_y;
+            // Inverse rotation (CW angle → CCW inverse)
+            let src_x = fx * cos_a + fy * sin_a + half_x;
+            let src_y = -fx * sin_a + fy * cos_a + half_y;
+            if src_x >= 0.0
+                && src_x < (bx - 1) as f32
+                && src_y >= 0.0
+                && src_y < (by - 1) as f32
+            {
+                let x0 = src_x as u32;
+                let y0 = src_y as u32;
+                let x1 = (x0 + 1).min(buf_size - 1);
+                let y1 = (y0 + 1).min(buf_size - 1);
+                let fx2 = src_x.fract();
+                let fy2 = src_y.fract();
+                let p00 = buf
+                    .get_pixel(x0, y0)
+                    .0;
+                let p10 = buf
+                    .get_pixel(x1, y0)
+                    .0;
+                let p01 = buf
+                    .get_pixel(x0, y1)
+                    .0;
+                let p11 = buf
+                    .get_pixel(x1, y1)
+                    .0;
+                let interp = |a: u8, b: u8, c: u8, d: u8| -> u8 {
+                    let top = a as f32 + (b as f32 - a as f32) * fx2;
+                    let bot = c as f32 + (d as f32 - c as f32) * fx2;
+                    (top + (bot - top) * fy2) as u8
+                };
+                rotated.put_pixel(
+                    ox,
+                    oy,
+                    Rgba([
+                        interp(p00[0], p10[0], p01[0], p11[0]),
+                        interp(p00[1], p10[1], p01[1], p11[1]),
+                        interp(p00[2], p10[2], p01[2], p11[2]),
+                        interp(p00[3], p10[3], p01[3], p11[3]),
+                    ]),
+                );
+            }
+        }
+    }
+
+    let stamp_x = cx - buf_size as i64 / 2;
+    let stamp_y = cy - buf_size as i64 / 2;
+    image::imageops::overlay(canvas, &rotated, stamp_x, stamp_y);
+}
+
+/// Sync overlay renderer — called from inside `spawn_blocking`.
+/// `logo_image` is the already-downloaded streaming logo (if any). `centered`
+/// is set for [`CollectionPosterLayout::None`], where there is no poster grid
+/// reserving space on one side, so the overlay is centered on the full canvas
+/// instead of left-aligned in the text box next to it.
+fn apply_overlay_sync(
+    canvas: &mut RgbaImage,
+    overlay: &CollectionOverlay,
+    fallback_name: &str,
+    logo_image: Option<RgbaImage>,
+    centered: bool,
+) -> anyhow::Result<()> {
+    match overlay {
+        CollectionOverlay::None => {}
+        CollectionOverlay::Text {
+            text,
+            font_size,
+            font_family,
+            font_weight,
+        } => {
+            let label = text
+                .as_deref()
+                .unwrap_or(fallback_name);
+            let size = (*font_size).unwrap_or(90) as f32;
+            let font_bytes = collection_font_bytes(font_family.unwrap_or_default());
+            let mut font = FontRef::try_from_slice(font_bytes)
+                .map_err(|e| anyhow::anyhow!("font load: {e:?}"))?;
+            use ab_glyph::VariableFont;
+            let weight = match font_weight.unwrap_or_default() {
+                CollectionFontWeight::Regular => 400.0,
+                CollectionFontWeight::Bold => 700.0,
+            };
+            let _ = font.set_variation(b"wght", weight);
+            let fallbacks = fallback_fonts(weight);
+
+            let max_w = if centered {
+                OUT_W as f32 * 0.85
+            } else {
+                TEXT_AREA_END as f32 - TEXT_LEFT_MARGIN as f32
+            };
+            let scale = PxScale::from(size);
+
+            let lines = wrap_words(&font, scale, label, max_w);
+
+            let sf = font.as_scaled(scale);
+            let line_h = sf.ascent() - sf.descent();
+            let line_gap = line_h * 0.18;
+            let step = line_h + line_gap;
+            let total_h = step * lines.len() as f32 - line_gap;
+            let start_y = ((OUT_H as f32 - total_h) / 2.0) as i32;
+
+            for (i, line) in lines
+                .iter()
+                .enumerate()
+            {
+                let y = start_y + (i as f32 * step) as i32;
+                let x = if centered {
+                    ((OUT_W as f32 - measure_text_width(&font, scale, line)) / 2.0)
+                        as i32
+                } else {
+                    TEXT_LEFT_MARGIN
+                };
+                draw_text_with_fallback(
+                    canvas,
+                    Rgba([255, 255, 255, 255]),
+                    x,
+                    y,
+                    scale,
+                    &font,
+                    &fallbacks,
+                    line,
+                );
+            }
+        }
+        CollectionOverlay::StreamingLogo { .. } => {
+            if let Some(logo) = logo_image {
+                let max_logo_h = if centered {
+                    OUT_H * 9 / 25
+                } else {
+                    OUT_H * 3 / 10
+                };
+                let max_logo_w = if centered {
+                    (OUT_W as f32 * 0.7) as u32
+                } else {
+                    (OUT_W as f32 * 0.34) as u32
+                };
+                let scale = (max_logo_h as f32 / logo.height() as f32)
+                    .min(max_logo_w as f32 / logo.width() as f32);
+                let lw = (logo.width() as f32 * scale) as u32;
+                let lh = (logo.height() as f32 * scale) as u32;
+                let scaled = image::imageops::resize(
+                    &logo,
+                    lw,
+                    lh,
+                    image::imageops::FilterType::Lanczos3,
+                );
+                let lx = if centered {
+                    (OUT_W.saturating_sub(lw) / 2) as i64
+                } else {
+                    TEXT_LEFT_MARGIN as i64
+                };
+                let ly = (OUT_H.saturating_sub(lh) / 2) as i64;
+                let mut shadow = scaled.clone();
+                for pixel in shadow.pixels_mut() {
+                    if pixel[3] > 0 {
+                        pixel[0] = 0;
+                        pixel[1] = 0;
+                        pixel[2] = 0;
+                        pixel[3] = (pixel[3] as f32 * 0.35) as u8;
+                    }
+                }
+                image::imageops::overlay(canvas, &shadow, lx + 3, ly + 3);
+                image::imageops::overlay(canvas, &scaled, lx, ly);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn provider_wordmark(provider_name: Option<&str>) -> Option<RgbaImage> {
+    let bytes = match provider_name?
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "netflix" => PROVIDER_LOGO_NETFLIX,
+        "amazon prime video" | "prime video" => PROVIDER_LOGO_PRIME_VIDEO,
+        "disney plus" | "disney+" => PROVIDER_LOGO_DISNEY_PLUS,
+        "max" | "hbo max" => PROVIDER_LOGO_MAX,
+        "hulu" => PROVIDER_LOGO_HULU,
+        "paramount plus" | "paramount+" => PROVIDER_LOGO_PARAMOUNT_PLUS,
+        "crunchyroll" => PROVIDER_LOGO_CRUNCHYROLL,
+        "apple tv plus" | "apple tv+" | "apple tv" => PROVIDER_LOGO_APPLE_TV,
+        "viaplay" => PROVIDER_LOGO_VIAPLAY,
+        "skyshowtime" => PROVIDER_LOGO_SKYSHOWTIME,
+        "peacock" => PROVIDER_LOGO_PEACOCK,
+        "mubi" => PROVIDER_LOGO_MUBI,
+        "pluto tv" => PROVIDER_LOGO_PLUTO_TV,
+        "youtube" | "youtube premium" => PROVIDER_LOGO_YOUTUBE,
+        "amc+" | "amc plus" => PROVIDER_LOGO_AMC_PLUS,
+        "adn" | "animation digital network" => PROVIDER_LOGO_ADN,
+        "funimation now" | "funimation" => PROVIDER_LOGO_FUNIMATION_NOW,
+        "illico+" | "illico plus" => PROVIDER_LOGO_ILLICO_PLUS,
+        "sky mais" | "skymais" => PROVIDER_LOGO_SKY_MAIS,
+        "c more" | "cmore" => PROVIDER_LOGO_C_MORE,
+        "foxtel now" => PROVIDER_LOGO_FOXTEL_NOW,
+        "jiohotstar" => PROVIDER_LOGO_JIOHOTSTAR,
+        "wetv" => PROVIDER_LOGO_WETV,
+        "chorki" => PROVIDER_LOGO_CHORKI,
+        "tvp vod" => PROVIDER_LOGO_TVP_VOD,
+        "kwelitv" => PROVIDER_LOGO_KWELITV,
+        "vidio" => PROVIDER_LOGO_VIDIO,
+        "vivamax" => PROVIDER_LOGO_VIVAMAX,
+        "ruutu" => PROVIDER_LOGO_RUUTU,
+        "samsung tv plus" => PROVIDER_LOGO_SAMSUNG_TV_PLUS,
+        "craftsy" => PROVIDER_LOGO_CRAFTSY,
+        "mx player" => PROVIDER_LOGO_MX_PLAYER,
+        "axn now" | "axnnow" => PROVIDER_LOGO_AXN_NOW,
+        "claro video" => PROVIDER_LOGO_CLARO_VIDEO,
+        "dimsum" => PROVIDER_LOGO_DIMSUM,
+        "catchplay+" | "catchplay" => PROVIDER_LOGO_CATCHPLAY,
+        "fanatiz" => PROVIDER_LOGO_FANATIZ,
+        "movistar plus+" | "movistar+" | "movistar plus" => PROVIDER_LOGO_MOVISTAR_PLUS,
+        "discovery+" | "discovery plus" => PROVIDER_LOGO_DISCOVERY_PLUS,
+        "kocowa" => PROVIDER_LOGO_KOCOWA,
+        "toku" => PROVIDER_LOGO_TOKU,
+        "watcha" => PROVIDER_LOGO_WATCHA,
+        "wakanim" => PROVIDER_LOGO_WAKANIM,
+        "dplay" => PROVIDER_LOGO_DPLAY,
+        "filmdoo" => PROVIDER_LOGO_FILMDOO,
+        "globoplay" => PROVIDER_LOGO_GLOBOPLAY,
+        "mtv katsomo" => PROVIDER_LOGO_MTV_KATSOMO,
+        "u-next" | "unext" => PROVIDER_LOGO_U_NEXT,
+        "rcti+" | "rcti plus" => PROVIDER_LOGO_RCTI_PLUS,
+        "nfl+" | "nfl plus" => PROVIDER_LOGO_NFL_PLUS,
+        "nasa+" | "nasa plus" => PROVIDER_LOGO_NASA_PLUS,
+        "iwanttfc" | "iwant" => PROVIDER_LOGO_IWANTTFC,
+        "kapamilya online live" => PROVIDER_LOGO_KAPAMILYA_ONLINE_LIVE,
+        "hayu" => PROVIDER_LOGO_HAYU,
+        "watch it" => PROVIDER_LOGO_WATCH_IT,
+        "stan" => PROVIDER_LOGO_STAN,
+        "shudder" => PROVIDER_LOGO_SHUDDER,
+        "roxi" => PROVIDER_LOGO_ROXI,
+        _ => return None,
+    };
+    image::load_from_memory(bytes)
+        .ok()
+        .map(|image| image.into_rgba8())
+}
+
+/// Break `text` into lines where each line fits within `max_w` pixels at `scale`.
+fn wrap_words(
+    font: &FontRef<'_>,
+    scale: PxScale,
+    text: &str,
+    max_w: f32,
+) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        let candidate = if current.is_empty() {
+            word.to_string()
+        } else {
+            format!("{current} {word}")
+        };
+        if !current.is_empty() && measure_text_width(font, scale, &candidate) > max_w {
+            lines.push(current);
+            current = word.to_string();
+        } else {
+            current = candidate;
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(text.to_string());
+    }
+    lines
+}
+
 fn solid_background() -> RgbImage {
-    RgbImage::from_pixel(OUT_W, OUT_H, image::Rgb([30, 30, 30]))
+    RgbImage::from_pixel(OUT_W, OUT_H, Rgb([0, 0, 0]))
+}
+
+fn parse_hex_color(value: &str) -> Option<[u8; 3]> {
+    let value = value.strip_prefix('#')?;
+    if value.len() != 6 {
+        return None;
+    }
+    Some([
+        u8::from_str_radix(&value[0..2], 16).ok()?,
+        u8::from_str_radix(&value[2..4], 16).ok()?,
+        u8::from_str_radix(&value[4..6], 16).ok()?,
+    ])
+}
+
+fn gradient_background(color: [u8; 3]) -> RgbaImage {
+    let mut image = RgbaImage::new(OUT_W, OUT_H);
+    for y in 0..OUT_H {
+        let t = y as f32 / (OUT_H.saturating_sub(1)) as f32;
+        let factor = 0.7 + t * 0.3;
+        let pixel = Rgba([
+            (color[0] as f32 * factor) as u8,
+            (color[1] as f32 * factor) as u8,
+            (color[2] as f32 * factor) as u8,
+            255,
+        ]);
+        for x in 0..OUT_W {
+            image.put_pixel(x, y, pixel);
+        }
+    }
+    image
 }
 
 /// Blend a semi-transparent black overlay over the image to darken it,
@@ -489,7 +1641,7 @@ fn apply_dark_overlay(mut img: RgbImage) -> RgbImage {
 
 /// Render the library name centered on the image in white text.
 fn draw_label(mut img: RgbImage, name: &str) -> anyhow::Result<RgbImage> {
-    let font = FontRef::try_from_slice(FONT_DATA)
+    let font = FontRef::try_from_slice(FONT_BOLD)
         .map_err(|e| anyhow::anyhow!("font load failed: {e:?}"))?;
 
     // Start at ~20% of image height and scale down until it fits within 90% width.
@@ -529,6 +1681,83 @@ fn measure_text_width(font: &FontRef<'_>, scale: PxScale, text: &str) -> f32 {
     width
 }
 
+/// Loads the fallback chain (see `FALLBACK_FONT_BYTES`) at the given variable
+/// weight, matching whatever the primary font was set to. Built fresh per
+/// call — cheap, since this only parses font headers, not glyph outlines.
+fn fallback_fonts(weight: f32) -> Vec<FontRef<'static>> {
+    use ab_glyph::VariableFont;
+    FALLBACK_FONT_BYTES
+        .iter()
+        .filter_map(|bytes| FontRef::try_from_slice(bytes).ok())
+        .map(|mut font| {
+            let _ = font.set_variation(b"wght", weight);
+            font
+        })
+        .collect()
+}
+
+/// Whether `font` has a real glyph for `c`. `ab_glyph` returns glyph id 0
+/// (`.notdef`) for anything outside the font's coverage, which is otherwise
+/// indistinguishable from a legitimately empty glyph.
+fn font_covers(font: &FontRef<'_>, c: char) -> bool {
+    c.is_whitespace()
+        || font
+            .glyph_id(c)
+            .0
+            != 0
+}
+
+/// Draws `text` at `(x, y)`, substituting the first fallback font that has a
+/// given character instead of leaving it blank when `primary` doesn't cover
+/// it — e.g. a symbol like ♥ that only some of the bundled fonts include.
+/// Splits `text` into runs by resolved font and draws each run separately;
+/// kerning across a font switch is not applied, a minor cosmetic gap next to
+/// an already-uncommon fallback character. This does not add support for
+/// color/pictographic emoji: `ab_glyph` only rasterizes monochrome vector
+/// outlines, so a true emoji codepoint has no glyph in any of these fonts
+/// either and still renders as nothing.
+fn draw_text_with_fallback<'f>(
+    canvas: &mut RgbaImage,
+    color: Rgba<u8>,
+    x: i32,
+    y: i32,
+    scale: PxScale,
+    primary: &'f FontRef<'f>,
+    fallbacks: &'f [FontRef<'f>],
+    text: &str,
+) {
+    let font_for = |c: char| -> &'f FontRef<'f> {
+        if font_covers(primary, c) {
+            return primary;
+        }
+        fallbacks
+            .iter()
+            .find(|f| font_covers(f, c))
+            .unwrap_or(primary)
+    };
+
+    let mut cursor_x = x as f32;
+    let mut run = String::new();
+    let mut run_font: Option<&'f FontRef<'f>> = None;
+
+    for c in text.chars() {
+        let f = font_for(c);
+        let same = run_font.is_some_and(|rf| std::ptr::eq(rf, f));
+        if !same && !run.is_empty() {
+            let font = run_font.unwrap();
+            draw_text_mut(canvas, color, cursor_x as i32, y, scale, font, &run);
+            cursor_x += measure_text_width(font, scale, &run);
+            run.clear();
+        }
+        run_font = Some(f);
+        run.push(c);
+    }
+    if !run.is_empty() {
+        let font = run_font.unwrap();
+        draw_text_mut(canvas, color, cursor_x as i32, y, scale, font, &run);
+    }
+}
+
 fn ext_for_content_type(ct: &str) -> &'static str {
     match ct {
         "image/png" => "png",
@@ -541,6 +1770,17 @@ fn ext_for_content_type(ct: &str) -> &'static str {
 fn encode_jpeg(img: RgbImage) -> anyhow::Result<Vec<u8>> {
     let mut buf = Cursor::new(Vec::new());
     img.write_to(&mut buf, ImageFormat::Jpeg)?;
+    Ok(buf.into_inner())
+}
+
+/// Generated collection art is fully opaque photographic content. JPEG avoids
+/// the disproportionately expensive lossless PNG compression of a poster grid.
+fn encode_jpeg_rgba(img: RgbaImage) -> anyhow::Result<Vec<u8>> {
+    let mut buf = Cursor::new(Vec::new());
+    let rgb = DynamicImage::ImageRgba8(img).into_rgb8();
+    use image::codecs::jpeg::JpegEncoder;
+    JpegEncoder::new_with_quality(&mut buf, 90)
+        .encode_image(&DynamicImage::ImageRgb8(rgb))?;
     Ok(buf.into_inner())
 }
 
@@ -595,7 +1835,10 @@ fn apply_sizing(img: DynamicImage, opts: &ImageProcessOptions) -> DynamicImage {
     let orig_w = img.width();
     let orig_h = img.height();
 
-    // Priority 1: fill — scale down to fit inside box, no upscale, maintain AR.
+    // Priority 1: fill — cover the requested box, including upscaling local
+    // generated art when the client asks for a larger rendition. With both
+    // dimensions supplied this deliberately crops the excess so the response
+    // has the exact dimensions requested by Jellyfin clients.
     if opts
         .fill_width
         .is_some()
@@ -603,23 +1846,18 @@ fn apply_sizing(img: DynamicImage, opts: &ImageProcessOptions) -> DynamicImage {
             .fill_height
             .is_some()
     {
-        let scale_x = opts
-            .fill_width
-            .map(|fw| fw as f32 / orig_w as f32)
-            .unwrap_or(f32::MAX);
-        let scale_y = opts
-            .fill_height
-            .map(|fh| fh as f32 / orig_h as f32)
-            .unwrap_or(f32::MAX);
-        let scale = scale_x
-            .min(scale_y)
-            .min(1.0);
-        if scale < 1.0 {
-            let nw = ((orig_w as f32 * scale) as u32).max(1);
-            let nh = ((orig_h as f32 * scale) as u32).max(1);
-            return img.resize(nw, nh, image::imageops::FilterType::Lanczos3);
-        }
-        return img;
+        return match (opts.fill_width, opts.fill_height) {
+            (Some(width), Some(height)) => {
+                img.resize_to_fill(width, height, image::imageops::FilterType::Lanczos3)
+            }
+            (Some(width), None) => {
+                img.resize(width, u32::MAX, image::imageops::FilterType::Lanczos3)
+            }
+            (None, Some(height)) => {
+                img.resize(u32::MAX, height, image::imageops::FilterType::Lanczos3)
+            }
+            (None, None) => unreachable!("fill sizing requires a dimension"),
+        };
     }
 
     // Priority 2: exact width / height (missing dimension maintains AR).
@@ -651,4 +1889,205 @@ fn apply_sizing(img: DynamicImage, opts: &ImageProcessOptions) -> DynamicImage {
     }
 
     img
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grid_is_four_by_four_with_gutters() {
+        assert_eq!(
+            grid_dimensions(),
+            (
+                3 * GRID_POSTER_W + 2 * GRID_GUTTER,
+                3 * GRID_POSTER_H + 2 * GRID_GUTTER,
+            )
+        );
+    }
+
+    #[test]
+    fn fill_dimensions_upscale_and_crop_to_the_requested_size() {
+        let source = DynamicImage::new_rgba8(960, 540);
+        let opts = ImageProcessOptions {
+            fill_width: Some(1170),
+            fill_height: Some(657),
+            ..Default::default()
+        };
+
+        let result = apply_sizing(source, &opts);
+
+        assert_eq!((result.width(), result.height()), (1170, 657));
+    }
+
+    #[test]
+    fn missing_streaming_logo_does_not_render_placeholder_text() {
+        let mut canvas = RgbaImage::from_pixel(OUT_W, OUT_H, Rgba([18, 18, 22, 255]));
+        let expected = canvas.clone();
+
+        apply_overlay_sync(
+            &mut canvas,
+            &CollectionOverlay::StreamingLogo {
+                provider_id: 0,
+                provider_name: None,
+                logo_path: None,
+            },
+            "Collection",
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(canvas, expected);
+    }
+
+    #[tokio::test]
+    async fn synthetic_thumb_composites_backdrop_and_logo_at_thumb_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let backdrop_path = dir
+            .path()
+            .join("backdrop.jpg");
+        RgbImage::from_pixel(1280, 720, Rgb([40, 60, 80]))
+            .save(&backdrop_path)
+            .unwrap();
+        let logo_path = dir
+            .path()
+            .join("logo.png");
+        RgbaImage::from_pixel(500, 200, Rgba([255, 255, 255, 255]))
+            .save(&logo_path)
+            .unwrap();
+
+        let bytes = ImageService::synthetic_thumb(
+            backdrop_path
+                .to_str()
+                .unwrap(),
+            Some(
+                logo_path
+                    .to_str()
+                    .unwrap(),
+            ),
+            "Some Title",
+        )
+        .await
+        .unwrap();
+
+        let decoded = image::load_from_memory(&bytes).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (OUT_W, OUT_H));
+        assert_eq!(detect_content_type(&bytes), "image/jpeg");
+    }
+
+    #[tokio::test]
+    async fn synthetic_thumb_falls_back_to_title_text_without_a_logo() {
+        let dir = tempfile::tempdir().unwrap();
+        let backdrop_path = dir
+            .path()
+            .join("backdrop.jpg");
+        RgbImage::from_pixel(1280, 720, Rgb([40, 60, 80]))
+            .save(&backdrop_path)
+            .unwrap();
+
+        let bytes = ImageService::synthetic_thumb(
+            backdrop_path
+                .to_str()
+                .unwrap(),
+            None,
+            "Some Title",
+        )
+        .await
+        .unwrap();
+
+        let decoded = image::load_from_memory(&bytes).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (OUT_W, OUT_H));
+    }
+
+    #[tokio::test]
+    async fn cached_synthetic_thumb_persists_under_the_image_cache_dir() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let backdrop_path = source_dir
+            .path()
+            .join("backdrop.jpg");
+        RgbImage::from_pixel(1280, 720, Rgb([40, 60, 80]))
+            .save(&backdrop_path)
+            .unwrap();
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let backdrop_id = Uuid::new_v4();
+
+        let (first, cache_key) = ImageService::cached_synthetic_thumb(
+            data_dir.path(),
+            backdrop_id,
+            None,
+            backdrop_path
+                .to_str()
+                .unwrap(),
+            None,
+            "Some Title",
+        )
+        .await
+        .unwrap();
+        let cache_path =
+            ImageService::cache_dir(data_dir.path()).join(format!("{cache_key}.jpg"));
+        assert!(cache_path.exists(), "composite should be written to disk");
+
+        // Deleting the source backdrop proves a second call for the same
+        // backdrop/logo ids is served from the cache file, not regenerated.
+        std::fs::remove_file(&backdrop_path).unwrap();
+        let (second, _) = ImageService::cached_synthetic_thumb(
+            data_dir.path(),
+            backdrop_id,
+            None,
+            backdrop_path
+                .to_str()
+                .unwrap(),
+            None,
+            "Some Title",
+        )
+        .await
+        .unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[tokio::test]
+    async fn cached_synthetic_thumb_regenerates_when_the_backdrop_changes() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let backdrop_path = source_dir
+            .path()
+            .join("backdrop.jpg");
+        RgbImage::from_pixel(1280, 720, Rgb([40, 60, 80]))
+            .save(&backdrop_path)
+            .unwrap();
+
+        let data_dir = tempfile::tempdir().unwrap();
+
+        let (_, first_key) = ImageService::cached_synthetic_thumb(
+            data_dir.path(),
+            Uuid::new_v4(),
+            None,
+            backdrop_path
+                .to_str()
+                .unwrap(),
+            None,
+            "Some Title",
+        )
+        .await
+        .unwrap();
+
+        // A refresh that replaces the Backdrop gets a new `media_images` row
+        // id (see `sync_from_media`) — the cache key must follow it so the
+        // stale composite is never served for the new artwork.
+        let (_, second_key) = ImageService::cached_synthetic_thumb(
+            data_dir.path(),
+            Uuid::new_v4(),
+            None,
+            backdrop_path
+                .to_str()
+                .unwrap(),
+            None,
+            "Some Title",
+        )
+        .await
+        .unwrap();
+
+        assert_ne!(first_key, second_key);
+    }
 }

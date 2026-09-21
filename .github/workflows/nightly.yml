@@ -17,7 +17,7 @@ jobs:
     outputs:
       has_changes: ${{ steps.check.outputs.has_changes }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
       - name: Compare HEAD with last nightly
         id: check
@@ -43,7 +43,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           fetch-tags: true
@@ -65,6 +65,12 @@ jobs:
     needs: version
     uses: ./.github/workflows/test.yml
 
+  bench:
+    name: Bench
+    needs: [version, test]
+    uses: ./.github/workflows/bench.yml
+    secrets: inherit
+
   build:
     name: Build
     needs: [version, test]
@@ -81,7 +87,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout source
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
           fetch-tags: true

@@ -49,6 +49,7 @@ pub struct Device {
     pub app_version: String,
     pub last_activity_at: Option<DateTime<Utc>>,
     pub capabilities: Option<sqlx::types::Json<crate::api::ClientCapabilitiesDto>>,
+    pub device_profile: Option<sqlx::types::Json<remux_sdks::remux::DeviceProfile>>,
     pub remote_ip: Option<String>,
     pub created_at: Option<DateTime<Utc>>,
 }
@@ -336,20 +337,57 @@ impl Device {
     /// Store client capabilities JSON for this device.
     pub async fn save_capabilities(
         db: &SqlitePool,
+        user_id: Uuid,
         device_id: &str,
         caps: &crate::api::ClientCapabilitiesDto,
     ) -> Result<()> {
-        sqlx::query("UPDATE devices SET capabilities = ? WHERE lower(id) = lower(?)")
-            .bind(sqlx::types::Json(caps))
-            .bind(device_id)
-            .execute(db)
-            .await?;
+        // devices' primary key is (user_id, id) — a client-supplied device id
+        // is not unique across users, so filtering by id alone can update
+        // another user's device row entirely.
+        sqlx::query(
+            "UPDATE devices SET capabilities = ? WHERE user_id = ? AND lower(id) = lower(?)",
+        )
+        .bind(sqlx::types::Json(caps))
+        .bind(user_id)
+        .bind(device_id)
+        .execute(db)
+        .await?;
         Ok(())
     }
 
     /// Get the stored capabilities for this device, if present.
     pub fn parsed_capabilities(&self) -> Option<crate::api::ClientCapabilitiesDto> {
         self.capabilities
+            .as_ref()
+            .map(|j| {
+                j.0.clone()
+            })
+    }
+
+    /// Store the Jellyfin DeviceProfile for this device (used to sort MediaSources
+    /// by capability on later requests that don't resend the full profile).
+    pub async fn save_device_profile(
+        db: &SqlitePool,
+        user_id: Uuid,
+        device_id: &str,
+        profile: &remux_sdks::remux::DeviceProfile,
+    ) -> Result<()> {
+        // Same reasoning as save_capabilities: devices' primary key is
+        // (user_id, id), so a device id alone can match another user's row.
+        sqlx::query(
+            "UPDATE devices SET device_profile = ? WHERE user_id = ? AND lower(id) = lower(?)",
+        )
+        .bind(sqlx::types::Json(profile))
+        .bind(user_id)
+        .bind(device_id)
+        .execute(db)
+        .await?;
+        Ok(())
+    }
+
+    /// Get the stored DeviceProfile for this device, if present.
+    pub fn parsed_device_profile(&self) -> Option<remux_sdks::remux::DeviceProfile> {
+        self.device_profile
             .as_ref()
             .map(|j| {
                 j.0.clone()
@@ -503,6 +541,7 @@ impl FromRequestParts<AppState> for AuthSession {
             app_version: String::new(),
             last_activity_at: None,
             capabilities: None,
+            device_profile: None,
             remote_ip: None,
             created_at: None,
         };
@@ -676,6 +715,18 @@ impl JellyfinAuthHeader {
     }
 }
 
+/// Lossily decode a header value's raw bytes as UTF-8. `HeaderValue::to_str()`
+/// rejects any byte >= 0x80, which is enough to lose the whole Authorization
+/// header — macOS gives new Macs a smart/curly apostrophe (U+2019) in the
+/// default computer name (e.g. "Jonas's MacBook Pro"), and Jellyfin Media
+/// Player sends that raw UTF-8 in the header's `Device=` field. `to_str()`
+/// failing there silently drops the Token too, since the whole header is
+/// parsed as one unit — turning every authenticated request into a 401 for
+/// any device name (or other field) containing a non-ASCII character.
+fn header_text_lossy(v: &http::HeaderValue) -> String {
+    String::from_utf8_lossy(v.as_bytes()).into_owned()
+}
+
 impl FromRequestParts<AppState> for JellyfinAuthHeader {
     type Rejection = ApiError;
 
@@ -691,11 +742,8 @@ impl FromRequestParts<AppState> for JellyfinAuthHeader {
                     .headers
                     .get("X-Emby-Authorization")
             })
-            .and_then(|v| {
-                v.to_str()
-                    .ok()
-            })
-            .and_then(|raw| JellyfinAuthHeader::from_str(raw).ok())
+            .map(header_text_lossy)
+            .and_then(|raw| JellyfinAuthHeader::from_str(&raw).ok())
         {
             return Ok(auth);
         }
@@ -709,11 +757,7 @@ impl FromRequestParts<AppState> for JellyfinAuthHeader {
                     .headers
                     .get("X-MediaBrowser-Token")
             })
-            .and_then(|v| {
-                v.to_str()
-                    .ok()
-            })
-            .map(|s| s.to_string());
+            .map(header_text_lossy);
 
         if let Some(token) = token {
             return Ok(JellyfinAuthHeader {

@@ -44,6 +44,111 @@ pub fn is_tracker_url(s: &str) -> bool {
     }
 }
 
+/// Whether `host` names an address only reachable from the network remux
+/// itself runs on: a loopback/private/link-local/CGNAT IP, a bare
+/// single-label hostname (Docker Compose/Kubernetes service names), or a
+/// well-known internal-only suffix (`.local`, `.internal`, `.lan`, …).
+/// Used to catch stream URLs an addon resolved from inside its own container
+/// that a client elsewhere on the network could never reach.
+pub fn is_internal_host(host: &str) -> bool {
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return is_internal_ip(ip);
+    }
+    let host = host.trim_end_matches('.');
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    if !host.contains('.') {
+        return true;
+    }
+    matches!(
+        host.rsplit('.')
+            .next()
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some(
+            "local"
+                | "internal"
+                | "lan"
+                | "home"
+                | "docker"
+                | "test"
+                | "invalid"
+                | "localdomain"
+                | "localhost"
+        )
+    )
+}
+
+fn is_internal_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || is_cgnat_v4(v4)
+        }
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || is_unique_local_v6(v6)
+                || is_link_local_v6(v6)
+        }
+    }
+}
+
+/// 100.64.0.0/10, the carrier-grade NAT range Docker/Tailscale sometimes use.
+fn is_cgnat_v4(v4: std::net::Ipv4Addr) -> bool {
+    let o = v4.octets();
+    o[0] == 100 && (o[1] & 0b1100_0000) == 0b0100_0000
+}
+
+fn is_unique_local_v6(v6: std::net::Ipv6Addr) -> bool {
+    (v6.segments()[0] & 0xfe00) == 0xfc00
+}
+
+fn is_link_local_v6(v6: std::net::Ipv6Addr) -> bool {
+    (v6.segments()[0] & 0xffc0) == 0xfe80
+}
+
+#[cfg(test)]
+mod internal_host_tests {
+    use super::is_internal_host;
+
+    #[test]
+    fn flags_private_and_loopback_ips() {
+        assert!(is_internal_host("127.0.0.1"));
+        assert!(is_internal_host("192.168.1.50"));
+        assert!(is_internal_host("10.0.10.66"));
+        assert!(is_internal_host("172.17.0.2"));
+        assert!(is_internal_host("169.254.1.1"));
+        assert!(is_internal_host("100.64.0.5"));
+        assert!(is_internal_host("::1"));
+        assert!(is_internal_host("fc00::1"));
+        assert!(is_internal_host("fe80::1"));
+    }
+
+    #[test]
+    fn flags_bare_and_internal_suffixed_hostnames() {
+        assert!(is_internal_host("aiostreams"));
+        assert!(is_internal_host("localhost"));
+        assert!(is_internal_host("myaddon.local"));
+        assert!(is_internal_host("service.internal"));
+        assert!(is_internal_host("box.lan"));
+        assert!(is_internal_host("service.localhost"));
+    }
+
+    #[test]
+    fn allows_public_ips_and_domains() {
+        assert!(!is_internal_host("8.8.8.8"));
+        assert!(!is_internal_host("example.com"));
+        assert!(!is_internal_host("stream.example.co.uk"));
+        assert!(!is_internal_host("aiostreams.example.com"));
+    }
+}
+
 fn deserialize_tracker_urls<'de, D>(
     deserializer: D,
 ) -> std::result::Result<Vec<TrackerUrl>, D::Error>
@@ -261,8 +366,12 @@ pub struct StreamInfo {
     /// Used as part of the stable dedup key for HTTP streams.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binge_group: Option<String>,
+    /// Upstream addon name from `streamData.addon` (e.g. "BB", "Comet").
+    /// Used alongside `service_id` for the addon-level stream filter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_addon: Option<String>,
     /// Torrent info-hash for the source release (from AIOStreams streamData).
-    /// Stored independently of the descriptor so debrid Http streams can match by hash.
+    /// Stored independently of the descriptor so debrid Http streams can match and submit by hash.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub torrent_info_hash: Option<String>,
     /// File index within the torrent (from AIOStreams streamData).
@@ -277,6 +386,30 @@ pub struct StreamInfo {
 impl StreamInfo {
     pub fn is_p2p(&self) -> bool {
         matches!(self.descriptor, StreamDescriptor::Torrent { .. })
+    }
+
+    /// Torrent identity used for RemuxDB lookup and submission.
+    ///
+    /// A `Torrent` descriptor is authoritative. Any other transport (notably a
+    /// debrid `Http` stream) falls back to the identity preserved from
+    /// AIOStreams `streamData.torrent`. `None` when the stream has no torrent
+    /// identity at all.
+    pub fn torrent_identity(&self) -> Option<(&str, Option<i32>)> {
+        match &self.descriptor {
+            StreamDescriptor::Torrent {
+                info_hash,
+                file_idx,
+                ..
+            } => Some((
+                info_hash.as_str(),
+                // Indices beyond i32 can't be represented in RemuxDB; treat as unknown.
+                file_idx.and_then(|i| i32::try_from(i).ok()),
+            )),
+            _ => self
+                .torrent_info_hash
+                .as_deref()
+                .map(|hash| (hash, self.torrent_file_idx)),
+        }
     }
 
     pub fn resolution_tag(&self) -> Option<String> {
@@ -590,18 +723,30 @@ impl StreamSource for TorrentSource {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("P2P is disabled"))
             .context_bad_request("P2P is disabled")?;
+        let lease = torrent
+            .acquire(&self.info_hash)
+            .await;
         let resolved = torrent
             .resolve_url(&self.to_magnet())
             .await
             .context_bad_request("failed to resolve torrent")?;
 
-        HttpSource {
+        let response = HttpSource {
             url: resolved,
             request_headers: Default::default(),
             response_headers: Default::default(),
         }
         .serve_inner(headers, true)
-        .await
+        .await?;
+        let (parts, body) = response.into_parts();
+        let stream = async_stream::stream! {
+            let _lease = lease;
+            let mut stream = body.into_data_stream();
+            while let Some(chunk) = stream.next().await {
+                yield chunk;
+            }
+        };
+        Ok(Response::from_parts(parts, Body::from_stream(stream)))
     }
 }
 

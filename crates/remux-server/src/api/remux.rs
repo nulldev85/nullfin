@@ -13,13 +13,17 @@ use std::collections::{HashMap, HashSet};
 
 use crate::{
     AppState, OptionExt,
+    common::tmdb_client,
     db::{self, auth},
-    sdks,
+    sdks::{self, CachedEndpoint},
+    services::image::ImageService,
 };
 use axum_anyhow::ApiResult as Result;
 use uuid::Uuid;
 
 const CACHE_KEY_PREFIX: &str = "remux:cache:";
+const WATCH_PROVIDERS_CACHE_TTL: std::time::Duration =
+    std::time::Duration::from_secs(72 * 60 * 60);
 
 #[query]
 #[derive(Debug, Default)]
@@ -524,6 +528,13 @@ async fn streams_metadata(state: &AppState, id: Uuid) -> AnyResult<StreamsRespon
                         .collect::<Vec<_>>()
                         .join("/"),
                     StreamRule::Size { op, value } => format_size_rule(*op, *value),
+                    StreamRule::Addon { values, .. } => {
+                        if values.len() == 1 {
+                            "1 addon".to_string()
+                        } else {
+                            format!("{} addons", values.len())
+                        }
+                    }
                 })
                 .filter(|s| !s.is_empty())
                 .collect();
@@ -559,9 +570,7 @@ async fn streams_metadata(state: &AppState, id: Uuid) -> AnyResult<StreamsRespon
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct MetricsStatusResponse {
-    pub daily_days: i64,
     pub last_updated_days_ago: Option<i64>,
-    pub item_count: i64,
 }
 
 #[get("/remux/metrics/status")]
@@ -569,24 +578,21 @@ pub async fn remux_metrics_status(
     State(state): State<AppState>,
     _session: auth::AuthSession,
 ) -> Result<impl IntoResponse> {
-    let row = sqlx::query_as::<_, (i64, Option<i64>, i64)>(
-        "SELECT COUNT(DISTINCT period_key), \
-                CAST(julianday('now') - julianday(MAX(period_key)) AS INTEGER), \
-                COUNT(DISTINCT media_id) \
-         FROM popularity_agg \
-         WHERE period = 'daily'",
+    let last_updated_days_ago = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT CAST(julianday('now') - julianday(end_at) AS INTEGER) \
+         FROM task_results WHERE task_id = 'RefreshPopularity' \
+         AND status = 'completed'",
     )
-    .fetch_one(
+    .fetch_optional(
         &state
             .ctx
             .db,
     )
-    .await?;
+    .await?
+    .flatten();
 
     Ok(Json(MetricsStatusResponse {
-        daily_days: row.0,
-        last_updated_days_ago: row.1,
-        item_count: row.2,
+        last_updated_days_ago,
     }))
 }
 
@@ -663,4 +669,96 @@ pub async fn remux_meta(
             Ok((StatusCode::NOT_FOUND, Json(serde_json::Value::Null)).into_response())
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Watch providers
+// ---------------------------------------------------------------------------
+
+fn watch_provider_key(name: &str) -> String {
+    match name
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "amazon prime video" | "prime video" => "amazon prime video".to_string(),
+        "discovery+" | "discovery plus" => "discovery plus".to_string(),
+        name => name.to_string(),
+    }
+}
+
+/// `GET /remux/watch-providers` — list all streaming providers available on TMDB.
+#[get("/remux/watch-providers")]
+pub async fn get_watch_providers(
+    State(state): State<AppState>,
+    _session: auth::AdminSession,
+) -> Result<Json<Vec<crate::services::stream_provider::StreamProvider>>> {
+    let tmdb_base = state
+        .ctx
+        .config
+        .tmdb_base_url
+        .clone();
+    let client = tmdb_client(
+        &state
+            .ctx
+            .db,
+        &tmdb_base,
+    )
+    .await
+    .ok_or_else(|| anyhow::anyhow!("TMDB client is unavailable"))?;
+
+    let providers = client
+        .execute(
+            sdks::tmdb::AllMovieWatchProvidersEndpoint {
+                language: Some("en-US".to_string()),
+                watch_region: None,
+            }
+            .with_cache(WATCH_PROVIDERS_CACHE_TTL),
+        )
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!("failed to fetch TMDB watch providers: {error}")
+        })?
+        .results;
+
+    let mut dtos: Vec<crate::services::stream_provider::StreamProvider> = providers
+        .into_iter()
+        .map(|p| {
+            crate::services::stream_provider::StreamProvider::new(
+                p.provider_id,
+                p.provider_name,
+                p.logo_path,
+            )
+        })
+        .collect();
+    dtos.sort_by_key(|provider| watch_provider_key(&provider.name));
+    dtos.dedup_by(|a, b| watch_provider_key(&a.name) == watch_provider_key(&b.name));
+    Ok(Json(dtos))
+}
+
+// ---------------------------------------------------------------------------
+// Collection image regeneration
+// ---------------------------------------------------------------------------
+
+/// `POST /remux/collections/{id}/image/regenerate` — delete the cached generated
+/// image for a collection so it is rebuilt on the next request.
+#[post("/remux/collections/{id}/image/regenerate")]
+pub async fn regenerate_collection_image(
+    State(state): State<AppState>,
+    _session: auth::AdminSession,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode> {
+    ImageService::invalidate_collection_image(
+        &state
+            .ctx
+            .config
+            .data_dir,
+        id,
+        &state
+            .ctx
+            .db,
+    )
+    .await
+    .map_err(anyhow::Error::from)?;
+    Ok(StatusCode::NO_CONTENT)
 }

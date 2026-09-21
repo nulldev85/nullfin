@@ -39,7 +39,10 @@ use crate::{
 
 use crate::{
     IntoApiError, OptionExt, ResultExt,
-    device_profile::{DeviceProfileExt, SubtitleCodec, subtitle_codec_matches_profile},
+    device_profile::{
+        DeviceProfileExt, SourceRankingContext, SubtitleCodec,
+        subtitle_codec_matches_profile,
+    },
     playback::{
         decision::{
             PlaybackConfig, TranscodeDecision, apply_subtitle_delivery,
@@ -163,6 +166,39 @@ async fn items_playbackinfo_inner(
         .device_profile
         .clone();
 
+    if let Some(profile) = device_profile.clone() {
+        let db = state
+            .ctx
+            .db
+            .clone();
+        let user_id = session
+            .user
+            .id;
+        let device_id = session
+            .device
+            .id
+            .clone();
+        tokio::spawn(async move {
+            if let Err(err) =
+                auth::Device::save_device_profile(&db, user_id, &device_id, &profile)
+                    .await
+            {
+                warn!("failed to persist device profile for {device_id}: {err}");
+            }
+        });
+    }
+    // Fall back to the last DeviceProfile this device sent for MediaSources
+    // sorting only — transcode decisions above still use only what this
+    // specific request sent, so a stale cached profile can't misroute a
+    // direct-play/transcode choice.
+    let sort_device_profile = device_profile
+        .clone()
+        .or_else(|| {
+            session
+                .device
+                .parsed_device_profile()
+        });
+
     let probe_cfg = db::Settings::get_config_or_default(
         &state
             .ctx
@@ -283,6 +319,7 @@ async fn items_playbackinfo_inner(
     let probed = service
         .probe_candidates()
         .await?;
+    service.save_probe_fallback(&play_session_id, &probed);
     let specific_stream_requested = probed.specific_requested;
     let mut media_sources = Vec::with_capacity(
         probed
@@ -290,6 +327,15 @@ async fn items_playbackinfo_inner(
             .len(),
     );
     let mut sidecar_subtitle_routes = Vec::with_capacity(
+        probed
+            .results
+            .len(),
+    );
+    // Tracked so the capability sort below can be skipped entirely when any
+    // source is a stream-group representative — group order is an explicit,
+    // admin-authored priority (drag-and-drop in the dashboard), not something
+    // a device-capability sort should second-guess.
+    let mut source_group_ids: Vec<Option<Uuid>> = Vec::with_capacity(
         probed
             .results
             .len(),
@@ -334,41 +380,10 @@ async fn items_playbackinfo_inner(
             api::inject_lyric_stream(&mut source);
         }
 
-        // Only flag bitrate exceeded when the source bitrate is known and
-        // actually exceeds the cap. An unknown bitrate is treated as within
-        // limits so that clients with a high/unlimited cap aren't forced into
-        // transcoding unnecessarily.
-        let bitrate_exceeded = max_bitrate.map_or(false, |max| {
-            source
-                .bitrate
-                .map_or(false, |b| b > max)
-        });
-
-        let mut transcode_reasons: api::TranscodeReasons = {
-            let mut reasons = device_profile
-                .as_ref()
-                .map(|profile| profile.check_direct_play(&source))
-                .unwrap_or_default();
-            if bitrate_exceeded {
-                reasons.insert(api::TranscodeReason::ContainerBitrateExceedsLimit);
-            }
-            // RTSP streams can only be served via ffmpeg — never direct-playable.
-            if matches!(
-                stream
-                    .stream_info
-                    .as_ref()
-                    .map(|si| &si.descriptor),
-                Some(crate::stream::StreamDescriptor::Rtsp { .. })
-            ) {
-                reasons.insert(api::TranscodeReason::ContainerNotSupported(
-                    "rtsp".to_string(),
-                ));
-            }
-            reasons
-        };
-
         // Strip mode: remove embedded subtitle streams not supported by the client so
         // they don't trigger a transcode. External/addon subs are never touched.
+        // Must run before resolve_default_streams below, so a stripped-out stream
+        // can never end up as the resolved default (a dangling index).
         if subtitle_mode == remux_sdks::remux::EmbeddedSubtitleHandling::Strip {
             source
                 .media_streams
@@ -410,9 +425,9 @@ async fn items_playbackinfo_inner(
         let _ = effective_url;
 
         // Resolve default audio/subtitle stream indexes for this source. These are
-        // per-request API values (never persisted); resolving before the burn
-        // check, transcode decision and subtitle delivery means those consumers
-        // see the stream the client will actually get.
+        // per-request API values (never persisted); resolving before the transcode
+        // decision and subtitle delivery means those consumers see the stream the
+        // client will actually get.
         source.resolve_default_streams(
             &user_cfg,
             server_subtitle_lang,
@@ -422,56 +437,31 @@ async fn items_playbackinfo_inner(
             saved_audio,
             saved_subtitle,
         );
-
-        // Detect embedded subtitle codecs unsupported by the client device profile.
-        // In Burn mode this triggers transcoding so the subtitle can be burned in.
-        // In Extract/Strip modes, no transcode reason is added for subtitles.
         let effective_sub_idx = q
             .subtitle_stream_index
             .or(source.default_subtitle_stream_index);
-        if let Some(idx) = effective_sub_idx {
-            let needs_burn = subtitle_mode
-                == remux_sdks::remux::EmbeddedSubtitleHandling::Burn
-                && source
-                    .media_streams
-                    .iter()
-                    .any(|s| {
-                        s.index == idx
-                            && matches!(s.type_, Some(api::MediaStreamType::Subtitle))
-                            && !s.is_external
-                            && !s.is_text_subtitle_stream
-                            && !device_profile
-                                .as_ref()
-                                .map(|dp| {
-                                    dp.subtitle_profiles
-                                        .iter()
-                                        .filter_map(|p| {
-                                            p.format
-                                                .as_deref()
-                                        })
-                                        .any(|f| {
-                                            s.codec
-                                                .as_deref()
-                                                .map_or(false, |c| {
-                                                    subtitle_codec_matches_profile(c, f)
-                                                })
-                                        })
-                                })
-                                .unwrap_or(false)
-                    });
-            if needs_burn {
-                let codec = source
-                    .media_streams
-                    .iter()
-                    .find(|s| s.index == idx)
-                    .and_then(|s| {
-                        s.codec
-                            .clone()
-                    })
-                    .unwrap_or_default();
-                transcode_reasons
-                    .insert(api::TranscodeReason::SubtitleCodecNotSupported(codec));
-            }
+
+        // check_direct_play, the bitrate cap and the subtitle-burn check (in Burn
+        // mode) all in one place — the same reasons construction ranking below
+        // reuses for the persisted-profile fallback case.
+        let mut transcode_reasons = crate::device_profile::compute_transcode_reasons(
+            &source,
+            device_profile.as_ref(),
+            subtitle_mode,
+            q.subtitle_stream_index,
+            max_bitrate,
+        );
+        // RTSP streams can only be served via ffmpeg — never direct-playable.
+        if matches!(
+            stream
+                .stream_info
+                .as_ref()
+                .map(|si| &si.descriptor),
+            Some(crate::stream::StreamDescriptor::Rtsp { .. })
+        ) {
+            transcode_reasons.insert(api::TranscodeReason::ContainerNotSupported(
+                "rtsp".to_string(),
+            ));
         }
 
         debug!(
@@ -528,6 +518,28 @@ async fn items_playbackinfo_inner(
 
         source.transcoding_reasons = transcode_reasons;
 
+        if device_profile.is_some()
+            && probe_cfg
+                .show_playback_decision_in_title
+                .unwrap_or(true)
+        {
+            let source_bitrate = source.bitrate;
+            let reasons = source
+                .transcoding_reasons
+                .clone();
+            if let Some(video) = source
+                .media_streams
+                .iter_mut()
+                .find(|s| matches!(s.type_, Some(api::MediaStreamType::Video)))
+            {
+                crate::device_profile::annotate_video_display_title(
+                    video,
+                    source_bitrate,
+                    &reasons,
+                );
+            }
+        }
+
         // Recompute from codec — never trust the stored DB value (may be stale).
         for s in &mut source.media_streams {
             if matches!(s.type_, Some(api::MediaStreamType::Subtitle)) {
@@ -536,6 +548,7 @@ async fn items_playbackinfo_inner(
         }
 
         sidecar_subtitle_routes.push((subtitle_source_id, routes));
+        source_group_ids.push(stream.group_id);
         media_sources.push(source);
     }
 
@@ -577,6 +590,36 @@ async fn items_playbackinfo_inner(
             saved_audio,
             saved_subtitle,
         );
+    }
+
+    // Rank sources by how well they match the device's capabilities (transcode
+    // cost, confident 4K, HDR tier, bit depth, audio quality, embedded subs)
+    // so the auto-play source below is the best version, not just the first
+    // one probed. Keep `sidecar_subtitle_routes` aligned by permuting it in
+    // lockstep — the later zip below pairs them back up by index.
+    let sort_mode = probe_cfg
+        .sort_media_sources
+        .unwrap_or_default();
+    if sort_mode != remux_sdks::remux::SortMediaSourcesMode::Disabled
+        && source_group_ids
+            .iter()
+            .all(|g| g.is_none())
+    {
+        let ranking = SourceRankingContext {
+            mode: sort_mode,
+            device_profile: sort_device_profile.as_ref(),
+            subtitle_mode,
+            explicit_subtitle_index: q.subtitle_stream_index,
+        };
+        let mut paired: Vec<_> = media_sources
+            .drain(..)
+            .zip(sidecar_subtitle_routes.drain(..))
+            .collect();
+        paired.sort_by_cached_key(|(source, _)| std::cmp::Reverse(ranking.key(source)));
+        for (source, route) in paired {
+            media_sources.push(source);
+            sidecar_subtitle_routes.push(route);
+        }
     }
 
     // Cache the group-resolved stream UUID so the stream endpoint can find it
@@ -875,6 +918,37 @@ fn ext_from_descriptor(descriptor: &crate::stream::StreamDescriptor) -> String {
     }
 }
 
+/// A Matroska source can be served unchanged when the requested output is
+/// Matroska. `stream.mkv` callers commonly omit `AudioCodec`; unlike the
+/// progressive endpoint's FFmpeg default, that does not itself request an
+/// audio conversion.
+fn can_serve_mkv_source_directly(
+    container: &str,
+    audio_codec: Option<&str>,
+    has_audio_options: bool,
+) -> bool {
+    if has_audio_options {
+        return false;
+    }
+
+    let audio_is_copy_or_unspecified = audio_codec
+        .map(|codec| codec.eq_ignore_ascii_case("copy"))
+        .unwrap_or(true);
+
+    match container
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        // `build_progressive_args` promotes copy/copy MP4 output to Matroska,
+        // so this is also an unchanged source response.
+        "mp4" => audio_codec
+            .map(|codec| codec.eq_ignore_ascii_case("copy"))
+            .unwrap_or(false),
+        "mkv" | "matroska" => audio_is_copy_or_unspecified,
+        _ => false,
+    }
+}
+
 async fn videos_stream_inner(
     headers: headers::HeaderMap,
     state: AppState,
@@ -882,27 +956,90 @@ async fn videos_stream_inner(
     id: Uuid,
     q: api::VideoStreamQuery,
 ) -> Result<impl IntoResponse> {
+    // Auto-play and stream-group requests name an id the client echoes back
+    // (the item id, or the group id), not a stream. If PlaybackInfo's probe
+    // fell over to another stream for that id in this play session, follow
+    // it; the lookup below would otherwise land on the first candidate — the
+    // one that just failed to probe. A specific stream named by the client
+    // has no such record and stands.
+    let probe_fallback = q
+        .play_session_id
+        .as_deref()
+        .and_then(|psid| {
+            StreamService::probe_fallback_for(
+                &state.ctx,
+                psid,
+                q.media_source_id
+                    .unwrap_or(id),
+            )
+        });
+    let requested_id = probe_fallback.or(q.media_source_id);
     let media = StreamService::lookup(
         &state.ctx,
         id,
-        q.media_source_id,
+        requested_id,
         q.device_id
             .as_deref(),
         user_id,
     )
     .await;
 
+    // Both fallthroughs serve the no-streams placeholder with HTTP 200 (the
+    // client plays a blank clip). Log why, or the failure is invisible.
     let media = match media {
         Ok(m) => m,
-        Err(_) => return Ok(no_streams_response().into_response()),
+        Err(e) => {
+            tracing::warn!(
+                item = %id,
+                media_source = ?q.media_source_id,
+                "stream lookup failed; serving no-streams placeholder: {e:#}"
+            );
+            return Ok(no_streams_response().into_response());
+        }
     };
     let Some(si) = media
         .stream_info
         .clone()
     else {
+        tracing::warn!(
+            item = %id,
+            media = %media.id,
+            "resolved media has no stream_info; serving no-streams placeholder"
+        );
         return Ok(no_streams_response().into_response());
     };
     let descriptor = si.descriptor;
+    let playback_id = q
+        .play_session_id
+        .clone()
+        .or_else(|| {
+            state
+                .ctx
+                .sessions
+                .get_by_device(
+                    q.device_id
+                        .as_deref()?,
+                )
+                .filter(|session| session.item_id == id)
+                .map(|session| session.play_session_id)
+        });
+    if let (Some(psid), crate::stream::StreamDescriptor::Torrent { info_hash, .. }) =
+        (playback_id.as_deref(), &descriptor)
+    {
+        if let Some(torrent) = state
+            .ctx
+            .torrent
+            .read()
+            .await
+            .clone()
+        {
+            state
+                .ctx
+                .sessions
+                .retain_torrent(psid, &torrent, info_hash)
+                .await;
+        }
+    }
 
     // Direct play: serve bytes directly through the StreamSource trait.
     // This handles HTTP, local files, torrents, and opendal without going through
@@ -911,19 +1048,32 @@ async fn videos_stream_inner(
         .unwrap_or(false)
     {
         // If the producing addon has http_redirect_stream enabled, issue a 302
-        // directly to the stream URL instead of proxying bytes through remux.
+        // directly to the stream URL instead of proxying bytes through remux —
+        // unless the URL's host is only reachable from remux's own network, in
+        // which case a client redirected there would just fail to connect.
         if let (Some(addon_id), crate::stream::StreamDescriptor::Http { url, .. }) =
             (si.addon_id, &descriptor)
         {
-            if state
-                .ctx
-                .addons
-                .get(addon_id)
-                .map(|a| {
-                    a.row
-                        .http_redirect_stream
+            // Fail closed: a URL we can't parse, or one with no host, is not
+            // confirmed reachable by the client either — treat it as internal
+            // rather than defaulting to allowing the redirect.
+            let host_is_internal = url::Url::parse(url)
+                .ok()
+                .and_then(|u| {
+                    u.host_str()
+                        .map(crate::stream::is_internal_host)
                 })
-                .unwrap_or(false)
+                .unwrap_or(true);
+            if !host_is_internal
+                && state
+                    .ctx
+                    .addons
+                    .get(addon_id)
+                    .map(|a| {
+                        a.row
+                            .http_redirect_stream
+                    })
+                    .unwrap_or(false)
             {
                 return Ok(axum::response::Redirect::temporary(url).into_response());
             }
@@ -990,6 +1140,9 @@ async fn videos_stream_inner(
         "h264"
     }
     .to_string();
+    let requested_audio_codec = q
+        .audio_codec
+        .clone();
     let audio_codec = q
         .audio_codec
         .unwrap_or_else(|| "aac".to_string());
@@ -1034,6 +1187,60 @@ async fn videos_stream_inner(
         .as_deref()
         == Some("Encode");
 
+    // Fast path: a Matroska source requested as Matroska is already the exact
+    // output the client wants. Copy/copy MP4 requests are also promoted to
+    // Matroska by `build_progressive_args`. Serve the source directly so its
+    // Range support is preserved; piping FFmpeg's stdout cannot seek (#438).
+    // Requests that select streams, burn subtitles, or seek by timestamp
+    // still need FFmpeg.
+    let source_is_mkv = matches!(
+        media
+            .probe_data
+            .as_ref()
+            .and_then(|p| p
+                .container
+                .as_ref()),
+        Some(VideoContainer::Mkv)
+    );
+    if is_copy_video
+        && source_is_mkv
+        && !matches!(&descriptor, crate::stream::StreamDescriptor::Rtsp { .. })
+        && can_serve_mkv_source_directly(
+            &container,
+            requested_audio_codec.as_deref(),
+            q.audio_bit_rate
+                .is_some()
+                || q.audio_channels
+                    .is_some(),
+        )
+        && !wants_stream_selection
+        && !burn_subtitle_prog
+        && q.start_time_ticks
+            .unwrap_or(0)
+            == 0
+    {
+        let resp = if let Some(addon_id) = descriptor.addon_id() {
+            let addon = state
+                .ctx
+                .addons
+                .get(addon_id)
+                .context_not_found("addon not found")?;
+            addon
+                .stream
+                .as_ref()
+                .context_not_found("addon does not support streams")?
+                .serve_stream(&descriptor, &headers)
+                .await?
+        } else {
+            descriptor
+                .clone()
+                .into_source()
+                .serve(&state, &headers)
+                .await?
+        };
+        return Ok(resp.into_response());
+    }
+
     let params = crate::playback::engine::ProgressiveTranscodeParams {
         input_url: url,
         container: container.clone(),
@@ -1072,6 +1279,9 @@ async fn videos_stream_inner(
         encoding_preset: encoding_opts.encoding_preset,
         source_video_codec,
         source_audio_codec,
+        hevc_copy_tag: q
+            .video_codec_tag
+            .clone(),
         accelerator: hw_accel::from_encoding_opts(&encoding_opts),
         source_video_range_type,
         enable_tonemapping: encoding_opts
@@ -1244,6 +1454,108 @@ mod tests {
     }
 
     #[test]
+    fn mkv_source_direct_path_accepts_bare_and_copy_mkv_requests() {
+        assert!(super::can_serve_mkv_source_directly("mkv", None, false));
+        assert!(super::can_serve_mkv_source_directly(
+            "mkv",
+            Some("copy"),
+            false
+        ));
+        assert!(super::can_serve_mkv_source_directly(
+            "matroska",
+            Some("COPY"),
+            false
+        ));
+        assert!(!super::can_serve_mkv_source_directly(
+            "mkv",
+            Some("aac"),
+            false
+        ));
+        assert!(!super::can_serve_mkv_source_directly("mkv", None, true));
+
+        // A copy/copy MP4 request is remuxed as Matroska by FFmpeg, whereas
+        // omitting AudioCodec retains its progressive AAC default.
+        assert!(super::can_serve_mkv_source_directly(
+            "mp4",
+            Some("copy"),
+            false
+        ));
+        assert!(!super::can_serve_mkv_source_directly("mp4", None, false));
+    }
+
+    #[tokio::test]
+    async fn bare_mkv_stream_preserves_range_requests() {
+        use crate::{
+            api::{MediaSourceInfo, MediaStream, MediaStreamType},
+            db, stream,
+        };
+
+        let (server, guard, token) = authenticated_server().await;
+        let fixture = std::env::temp_dir()
+            .join(format!("remux-range-{}.mkv", uuid::Uuid::new_v4()));
+        tokio::fs::write(&fixture, b"0123456789abcdef")
+            .await
+            .unwrap();
+
+        let now = chrono::Utc::now().naive_utc();
+        let mut media = db::Media {
+            title: "MKV range fixture".to_string(),
+            kind: db::MediaKind::Stream,
+            stream_info: Some(stream::StreamInfo {
+                descriptor: stream::StreamDescriptor::Local(fixture.clone()),
+                ..Default::default()
+            }),
+            probe_data: Some(MediaSourceInfo {
+                container: Some(VideoContainer::Mkv),
+                media_streams: vec![
+                    MediaStream {
+                        codec: Some("h264".to_string()),
+                        type_: Some(MediaStreamType::Video),
+                        index: 0,
+                        ..Default::default()
+                    },
+                    MediaStream {
+                        codec: Some("aac".to_string()),
+                        type_: Some(MediaStreamType::Audio),
+                        index: 1,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }),
+            created_at: now,
+            updated_at: now,
+            ..Default::default()
+        };
+        media
+            .save(
+                &guard
+                    .0
+                    .db,
+            )
+            .await
+            .unwrap();
+
+        let auth = auth_header_with_token(&token);
+        let response = server
+            .get(&format!("/videos/{}/stream.mkv", media.id))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .add_header(http::header::RANGE, HeaderValue::from_static("bytes=4-7"))
+            .await;
+
+        response.assert_status(StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.header("content-range"), "bytes 4-7/16");
+        assert_eq!(response.header("accept-ranges"), "bytes");
+
+        tokio::fs::remove_file(fixture)
+            .await
+            .unwrap();
+    }
+
+    #[test]
     fn item_runtime_fills_missing_source_duration() {
         let mut source = crate::api::MediaSourceInfo::default();
 
@@ -1364,6 +1676,84 @@ mod tests {
             resp.header("location"),
             stream_url,
             "redirect Location must point directly to the source stream URL"
+        );
+    }
+
+    /// A stream URL whose host is only reachable from remux's own network
+    /// (here, a bare Docker-style hostname) must never be handed to the
+    /// client as a redirect target, even with `http_redirect_stream` enabled —
+    /// it falls back to proxying instead.
+    #[tokio::test]
+    async fn http_redirect_stream_skips_redirect_for_internal_host() {
+        use crate::{addons::addon::Addon, stream};
+        use chrono::Utc;
+        use remux_sdks::{remux::AddonPresetRef, stremio::ResourceType};
+        use uuid::Uuid;
+
+        let (server, guard, token) = authenticated_server().await;
+        let ctx = &guard.0;
+        let now = Utc::now().naive_utc();
+        let addon_id = Uuid::new_v4();
+        let stream_url = "http://internal-addon-service:1234/movie.mp4";
+
+        let addon = Addon {
+            id: addon_id,
+            name: "redirect-test-addon-internal".to_string(),
+            preset: AddonPresetRef {
+                kind: "stremio".to_string(),
+                config: serde_json::json!({
+                    "manifest_url": "https://example.com/addon/manifest.json"
+                })
+                .into(),
+            },
+            resources: vec![ResourceType::Stream],
+            types: vec![],
+            enabled: true,
+            priority: 0,
+            system: false,
+            is_default: false,
+            http_redirect_stream: true,
+            service_filter: vec![],
+            created_at: now,
+            updated_at: now,
+        };
+        addon
+            .insert(&ctx.db)
+            .await
+            .unwrap();
+
+        ctx.addons
+            .reload(&ctx.db, &ctx.config)
+            .await
+            .unwrap();
+
+        let mut media = crate::db::Media {
+            title: "Redirect Test Internal".to_string(),
+            kind: crate::db::MediaKind::Stream,
+            stream_info: Some(stream::StreamInfo {
+                descriptor: stream::StreamDescriptor::http(stream_url),
+                addon_id: Some(addon_id),
+                ..Default::default()
+            }),
+            created_at: now,
+            updated_at: now,
+            ..Default::default()
+        };
+        media
+            .save(&ctx.db)
+            .await
+            .unwrap();
+
+        let resp = server
+            .get(&format!("/videos/{}/stream", media.id))
+            .add_query_params([("Static", "true"), ("ApiKey", &token)])
+            .expect_failure()
+            .await;
+
+        assert_ne!(
+            resp.status_code(),
+            StatusCode::TEMPORARY_REDIRECT,
+            "must not redirect a client to an internal-only host"
         );
     }
 

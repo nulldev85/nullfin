@@ -29,6 +29,9 @@ fn find_matched_nothing(found: &sdks::tmdb::FindByIdResponse) -> bool {
         && found
             .tv_results
             .is_empty()
+        && found
+            .tv_episode_results
+            .is_empty()
 }
 
 /// The ids the call was for are not there: no such episode, or one TMDB knows
@@ -61,6 +64,7 @@ fn series_ids_endpoint(tmdb_id: i64) -> sdks::tmdb::SeriesEndpoint {
     sdks::tmdb::SeriesEndpoint {
         id: tmdb_id,
         language: None,
+        include_image_language: None,
         append_to_response: vec!["external_ids".to_string()],
     }
 }
@@ -69,6 +73,7 @@ fn movie_ids_endpoint(tmdb_id: i64) -> sdks::tmdb::MovieEndpoint {
     sdks::tmdb::MovieEndpoint {
         id: tmdb_id,
         language: None,
+        include_image_language: None,
         append_to_response: vec!["external_ids".to_string()],
     }
 }
@@ -168,6 +173,61 @@ impl MediaResolveService {
 
         // FindById returns a partial object without external_ids; use the TMDB id
         // to fetch the full record which includes external_ids (via append_to_response).
+        Self::imdb_from_tmdb_id(tmdb_id, is_tv, client).await
+    }
+
+    /// Title+year search fallback, used only when nothing else identifies the
+    /// item at all — e.g. a filename with no embedded provider id, matched by
+    /// title against TMDB directly. Never a substitute for id-based
+    /// resolution; see [`Self::resolve_imdb_from_ids`] for that.
+    pub(crate) async fn resolve_imdb_from_search(
+        client: &RestClient<BearerAuth>,
+        title: &str,
+        year: Option<i64>,
+        is_tv: bool,
+    ) -> Option<db::NonEmptyString> {
+        if title.is_empty() {
+            return None;
+        }
+        let tmdb_id = if is_tv {
+            client
+                .execute(
+                    sdks::tmdb::SearchTvEndpoint {
+                        query: title.to_string(),
+                    }
+                    .with_cache(ID_CACHE_TTL),
+                )
+                .await
+                .ok()?
+                .results
+                .into_iter()
+                .next()?
+                .id
+        } else {
+            client
+                .execute(
+                    sdks::tmdb::SearchMovieEndpoint {
+                        query: title.to_string(),
+                        year,
+                    }
+                    .with_cache(ID_CACHE_TTL),
+                )
+                .await
+                .ok()?
+                .results
+                .into_iter()
+                .next()?
+                .id
+        };
+        Self::imdb_from_tmdb_id(tmdb_id, is_tv, client).await
+    }
+
+    /// The minimal external-ids-only fetch for a TMDB id already in hand.
+    async fn imdb_from_tmdb_id<A: sdks::Auth + Clone>(
+        tmdb_id: i64,
+        is_tv: bool,
+        client: &RestClient<A>,
+    ) -> Option<db::NonEmptyString> {
         if is_tv {
             let series = client
                 .execute(series_ids_endpoint(tmdb_id).with_cache(ID_CACHE_TTL))
@@ -265,6 +325,183 @@ impl MediaResolveService {
         }
     }
 
+    /// Resolves external IDs on `media`.
+    ///
+    /// With `force_refresh` disabled, makes only the calls needed to fill a
+    /// missing ID. With it enabled, re-fetches IDs that TMDB can authoritatively
+    /// provide. Movies only ever get tmdb/imdb (TVDB doesn't track movies);
+    /// TVDB is Series- and Episode-only.
+    ///
+    /// Deliberately does not attempt to backfill a missing kitsu id: kitsu
+    /// only matters for anime, which we can't tell from ids alone at this
+    /// point (genre/original_language aren't known until an addon's own
+    /// `meta_fetch` runs, later in `refresh_meta`) — trying it unconditionally
+    /// for every Series added a mandatory third-party round trip that misses
+    /// for the vast majority of shows. Kitsu stays exactly what it was
+    /// before this method existed: a fallback *key source* in
+    /// `tmdb_search_key` (used only when neither imdb nor tvdb is known) and
+    /// the anime-tracker completion flow's own on-demand resolution — never
+    /// something resolved speculatively on every refresh.
+    ///
+    /// Called once at the top of `refresh_meta`, before any addon's own
+    /// `meta_fetch` runs, so every addon sees the fuller id set. This is
+    /// intentionally sequential, not parallelized: TMDB's series
+    /// `external_ids` sub-resource returns imdb *and* tvdb together in one
+    /// call — there's no pair
+    /// of independent lookups left to run concurrently once that's used.
+    pub async fn resolve_external_ids(
+        media: &mut db::Media,
+        ctx: &AppContext,
+        force_refresh: bool,
+    ) {
+        if media.kind == db::MediaKind::Episode {
+            let needs_ids = force_refresh
+                || media
+                    .external_ids
+                    .tmdb
+                    .is_none()
+                || media
+                    .external_ids
+                    .imdb
+                    .is_none()
+                || media
+                    .external_ids
+                    .tvdb
+                    .is_none();
+            if !needs_ids {
+                return;
+            }
+            let Some(client) = Self::tmdb(ctx).await else {
+                return;
+            };
+            let series_tmdb = if let Some(series_tmdb) =
+                Self::stored_series_tmdb_id(media, ctx)
+                    .await
+                    .ok()
+                    .flatten()
+            {
+                series_tmdb
+            } else {
+                let Some((episode_tmdb, series_tmdb)) =
+                    Self::find_episode_tmdb_ids(&media.external_ids, &client).await
+                else {
+                    return;
+                };
+                media
+                    .external_ids
+                    .tmdb = Some(episode_tmdb);
+                series_tmdb
+            };
+            let (Some(season), Some(episode)) = (media.parent_idx, media.idx) else {
+                return;
+            };
+            let Ok(Some(ids)) =
+                Self::episode_external_ids(series_tmdb, season, episode, &client).await
+            else {
+                return;
+            };
+            media
+                .external_ids
+                .merge(&ids, force_refresh);
+            return;
+        }
+
+        if !matches!(media.kind, db::MediaKind::Movie | db::MediaKind::Series) {
+            return;
+        }
+        let is_tv = media.kind == db::MediaKind::Series;
+        let needs_tmdb = media
+            .external_ids
+            .tmdb
+            .is_none();
+        let needs_imdb = media
+            .external_ids
+            .imdb
+            .is_none();
+        let needs_tvdb = is_tv
+            && media
+                .external_ids
+                .tvdb
+                .is_none();
+        if !force_refresh && !needs_tmdb && !needs_imdb && !needs_tvdb {
+            return;
+        }
+        let Some(client) = Self::tmdb(ctx).await else {
+            return;
+        };
+
+        let tmdb_id = if let Some(id) = media
+            .external_ids
+            .tmdb
+        {
+            Some(id)
+        } else {
+            match Self::tmdb_search_key(
+                &media.external_ids,
+                Some(&sdks::kitsu::client()),
+            )
+            .await
+            {
+                Some((external_id, external_source)) => {
+                    Self::find_tmdb_id_by(external_id, external_source, is_tv, &client)
+                        .await
+                        .ok()
+                        .flatten()
+                }
+                None => None,
+            }
+        };
+        let Some(tmdb_id) = tmdb_id else {
+            return;
+        };
+        media
+            .external_ids
+            .tmdb = Some(tmdb_id);
+
+        if force_refresh || needs_imdb || needs_tvdb {
+            if is_tv {
+                if let Ok(series) = client
+                    .execute(series_ids_endpoint(tmdb_id).with_cache(ID_CACHE_TTL))
+                    .await
+                    && let Some(e) = series.external_ids
+                {
+                    if force_refresh
+                        || media
+                            .external_ids
+                            .imdb
+                            .is_none()
+                    {
+                        media
+                            .external_ids
+                            .imdb = e
+                            .imdb_id
+                            .and_then(|s| db::NonEmptyString::try_new(s).ok());
+                    }
+                    if force_refresh
+                        || media
+                            .external_ids
+                            .tvdb
+                            .is_none()
+                    {
+                        media
+                            .external_ids
+                            .tvdb = e.tvdb_id;
+                    }
+                }
+            } else if (force_refresh || needs_imdb)
+                && let Ok(movie) = client
+                    .execute(movie_ids_endpoint(tmdb_id).with_cache(ID_CACHE_TTL))
+                    .await
+            {
+                media
+                    .external_ids
+                    .imdb = movie
+                    .imdb_id
+                    .and_then(|s| db::NonEmptyString::try_new(s).ok());
+            }
+        }
+    }
+
     /// The likeliest id to hit on `/find`: imdb, then tvdb, then tvdb via kitsu.
     /// Not tmdb, which a caller holding one would have skipped this for.
     pub(crate) async fn tmdb_search_key(
@@ -327,6 +564,42 @@ impl MediaResolveService {
         })
     }
 
+    /// Finds an episode's TMDB id and its parent series id from the episode's
+    /// own IMDb or TVDB id. `/find` accepts either ID without requiring a
+    /// resolved parent series first.
+    async fn find_episode_tmdb_ids<A: sdks::Auth + Clone>(
+        ids: &db::ExternalIds,
+        client: &RestClient<A>,
+    ) -> Option<(i64, i64)> {
+        let (external_id, external_source) =
+            Self::tmdb_search_key(ids, Some(&sdks::kitsu::client())).await?;
+        let found = client
+            .execute(
+                sdks::tmdb::FindByIdEndpoint {
+                    external_id,
+                    external_source: external_source.to_string(),
+                }
+                .with_cache(ID_CACHE_TTL)
+                .should_cache(|r| {
+                    Some(if find_matched_nothing(r) {
+                        ID_MISS_CACHE_TTL
+                    } else {
+                        ID_CACHE_TTL
+                    })
+                }),
+            )
+            .await
+            .ok()?;
+        found
+            .tv_episode_results
+            .into_iter()
+            .find_map(|episode| {
+                episode
+                    .show_id
+                    .map(|series_id| (episode.id, series_id))
+            })
+    }
+
     /// The series' TMDB id, from whatever else it carries. Kitsu comes last:
     /// a series with an imdb id would pay for a mapping call it then discards.
     async fn series_tmdb_id(
@@ -365,6 +638,7 @@ impl MediaResolveService {
                     season_number: season,
                     episode_number: episode,
                     language: None,
+                    include_image_language: None,
                     append_to_response: Some(vec!["external_ids".to_string()]),
                 }
                 .with_cache(
@@ -484,9 +758,9 @@ impl MediaResolveService {
         series
             .external_ids
             .tmdb = Some(tmdb);
-        // Cannot re-key the row out from under its own episodes: `candidate_ids`
-        // ranks imdb and the Stremio id above tmdb, and a series carrying
-        // neither is one `Media::save` refuses.
+        // Widen the stored IDs without changing the persisted UUID or child
+        // links, even when TMDB becomes the preferred canonical external ID.
+        // Later ingests find this row through its external IDs.
         if let Some(stored) = db::Media::widen_external_ids(
             &ctx.db,
             &series.id,
@@ -602,8 +876,7 @@ impl MediaResolveService {
     /// Resolves a cached search result from the store into a persisted `db::Media`.
     ///
     /// - Movie/Series: resolves IMDB ID first (via TMDB), then saves.
-    /// - Track/Album: builds artist root from `external_ids.deezer_artist`, runs
-    ///   `process_meta_item` which triggers `sync_tree` → full discography.
+    /// - Track/Album: [`Self::persist_music`] — returns the clicked item itself.
     /// - Artist/Person: passed directly to `process_meta_item`.
     async fn persist_from_store(
         id: Uuid,
@@ -623,85 +896,27 @@ impl MediaResolveService {
 
         if matches!(media.kind, db::MediaKind::Movie | db::MediaKind::Series) {
             if !Self::resolve_media_imdb(&mut media, ctx).await {
-                // If the item arrived with a resolvable external ID (TMDB or TVDB), we
-                // expected to derive an IMDB ID from it. Bail early so the caller sees
-                // a clean failure instead of a silent crash.
-                if media
-                    .external_ids
-                    .tmdb
-                    .is_some()
-                    || media
-                        .external_ids
-                        .tvdb
-                        .is_some()
-                {
-                    warn!(%id, kind = ?media.kind, title = %media.title,
-                        "persist_from_store: IMDB resolution failed for TMDB/TVDB item, skipping");
-                    return Ok(None);
-                }
-                warn!(%id, kind = ?media.kind, "persist_from_store: IMDB resolution failed, saving without IMDB ID");
+                debug!(%id, kind = ?media.kind, title = %media.title,
+                    "persist_from_store: no IMDb ID resolved, retaining existing external IDs");
             }
-            let raw = media.media_id_raw();
-            if raw
-                .canonical()
-                .is_some()
+            // External IDs resolved above may match a row already in the DB —
+            // adopt its id rather than persisting a duplicate.
+            if let Some(existing_id) =
+                db::Media::find_existing_id_by_ext(&ctx.db, &media).await
             {
-                media.id = uuid::Uuid::from(&raw);
+                media.id = existing_id;
             }
         }
 
         if matches!(media.kind, db::MediaKind::Track | db::MediaKind::Album) {
-            if !Self::resolve_music_deezer(&mut media).await {
-                warn!(%id, kind = ?media.kind, title = %media.title,
-                    "persist_from_store: Deezer ID resolution failed");
-            }
+            return Self::persist_music(media, id, ctx).await;
         }
 
-        let root = if matches!(media.kind, db::MediaKind::Track | db::MediaKind::Album)
-        {
-            let Some(deezer_artist_id) = media
-                .external_ids
-                .deezer_artist
-            else {
-                debug!(%id, kind = ?media.kind, "persist_from_store: no deezer_artist id on music child");
-                return Ok(None);
-            };
-            db::Media {
-                id: crate::common::stable_media_uuid(
-                    &db::MediaKind::Artist,
-                    &deezer_artist_id.to_string(),
-                ),
-                title: media
-                    .grandparent
-                    .as_ref()
-                    .map(|gp| {
-                        gp.title
-                            .clone()
-                    })
-                    .unwrap_or_default(),
-                kind: db::MediaKind::Artist,
-                external_ids: db::ExternalIds {
-                    deezer_artist: Some(deezer_artist_id),
-                    ..Default::default()
-                },
-                ..Default::default()
-            }
-        } else {
-            media
-        };
-
-        let resolved_id = root.id;
+        let resolved_id = media.id;
 
         // If the caller's fake UUID differs from the resolved real UUID, keep an alias so
         // future lookups for the fake ID still resolve to the persisted row.
-        if id != resolved_id {
-            ctx.store
-                .save(
-                    id.to_string(),
-                    resolved_id,
-                    std::time::Duration::from_secs(7 * 24 * 3600),
-                );
-        }
+        Self::save_alias(ctx, id, resolved_id).await;
 
         // Already in DB — alias is saved above, skip the full tree sync.
         if let Some(existing) = db::Media::get_by_id(&ctx.db, &resolved_id).await? {
@@ -711,13 +926,255 @@ impl MediaResolveService {
         let config = std::sync::Arc::new(
             crate::db::Settings::get_config_or_default(&ctx.db).await,
         );
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(
+            (config
+                .meta_concurrency
+                .max(1)) as usize,
+        ));
         // process_meta_item now owns all upserts internally and returns the actual UUID
         // (which may differ from resolved_id if an existing DB row was adopted).
+        // force_refresh=true: this is a brand-new item; the stub is a placeholder,
+        // so meta addons should fully replace any pre-populated fields.
         let actual_id = ctx
             .addons
-            .process_meta_item(root, ctx.clone(), false, config)
+            .process_meta_item(media, ctx.clone(), true, config, semaphore)
             .await;
         Ok(db::Media::get_by_id(&ctx.db, &actual_id).await?)
+    }
+
+    /// Persists a Track/Album clicked in search results and returns the
+    /// clicked item itself — the client navigated to this item, not to its
+    /// artist.
+    async fn persist_music(
+        mut media: db::Media,
+        id: Uuid,
+        ctx: &AppContext,
+    ) -> anyhow::Result<Option<db::Media>> {
+        if !Self::resolve_music_deezer(&mut media).await {
+            warn!(%id, kind = ?media.kind, title = %media.title,
+                "persist_music: Deezer ID resolution failed");
+        }
+        let Some(deezer_artist) = media
+            .external_ids
+            .deezer_artist
+        else {
+            debug!(%id, kind = ?media.kind, "persist_music: no deezer_artist id on music child");
+            return Ok(None);
+        };
+
+        let artist_id = crate::common::stable_media_uuid(
+            &db::MediaKind::Artist,
+            &deezer_artist.to_string(),
+        );
+
+        // Map the transient store key to the item's stable UUID (no-op for
+        // deezer-keyed search results).
+        Self::save_alias(ctx, id, media.id).await;
+
+        // A full discography sync is dozens of Deezer calls — keep it off the
+        // click's critical path. Concurrent first clicks on the same new
+        // artist may both spawn it; the sync is idempotent (stable UUIDs).
+        if db::Media::get_by_id(&ctx.db, &artist_id)
+            .await?
+            .is_none()
+        {
+            let root = db::Media {
+                id: artist_id,
+                title: media
+                    .artist_name()
+                    .map(str::to_string)
+                    .unwrap_or_default(),
+                kind: db::MediaKind::Artist,
+                external_ids: db::ExternalIds {
+                    deezer_artist: Some(deezer_artist),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            match db::Media::upsert(&ctx.db, &[root.clone()]).await {
+                Ok(()) => {
+                    let bg_ctx = ctx.clone();
+                    tokio::spawn(async move {
+                        let config = std::sync::Arc::new(
+                            crate::db::Settings::get_config_or_default(&bg_ctx.db)
+                                .await,
+                        );
+                        let semaphore =
+                            std::sync::Arc::new(tokio::sync::Semaphore::new(
+                                (config
+                                    .meta_concurrency
+                                    .max(1)) as usize,
+                            ));
+                        bg_ctx
+                            .addons
+                            .process_meta_item(
+                                root,
+                                bg_ctx.clone(),
+                                false,
+                                config,
+                                semaphore,
+                            )
+                            .await;
+                    });
+                }
+                Err(e) => {
+                    warn!(%id, error = %e, "persist_music: failed to upsert artist stub");
+                }
+            }
+        }
+
+        // The background sync may have already persisted this item.
+        if let Some(item) = db::Media::get_by_id(&ctx.db, &media.id).await? {
+            return Ok(Some(item));
+        }
+
+        // Compilation releases never appear in the artist's own discography —
+        // sync the item's album; this also persists its tracks.
+        let album_root = match media.kind {
+            db::MediaKind::Album => Some(media.clone()),
+            _ => Self::album_root_for_track(&media, artist_id),
+        };
+        if let Some(mut album_root) = album_root {
+            if album_root
+                .grandparent_id
+                .is_none()
+            {
+                album_root.grandparent_id = Some(artist_id);
+            }
+            if album_root
+                .grandparent
+                .is_none()
+            {
+                album_root.grandparent = Some(db::Media::stub(
+                    artist_id,
+                    media
+                        .artist_name()
+                        .map(str::to_string)
+                        .unwrap_or_default(),
+                ));
+            }
+            let config = std::sync::Arc::new(
+                crate::db::Settings::get_config_or_default(&ctx.db).await,
+            );
+            let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(
+                (config
+                    .meta_concurrency
+                    .max(1)) as usize,
+            ));
+            ctx.addons
+                .process_meta_item(album_root, ctx.clone(), false, config, semaphore)
+                .await;
+        }
+
+        if let Some(item) = db::Media::get_by_id(&ctx.db, &media.id).await? {
+            return Ok(Some(item));
+        }
+        // process_meta_item may have adopted an existing row for the same
+        // external ID under a different UUID.
+        if let Some(existing_id) =
+            db::Media::find_existing_id_by_ext(&ctx.db, &media).await
+        {
+            Self::save_alias(ctx, id, existing_id).await;
+            if let Some(item) = db::Media::get_by_id(&ctx.db, &existing_id).await? {
+                return Ok(Some(item));
+            }
+        }
+
+        // Fallback for when the album sync failed — the click must still
+        // resolve to itself.
+        let mut clicked = media;
+        if clicked.kind == db::MediaKind::Track
+            && clicked
+                .parent_id
+                .is_none()
+        {
+            if let Some(dz_album) = clicked
+                .external_ids
+                .deezer_album
+            {
+                clicked.parent_id = Some(crate::common::stable_media_uuid(
+                    &db::MediaKind::Album,
+                    &dz_album.to_string(),
+                ));
+            }
+        }
+        if clicked
+            .grandparent_id
+            .is_none()
+        {
+            clicked.grandparent_id = Some(artist_id);
+        }
+        let clicked_id = clicked.id;
+        if let Err(e) = db::Media::upsert(&ctx.db, &[clicked]).await {
+            warn!(%id, error = %e, "persist_music: failed to upsert clicked item");
+            return Ok(None);
+        }
+        Ok(db::Media::get_by_id(&ctx.db, &clicked_id).await?)
+    }
+
+    /// Album root stable-keyed by the Deezer album ID, for tracks whose
+    /// release is not yet in the DB.
+    fn album_root_for_track(track: &db::Media, artist_id: Uuid) -> Option<db::Media> {
+        let deezer_album = track
+            .external_ids
+            .deezer_album?;
+        let mut album = db::Media {
+            id: crate::common::stable_media_uuid(
+                &db::MediaKind::Album,
+                &deezer_album.to_string(),
+            ),
+            title: track
+                .parent
+                .as_ref()
+                .map(|p| {
+                    p.title
+                        .clone()
+                })
+                .or_else(|| {
+                    track
+                        .external_ids
+                        .album_title
+                        .clone()
+                })
+                .unwrap_or_default(),
+            kind: db::MediaKind::Album,
+            grandparent_id: Some(artist_id),
+            external_ids: db::ExternalIds {
+                deezer_album: Some(deezer_album),
+                deezer_artist: track
+                    .external_ids
+                    .deezer_artist,
+                artist_name: track
+                    .external_ids
+                    .artist_name
+                    .clone(),
+                album_title: track
+                    .external_ids
+                    .album_title
+                    .clone(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        album.grandparent = Some(db::Media::stub(
+            artist_id,
+            track
+                .artist_name()
+                .map(str::to_string)
+                .unwrap_or_default(),
+        ));
+        Some(album)
+    }
+
+    async fn save_alias(ctx: &AppContext, from: Uuid, to: Uuid) {
+        if from != to {
+            ctx.store
+                .save(
+                    from.to_string(),
+                    to,
+                    std::time::Duration::from_secs(7 * 24 * 3600),
+                );
+        }
     }
 
     /// For each candidate ID: if not in DB, acquire its persist lock and persist if still missing;
@@ -789,7 +1246,18 @@ impl MediaResolveService {
                 return Ok(Some(media));
             }
         }
-        Self::persist_from_store(id, ctx).await
+        // Boxed: `persist_from_store` is a large, rarely-taken chain (addon
+        // fetch, metadata merge, child sync) only reached for a not-yet-
+        // persisted item (e.g. a search result). Every fast-path return
+        // above skips it, but an unboxed call still bakes its locals into
+        // this function's state machine — and `resolve_item` is itself
+        // called from deep within the playback request handler, not a
+        // near-root background task, so the extra size was enough to
+        // overflow the stack specifically for search-result playback.
+        // Boxing moves that whole subtree onto the heap, same fix pattern
+        // as `drop_empty_group_containers` for the `get_by_filter_inner`
+        // overflow.
+        Box::pin(Self::persist_from_store(id, ctx)).await
     }
 
     /// Resolves a batch of possibly-transient UUIDs to their stable persisted IDs.
@@ -1207,46 +1675,117 @@ mod tests {
         .1
     }
 
-    /// A series tmdb could re-key is one `save` refuses outright, which is why
-    /// the completion path needs no re-key guard of its own.
     #[tokio::test]
-    async fn a_series_tmdb_could_re_key_cannot_be_stored_at_all() {
-        let (_s, guard) =
-            crate::integration_test::new_test_server_with_config(crate::Config {
-                database_url: Some("sqlite::memory:".into()),
-                torrent_http_port: None,
-                disable_dht: true,
+    async fn tvdb_series_keeps_stored_identity_when_tmdb_is_added() {
+        let tmdb = httpmock::MockServer::start();
+        tmdb.mock(|when, then| {
+            when.path("/find/7770002");
+            then.status(200)
+                .json_body(serde_json::json!({
+                    "tv_results": [{ "id": 7778, "name": "Show" }],
+                    "movie_results": []
+                }));
+        });
+        let guard = ctx_with_tmdb(&tmdb).await;
+        let ctx = &guard.0;
+        let mut media = series(
+            ctx,
+            db::ExternalIds {
+                tvdb: Some(7770002),
                 ..Default::default()
-            })
+            },
+        )
+        .await;
+        let original_id = media.id;
+        let client = MediaResolveService::tmdb(ctx)
             .await
             .unwrap();
-        let ids = db::ExternalIds {
-            tvdb: Some(7770002),
-            kitsu: Some(7770012),
-            ..Default::default()
-        };
-        let mut media = db::Media {
-            id: Uuid::from(&db::MediaIdRaw {
-                kind: db::MediaKind::Series,
-                external_ids: ids.clone(),
-                season: None,
-                episode: None,
-            }),
-            title: "Show".into(),
-            kind: db::MediaKind::Series,
-            external_ids: ids,
-            ..Default::default()
-        };
+        assert!(
+            MediaResolveService::fill_series_tmdb(&mut media, ctx, &client)
+                .await
+                .unwrap()
+        );
+        assert_eq!(media.id, original_id);
+        let stored = db::Media::get_by_id(&ctx.db, &original_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored
+                .external_ids
+                .tmdb,
+            Some(7778)
+        );
+        assert_eq!(
+            stored
+                .external_ids
+                .tvdb,
+            Some(7770002)
+        );
+        assert_eq!(
+            db::Media::find_existing_id_by_ext(&ctx.db, &media).await,
+            Some(original_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_tmdb_search_result_without_imdb_mapping() {
+        let tmdb = httpmock::MockServer::start();
+        let lookup = tmdb.mock(|when, then| {
+            when.path("/tv/446001");
+            then.status(200).json_body(serde_json::json!({
+                "id": 446001, "name": "No IMDb mapping", "external_ids": {"imdb_id": null}
+            }));
+        });
+        let guard = ctx_with_tmdb(&tmdb).await;
+        let ctx = &guard.0;
+        let id =
+            crate::common::stable_media_uuid(&db::MediaKind::Series, "tmdb:446001");
+        ctx.store
+            .save(
+                id.to_string(),
+                db::Media {
+                    id,
+                    title: "No IMDb mapping".into(),
+                    kind: db::MediaKind::Series,
+                    external_ids: db::ExternalIds {
+                        tmdb: Some(446001),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                std::time::Duration::from_secs(60),
+            );
+        let media = MediaResolveService::resolve_item(id, ctx)
+            .await
+            .unwrap()
+            .expect("TMDB-only series must persist");
+        assert_eq!(media.id, id);
+        assert_eq!(
+            media
+                .external_ids
+                .tmdb,
+            Some(446001)
+        );
         assert!(
             media
-                .save(
-                    &guard
-                        .0
-                        .db
-                )
-                .await
-                .is_err()
+                .external_ids
+                .imdb
+                .is_none()
         );
+        assert!(
+            db::Media::get_by_id(&ctx.db, &id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            MediaResolveService::resolve_item(id, ctx)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(lookup.hits() >= 1);
     }
 
     /// One provider needs only the episode's own ids, another the show's tmdb
@@ -1461,6 +2000,7 @@ mod tests {
         assert!(!find_matched_nothing(&sdks::tmdb::FindByIdResponse {
             movie_results: vec![sdks::tmdb::Movie::default()],
             tv_results: vec![],
+            ..Default::default()
         }));
     }
 
@@ -1642,7 +2182,7 @@ mod tests {
                 kind: db::MediaKind::Episode,
                 parent_id: Some(season.id),
                 grandparent_id: Some(series.id),
-                grandparent: Some(Box::new(db::Media {
+                grandparent: Some(std::sync::Arc::new(db::Media {
                     kind: db::MediaKind::Series,
                     external_ids: db::ExternalIds {
                         tmdb: Some(4242),
@@ -1672,7 +2212,7 @@ mod tests {
             let episode = db::Media {
                 kind: db::MediaKind::Episode,
                 grandparent_id: Some(season.id),
-                grandparent: Some(Box::new(db::Media {
+                grandparent: Some(std::sync::Arc::new(db::Media {
                     kind: db::MediaKind::Season,
                     external_ids: db::ExternalIds {
                         tmdb: Some(4242),
@@ -1827,6 +2367,366 @@ mod tests {
                 .map(|s| s.as_str()),
             Some("tt1890725"),
             "Blood-C tvdbid-249864"
+        );
+    }
+
+    fn stable_id(kind: &db::MediaKind, id: &str) -> Uuid {
+        crate::common::stable_media_uuid(kind, id)
+    }
+
+    /// Search-result shape from `track_to_result`: stable Track UUID with
+    /// parent album / grandparent artist links, not yet persisted.
+    fn search_track(
+        deezer_track: i64,
+        deezer_album: i64,
+        deezer_artist: i64,
+    ) -> db::Media {
+        let track_id = stable_id(&db::MediaKind::Track, &deezer_track.to_string());
+        let album_id = stable_id(&db::MediaKind::Album, &deezer_album.to_string());
+        let artist_id = stable_id(&db::MediaKind::Artist, &deezer_artist.to_string());
+        let mut media = db::Media {
+            id: track_id,
+            title: "What's Up Danger".to_string(),
+            kind: db::MediaKind::Track,
+            parent_id: Some(album_id),
+            grandparent_id: Some(artist_id),
+            external_ids: db::ExternalIds {
+                deezer_track: Some(deezer_track),
+                deezer_album: Some(deezer_album),
+                deezer_artist: Some(deezer_artist),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        media.parent = Some(db::Media::stub(
+            album_id,
+            "Spider-Man: Into the Spider-Verse",
+        ));
+        media.grandparent = Some(db::Media::stub(artist_id, "Blackway"));
+        media
+    }
+
+    #[test]
+    fn album_root_for_track_builds_stable_album_stub() {
+        let artist_id = stable_id(&db::MediaKind::Artist, "7741572");
+        let media = search_track(602456542, 81457652, 7741572);
+        let album = MediaResolveService::album_root_for_track(&media, artist_id)
+            .expect("album root built for track with deezer_album");
+        assert_eq!(album.id, stable_id(&db::MediaKind::Album, "81457652"));
+        assert_eq!(album.kind, db::MediaKind::Album);
+        assert_eq!(album.grandparent_id, Some(artist_id));
+        assert_eq!(
+            album
+                .external_ids
+                .deezer_album,
+            Some(81457652)
+        );
+        assert_eq!(
+            album
+                .external_ids
+                .deezer_artist,
+            Some(7741572)
+        );
+        assert_eq!(album.title, "Spider-Man: Into the Spider-Verse");
+    }
+
+    #[test]
+    fn album_root_for_track_falls_back_to_album_title_ext_id() {
+        let artist_id = stable_id(&db::MediaKind::Artist, "7741572");
+        let mut media = search_track(10, 100, 7741572);
+        media.parent = None;
+        media
+            .external_ids
+            .album_title = Some("Album A".to_string());
+        let album =
+            MediaResolveService::album_root_for_track(&media, artist_id).unwrap();
+        assert_eq!(album.title, "Album A");
+    }
+
+    #[test]
+    fn album_root_for_track_requires_deezer_album() {
+        let artist_id = stable_id(&db::MediaKind::Artist, "7741572");
+        let mut media = search_track(10, 100, 7741572);
+        media
+            .external_ids
+            .deezer_album = None;
+        assert!(MediaResolveService::album_root_for_track(&media, artist_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn track_click_resolves_to_track_not_artist() {
+        let (_server, guard) = crate::integration_test::new_test_server()
+            .await
+            .unwrap();
+        let ctx = &guard.0;
+
+        // VA-soundtrack track: absent from the artist's own discography.
+        let media = search_track(602456542, 81457652, 7741572);
+        let track_id = media.id;
+        let album_id = stable_id(&db::MediaKind::Album, "81457652");
+        let artist_id = stable_id(&db::MediaKind::Artist, "7741572");
+        ctx.store
+            .save(
+                track_id.to_string(),
+                media,
+                std::time::Duration::from_secs(60),
+            );
+
+        let resolved = MediaResolveService::resolve_item(track_id, ctx)
+            .await
+            .unwrap()
+            .expect("clicked track resolves");
+        assert_eq!(resolved.id, track_id);
+        assert_eq!(resolved.kind, db::MediaKind::Track);
+
+        // Artist and album rows exist so navigation works.
+        assert!(
+            db::Media::get_by_id(&ctx.db, &artist_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            db::Media::get_by_id(&ctx.db, &album_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // Retry stays on the track (DB fast path, no artist alias).
+        let again = MediaResolveService::resolve_item(track_id, ctx)
+            .await
+            .unwrap()
+            .expect("track resolves on retry");
+        assert_eq!(again.id, track_id);
+        assert_eq!(again.kind, db::MediaKind::Track);
+    }
+
+    #[tokio::test]
+    async fn track_click_with_synced_artist_still_resolves_to_track() {
+        let (_server, guard) = crate::integration_test::new_test_server()
+            .await
+            .unwrap();
+        let ctx = &guard.0;
+
+        // Artist already in the DB, but this track was never persisted.
+        let artist_id = stable_id(&db::MediaKind::Artist, "7741572");
+        let artist = db::Media {
+            id: artist_id,
+            title: "Blackway".to_string(),
+            kind: db::MediaKind::Artist,
+            external_ids: db::ExternalIds {
+                deezer_artist: Some(7741572),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        db::Media::upsert(&ctx.db, &[artist])
+            .await
+            .unwrap();
+
+        let media = search_track(623716672, 85606892, 7741572);
+        let track_id = media.id;
+        ctx.store
+            .save(
+                track_id.to_string(),
+                media,
+                std::time::Duration::from_secs(60),
+            );
+
+        let resolved = MediaResolveService::resolve_item(track_id, ctx)
+            .await
+            .unwrap()
+            .expect("clicked track resolves");
+        assert_eq!(resolved.id, track_id);
+        assert_eq!(resolved.kind, db::MediaKind::Track);
+    }
+
+    #[tokio::test]
+    async fn album_click_resolves_to_album_not_artist() {
+        let (_server, guard) = crate::integration_test::new_test_server()
+            .await
+            .unwrap();
+        let ctx = &guard.0;
+
+        let artist_id = stable_id(&db::MediaKind::Artist, "7741572");
+        let album_id = stable_id(&db::MediaKind::Album, "81457652");
+        let mut album = db::Media {
+            id: album_id,
+            title: "Spider-Man: Into the Spider-Verse".to_string(),
+            kind: db::MediaKind::Album,
+            grandparent_id: Some(artist_id),
+            external_ids: db::ExternalIds {
+                deezer_album: Some(81457652),
+                deezer_artist: Some(7741572),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        album.grandparent = Some(db::Media::stub(artist_id, "Blackway"));
+        ctx.store
+            .save(
+                album_id.to_string(),
+                album,
+                std::time::Duration::from_secs(60),
+            );
+
+        let resolved = MediaResolveService::resolve_item(album_id, ctx)
+            .await
+            .unwrap()
+            .expect("clicked album resolves");
+        assert_eq!(resolved.id, album_id);
+        assert_eq!(resolved.kind, db::MediaKind::Album);
+        // The artist row exists so the album has a browsable parent.
+        assert!(
+            db::Media::get_by_id(&ctx.db, &artist_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_external_ids_fills_tmdb_and_tvdb_from_imdb_alone() {
+        let tmdb = httpmock::MockServer::start();
+        tmdb.mock(|when, then| {
+            when.path("/find/tt0306414")
+                .query_param("external_source", "imdb_id");
+            then.status(200)
+                .json_body(serde_json::json!({
+                    "tv_results": [{ "id": 1438, "name": "The Wire" }],
+                    "movie_results": []
+                }));
+        });
+        tmdb.mock(|when, then| {
+            when.path("/tv/1438");
+            then.status(200)
+                .json_body(serde_json::json!({
+                    "id": 1438,
+                    "name": "The Wire",
+                    "external_ids": { "imdb_id": "tt0306414", "tvdb_id": 79126 }
+                }));
+        });
+        let guard = ctx_with_tmdb(&tmdb).await;
+        let ctx = &guard.0;
+        let mut media = series(
+            ctx,
+            db::ExternalIds {
+                imdb: db::NonEmptyString::try_new("tt0306414").ok(),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        MediaResolveService::resolve_external_ids(&mut media, ctx, false).await;
+
+        assert_eq!(
+            media
+                .external_ids
+                .tmdb,
+            Some(1438)
+        );
+        assert_eq!(
+            media
+                .external_ids
+                .tvdb,
+            Some(79126)
+        );
+        assert_eq!(
+            media
+                .external_ids
+                .imdb
+                .map(|s| s.to_string()),
+            Some("tt0306414".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_external_ids_is_a_noop_when_nothing_is_missing() {
+        // No mocks registered at all — any request would fail the test by
+        // connection refused, proving no network call is made when every id
+        // this kind cares about is already present.
+        let tmdb = httpmock::MockServer::start();
+        let guard = ctx_with_tmdb(&tmdb).await;
+        let ctx = &guard.0;
+        let mut media = series(
+            ctx,
+            db::ExternalIds {
+                imdb: db::NonEmptyString::try_new("tt0306414").ok(),
+                tmdb: Some(1438),
+                tvdb: Some(79126),
+                kitsu: Some(1),
+                ..Default::default()
+            },
+        )
+        .await;
+        let before = media
+            .external_ids
+            .clone();
+
+        MediaResolveService::resolve_external_ids(&mut media, ctx, false).await;
+
+        assert_eq!(media.external_ids, before);
+    }
+
+    #[tokio::test]
+    async fn resolve_external_ids_fills_missing_episode_ids() {
+        let tmdb = httpmock::MockServer::start();
+        let request = tmdb.mock(|when, then| {
+            when.path("/tv/1438/season/1/episode/1");
+            then.status(200)
+                .json_body(serde_json::json!({
+                    "id": 972467,
+                    "name": "The Target",
+                    "episode_number": 1,
+                    "season_number": 1,
+                    "external_ids": {
+                        "imdb_id": "tt0749419",
+                        "tvdb_id": 303821,
+                    },
+                }));
+        });
+        let guard = ctx_with_tmdb(&tmdb).await;
+        let ctx = &guard.0;
+        let mut episode = db::Media {
+            title: "The Target".into(),
+            kind: db::MediaKind::Episode,
+            parent_idx: Some(1),
+            idx: Some(1),
+            grandparent: Some(std::sync::Arc::new(db::Media {
+                title: "The Wire".into(),
+                kind: db::MediaKind::Series,
+                external_ids: db::ExternalIds {
+                    tmdb: Some(1438),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+
+        MediaResolveService::resolve_external_ids(&mut episode, ctx, false).await;
+
+        assert_eq!(request.hits(), 1);
+        assert_eq!(
+            episode
+                .external_ids
+                .tmdb,
+            Some(972467)
+        );
+        assert_eq!(
+            episode
+                .external_ids
+                .imdb
+                .as_deref()
+                .map(String::as_str),
+            Some("tt0749419")
+        );
+        assert_eq!(
+            episode
+                .external_ids
+                .tvdb,
+            Some(303821)
         );
     }
 }

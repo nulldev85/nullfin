@@ -2,7 +2,7 @@ use anyhow::Result;
 use chrono::NaiveDateTime;
 use futures::stream::StreamExt;
 use std::collections::{HashMap, HashSet};
-use tracing::{debug, error, info, warn};
+use tracing::{Instrument, debug, debug_span, error, info, warn};
 use uuid::Uuid;
 
 use super::ProgressReporter;
@@ -11,6 +11,15 @@ use crate::{AppContext, addons::ResolvedCatalog, db};
 /// Consume `stream`, fetching metadata + full tree for new items and upserting everything.
 ///
 /// Returns a map of `kind -> count` for top-level items imported.
+///
+/// Timing: this span plus its `stream_pull`/`id_resolve`/`write_relations`
+/// child spans below (and `process_meta_batch`'s own span, for whatever
+/// portion of this catalog's items are new) cover the whole pipeline from
+/// pulling items out of the addon's stream to the final DB writes — enable
+/// `RUST_LOG=remux_server::metadata_refresh=debug` (span-close events log
+/// automatically for this target, see `setup_logging`) to see per-catalog
+/// timing broken down by phase.
+#[tracing::instrument(level = "debug", target = "remux_server::metadata_refresh", skip_all, fields(catalog = media_id))]
 pub async fn import_catalog_items<S>(
     ctx: &AppContext,
     _catalog: &ResolvedCatalog,
@@ -24,6 +33,14 @@ where
 {
     // Stop pulling from the underlying paginated stream once we have enough items.
     // Without this, the stream fetches ALL pages until empty even when max=50.
+    //
+    // Chunk size is also the unit for `process_meta_batch` and the WAL
+    // checkpoint below — shrinking it to improve progress-reporting
+    // granularity was tried and reverted: it made large catalogs run ~10x as
+    // many metadata-batch/checkpoint cycles for a purely cosmetic benefit.
+    // Progress granularity within a single catalog is a lesser problem than
+    // that overhead; `RefreshLibraryTask::run`'s item-weighted total is what
+    // actually fixed the visible "stuck at 0%" issue this was chasing.
     let mut chunks = stream
         .take(max)
         .chunks(250);
@@ -41,10 +58,17 @@ where
         None => Uuid::nil(),
     };
 
-    while let Some(items) = chunks
-        .next()
-        .await
-    {
+    loop {
+        let next = chunks
+            .next()
+            .instrument(
+                debug_span!(target: "remux_server::metadata_refresh", "stream_pull"),
+            )
+            .await;
+        let Some(items) = next else {
+            break;
+        };
+
         progress.report(total, max.max(1));
 
         let remaining = max.saturating_sub(total);
@@ -89,28 +113,73 @@ where
             }
         }
 
-        // Partition: only new items need meta-batch processing.
-        let existing_ids: HashSet<Uuid> = if items.is_empty() {
-            HashSet::new()
-        } else {
-            let mut qb = sqlx::QueryBuilder::new("SELECT id FROM media WHERE id IN (");
-            let mut sep = qb.separated(", ");
-            for m in &items {
-                sep.push_bind(m.id);
+        // Adopt stored identities before recording positions or partitioning.
+        // A provider's stub UUID can differ from a row discovered through another
+        // provider, even though their external IDs identify the same content.
+        //
+        // Fast path first: a single batched id lookup covers the common case
+        // (re-scanning the same addon's own catalog, where ids already match
+        // exactly) without a query per item. Only items whose own id isn't
+        // already a row fall through to the slower per-item external-ID
+        // match — that's the only path that can find a row saved under a
+        // different provider's id for the same content.
+        let existing_ids: HashSet<Uuid> = async {
+            let candidate_ids: Vec<Uuid> = items
+                .iter()
+                .map(|i| i.id)
+                .collect();
+            let existing_by_id: HashMap<Uuid, String> = if candidate_ids.is_empty() {
+                HashMap::new()
+            } else {
+                let mut qb = sqlx::QueryBuilder::new(
+                    "SELECT id, CAST(kind AS TEXT) FROM media WHERE id IN (",
+                );
+                let mut sep = qb.separated(", ");
+                for id in &candidate_ids {
+                    sep.push_bind(id);
+                }
+                qb.push(")");
+                qb.build_query_as::<(Uuid, String)>()
+                    .fetch_all(&ctx.db)
+                    .await?
+                    .into_iter()
+                    .collect()
+            };
+
+            let mut existing_ids = HashSet::new();
+            for item in &mut items {
+                let existing_id = match item.kind {
+                    // Channels and playlists have provider-defined UUID identities;
+                    // the external-ID resolver does not support these kinds, so
+                    // only an exact (id, kind) match — never an external-ID
+                    // match — counts as "already exists" for them.
+                    db::MediaKind::TvChannel | db::MediaKind::Playlist => {
+                        existing_by_id
+                            .get(&item.id)
+                            .filter(|k| {
+                                **k == item
+                                    .kind
+                                    .to_string()
+                            })
+                            .map(|_| item.id)
+                    }
+                    _ if existing_by_id.contains_key(&item.id) => Some(item.id),
+                    _ => db::Media::find_existing_id_by_ext(&ctx.db, item).await,
+                };
+                if let Some(existing_id) = existing_id {
+                    item.id = existing_id;
+                    existing_ids.insert(existing_id);
+                }
             }
-            qb.push(")");
-            qb.build_query_scalar()
-                .fetch_all(&ctx.db)
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .collect()
-        };
+            Ok::<_, anyhow::Error>(existing_ids)
+        }
+        .instrument(debug_span!(target: "remux_server::metadata_refresh", "id_resolve"))
+        .await?;
         // Snapshot stream-order weights before partitioning — partition() does not
         // preserve the original order across the two vecs, so new items would
         // otherwise always get the lowest weights within a chunk regardless of where
         // they actually appeared in the catalog.
-        let item_weights: Vec<(Uuid, i64)> = items
+        let mut item_weights: Vec<(Uuid, i64)> = items
             .iter()
             .map(|item| {
                 let w = catalog_position;
@@ -137,17 +206,40 @@ where
             .map(|m| m.id)
             .collect();
 
-        if let Err(e) = ctx
+        // process_meta_batch can adopt an existing row's UUID for any of these
+        // items (dedup by external ID) instead of writing under the id we
+        // computed above — the row lands in `media` under the *adopted* id.
+        // `item_weights`/`imported_ids` were snapshotted from the pre-call id,
+        // so anything keyed on them (catalog membership rows below, the
+        // stale-member diff, series reconciliation) must be remapped through
+        // this or it silently targets a row that was never written.
+        let id_remap = match ctx
             .addons
             .process_meta_batch(new_items.clone(), ctx, true, None)
             .await
         {
-            error!(catalog = media_id, error = %e, "failed to process new items chunk");
-            continue;
+            Ok(map) => map,
+            Err(e) => {
+                error!(catalog = media_id, error = %e, "failed to process new items chunk");
+                continue;
+            }
+        };
+        let remap = |id: Uuid| {
+            id_remap
+                .get(&id)
+                .copied()
+                .unwrap_or(id)
+        };
+        for (item_id, _) in item_weights.iter_mut() {
+            *item_id = remap(*item_id);
         }
+        imported_ids = imported_ids
+            .into_iter()
+            .map(remap)
+            .collect();
 
         for id in new_series_ids {
-            db::reconcile_series_played_state(&ctx.db, id).await;
+            db::reconcile_series_played_state(&ctx.db, remap(id)).await;
         }
 
         // Re-upsert already-known TV channels too (skipping the metadata-fetch step
@@ -204,6 +296,7 @@ where
         // lock after releasing it tends to keep winning the race over a connection
         // that just started waiting, so unrelated writes (e.g. login) can time out
         // even though no single statement holds the lock for long.
+        async {
         if collection_id != Uuid::nil() {
             let catalog_tags: Vec<String> =
                 if let Some((addon_uuid, local_cat_id)) = membership {
@@ -286,6 +379,9 @@ where
                 }
             }
         }
+        }
+        .instrument(debug_span!(target: "remux_server::metadata_refresh", "write_relations"))
+        .await;
 
         for item in new_items.iter() {
             *new_counts
@@ -500,4 +596,149 @@ pub async fn prune_stale_iptv_channels(db: &sqlx::SqlitePool, cutoff: NaiveDateT
 pub fn catalog_membership(media_id: &str) -> Option<(&str, &str)> {
     let rest = media_id.strip_prefix("addon:")?;
     rest.split_once(':')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn catalog_matches_external_ids_before_partitioning_and_membership() {
+        let (_server, guard) = crate::integration_test::new_test_server()
+            .await
+            .unwrap();
+        let ctx = &guard.0;
+        let addon_id = Uuid::new_v4();
+        let collection_id = Uuid::new_v5(&addon_id, b"test");
+        let catalog = ResolvedCatalog {
+            provider_catalog_id: "test".into(),
+            catalog_id: format!("addon:{addon_id}:test"),
+            collection_id,
+            name: "Test".into(),
+            media_kind: Some(db::MediaKind::Series),
+            collection_media_kind: None,
+            enabled: true,
+            max_items: None,
+            tags: vec![],
+        };
+        let mut collection = db::Media {
+            id: collection_id,
+            kind: db::MediaKind::Collection,
+            title: "Test".into(),
+            ..Default::default()
+        };
+        collection
+            .save(&ctx.db)
+            .await
+            .unwrap();
+        let imdb = db::NonEmptyString::try_new("tt446201".to_string()).unwrap();
+        let stored_id =
+            crate::common::stable_media_uuid(&db::MediaKind::Series, imdb.as_str());
+        let mut stored = db::Media {
+            id: stored_id,
+            kind: db::MediaKind::Series,
+            title: "Stored metadata".into(),
+            external_ids: db::ExternalIds {
+                imdb: Some(imdb.clone()),
+                tmdb: Some(446201),
+                tvdb: Some(446202),
+                kitsu: Some(446203),
+                custom_stremio_id: Some("custom:446201".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        stored
+            .save(&ctx.db)
+            .await
+            .unwrap();
+        let progress = ProgressReporter::new(Default::default());
+        for external_ids in [
+            db::ExternalIds {
+                imdb: Some(imdb),
+                ..Default::default()
+            },
+            db::ExternalIds {
+                tmdb: Some(446201),
+                ..Default::default()
+            },
+            db::ExternalIds {
+                tvdb: Some(446202),
+                ..Default::default()
+            },
+            db::ExternalIds {
+                kitsu: Some(446203),
+                ..Default::default()
+            },
+            db::ExternalIds {
+                custom_stremio_id: Some("custom:446201".into()),
+                ..Default::default()
+            },
+        ] {
+            let stub_id = Uuid::new_v4();
+            let stub = db::Media {
+                id: stub_id,
+                kind: db::MediaKind::Series,
+                title: "Catalog stub".into(),
+                external_ids,
+                ..Default::default()
+            };
+            let (counts, new_counts) = import_catalog_items(
+                ctx,
+                &catalog,
+                &catalog.catalog_id,
+                10,
+                futures::stream::iter([stub]),
+                &progress,
+            )
+            .await
+            .unwrap();
+            assert_eq!(counts.get(&db::MediaKind::Series.to_string()), Some(&1));
+            assert!(
+                new_counts.is_empty(),
+                "existing content must skip metadata processing"
+            );
+            let members: Vec<(Uuid, i64)> = sqlx::query_as("SELECT right_media_id, weight FROM media_relations WHERE left_media_id = ? AND role = 'catalog'")
+                .bind(collection_id).fetch_all(&ctx.db).await.unwrap();
+            assert_eq!(members, vec![(stored_id, 0)]);
+            assert!(
+                db::Media::get_by_id(&ctx.db, &stub_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                db::Media::get_by_id(&ctx.db, &stored_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .title,
+                "Stored metadata"
+            );
+        }
+        let fresh_id = Uuid::new_v4();
+        let fresh = db::Media {
+            id: fresh_id,
+            kind: db::MediaKind::Series,
+            title: "New series".into(),
+            external_ids: db::ExternalIds {
+                tmdb: Some(446204),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (_, new_counts) = import_catalog_items(
+            ctx,
+            &catalog,
+            &catalog.catalog_id,
+            10,
+            futures::stream::iter([fresh]),
+            &progress,
+        )
+        .await
+        .unwrap();
+        assert_eq!(new_counts.get(&db::MediaKind::Series.to_string()), Some(&1));
+        let members: Vec<Uuid> = sqlx::query_scalar("SELECT right_media_id FROM media_relations WHERE left_media_id = ? AND role = 'catalog'").bind(collection_id).fetch_all(&ctx.db).await.unwrap();
+        assert_eq!(members, vec![fresh_id]);
+    }
 }

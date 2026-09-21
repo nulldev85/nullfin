@@ -21,6 +21,10 @@ harness = false
 name = "items"
 harness = false
 
+[[bench]]
+name = "userviews"
+harness = false
+
 [dependencies]
 # 12 needed for milldeware compatibility
 reqwest = { version = "0.13", default-features = false, features = [
@@ -29,7 +33,7 @@ reqwest = { version = "0.13", default-features = false, features = [
     "stream",
     "rustls",
 ] }
-serde = "1.0"
+serde = { version = "1.0", features = ["rc"] }
 serde_json = "^1.0"
 tokio = { version = "^1.0", features = ["full", "io-util", "time"] }
 axum = { version = "^0.8", features = ["ws"] }
@@ -57,7 +61,7 @@ uuid = { version = "1.8", features = ["v4", "v5", "serde"] }
 http = "1.4.0"
 http-body = "1.0"
 http-body-util = "0.1"
-tokio-util = { version = "0.7", features = ["compat", "io", "io-util"] }
+tokio-util = { version = "0.7", features = ["compat", "io", "io-util", "time"] }
 futures-util = "0.3.31"
 axum-extra = { version = "0.12.5", features = [
     "file-stream",
@@ -124,6 +128,7 @@ opendal = { version = "0.52", features = ["services-webdav", "services-fs"] }
 
 librqbit = { version = "8", default-features = false, features = ["rust-tls", "http-api", "tracing-subscriber-utils"] }
 regex = "1"
+handlebars = "6"
 hunch = "2"
 log = "0.4"
 env_logger = "0.11"
@@ -132,6 +137,12 @@ tikv-jemallocator = { version = "0.7", optional = true }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 imageproc = { version = "0.26", default-features = false, features = ["text"] }
 ab_glyph = "0.2"
+opentelemetry = "0.32.0"
+opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio"] }
+# grpc-tonic (async, non-blocking) rather than the default reqwest-blocking-client —
+# span export must not block a tokio worker thread.
+opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["grpc-tonic", "trace"] }
+tracing-opentelemetry = "0.33.0"
 [features]
 default = ["jemalloc"]
 jemalloc = ["tikv-jemallocator"]
@@ -139,6 +150,6 @@ desktop = ["include_dir"]
 
 [dev-dependencies]
 axum-test = "18.7.0"
-codspeed-divan-compat = "4"
+criterion = { version = "0.5", features = ["html_reports"] }
 chrono = { version = "0.4", features = ["serde"] }
 httpmock = "0.7"

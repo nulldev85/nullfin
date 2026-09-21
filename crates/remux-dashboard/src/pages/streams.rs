@@ -1,16 +1,19 @@
 use crate::{
-    components::{EmptyState, FormGroup, LoadingText},
+    components::{
+        DragAndDropList, EmptyState, FormGroup, LoadingText, Switch, ToggleRow,
+    },
     state::AppState,
 };
 use dioxus::prelude::*;
 use remux_sdks::remux::{
-    common_audio_languages, format_size_rule, language_label, CreateStreamGroup,
-    CreateStreamGroupRequest, DeleteStreamGroup, FilterMatchMode,
-    GetStreamGroupPreview, GetSystemConfiguration, ListStreamGroups, NumericOp,
-    ServerConfiguration, SetOp, StreamCodec, StreamFilter, StreamGroupDto,
+    common_audio_languages, format_size_rule, language_label, AddonDto,
+    CreateStreamGroup, CreateStreamGroupRequest, DeleteStreamGroup, FilterMatchMode,
+    GetStreamGroupPreview, GetSystemConfiguration, ListAddons, ListStreamGroups,
+    NumericOp, ServerConfiguration, SetOp, StreamCodec, StreamFilter, StreamGroupDto,
     StreamGroupPreviewDto, StreamQuality, StreamResolution, StreamRule,
     UpdateStreamGroup, UpdateStreamGroupRequest, UpdateSystemConfiguration,
 };
+use std::collections::HashMap;
 use uuid::Uuid;
 
 #[component]
@@ -18,6 +21,7 @@ pub(crate) fn StreamRuleRow(
     idx: usize,
     rule: StreamRule,
     rules: Signal<Vec<StreamRule>>,
+    addons: Signal<Vec<AddonDto>>,
 ) -> Element {
     let field_val = match &rule {
         StreamRule::Resolution { .. } => "resolution",
@@ -25,13 +29,15 @@ pub(crate) fn StreamRuleRow(
         StreamRule::Codec { .. } => "codec",
         StreamRule::Size { .. } => "size",
         StreamRule::AudioLanguage { .. } => "audio_language",
+        StreamRule::Addon { .. } => "addon",
     };
     let is_size = field_val == "size";
     let op_not_in = match &rule {
         StreamRule::Resolution { op, .. }
         | StreamRule::Quality { op, .. }
         | StreamRule::Codec { op, .. }
-        | StreamRule::AudioLanguage { op, .. } => matches!(op, SetOp::NotIn),
+        | StreamRule::AudioLanguage { op, .. }
+        | StreamRule::Addon { op, .. } => matches!(op, SetOp::NotIn),
         StreamRule::Size { .. } => false,
     };
     let size_op = match &rule {
@@ -54,6 +60,7 @@ pub(crate) fn StreamRuleRow(
                             "audio_language" => {
                                 StreamRule::AudioLanguage { op: SetOp::In, values: vec![] }
                             }
+                            "addon" => StreamRule::Addon { op: SetOp::In, values: vec![] },
                             "size"   => StreamRule::Size { op: NumericOp::Gt, value: 0 },
                             _        => StreamRule::Resolution { op: SetOp::In, values: vec![] },
                         };
@@ -64,6 +71,7 @@ pub(crate) fn StreamRuleRow(
                 option { value: "codec",      selected: field_val == "codec",      "Codec" }
                 option { value: "size",       selected: is_size,                   "Size" }
                 option { value: "audio_language", selected: field_val == "audio_language", "Audio Language" }
+                option { value: "addon", selected: field_val == "addon", "Addon" }
             }
             // Operator selector
             select {
@@ -88,6 +96,7 @@ pub(crate) fn StreamRuleRow(
                                 StreamRule::Quality { values, .. }     => StreamRule::Quality { op: new_op, values },
                                 StreamRule::Codec { values, .. }      => StreamRule::Codec  { op: new_op, values },
                                 StreamRule::AudioLanguage { values, .. } => StreamRule::AudioLanguage { op: new_op, values },
+                                StreamRule::Addon { values, .. } => StreamRule::Addon { op: new_op, values },
                                 StreamRule::Size { .. } => unreachable!("is_size branch handles Size"),
                             };
                         }
@@ -141,20 +150,20 @@ pub(crate) fn StreamRuleRow(
                     for res in StreamResolution::all() {
                         {
                             let res = res.clone();
+                            let res_label = res.label().to_string();
                             let checked = match &rule { StreamRule::Resolution { values, .. } => values.contains(&res), _ => false };
                             rsx! {
                                 label { style: "display:flex;align-items:center;gap:3px;font-size:.82rem;cursor:pointer",
-                                    input {
-                                        r#type: "checkbox",
+                                    Switch {
                                         checked,
-                                        onchange: move |e| {
+                                        on_change: move |v| {
                                             if let Some(StreamRule::Resolution { values, .. }) = rules.write().get_mut(idx) {
-                                                if e.checked() { if !values.contains(&res) { values.push(res.clone()); } }
+                                                if v { if !values.contains(&res) { values.push(res.clone()); } }
                                                 else { values.retain(|r| r != &res); }
                                             }
                                         },
                                     }
-                                    "{res.label()}"
+                                    "{res_label}"
                                 }
                             }
                         }
@@ -163,20 +172,20 @@ pub(crate) fn StreamRuleRow(
                     for src in StreamQuality::all() {
                         {
                             let src = src.clone();
+                            let src_label = src.label().to_string();
                             let checked = match &rule { StreamRule::Quality { values, .. } => values.contains(&src), _ => false };
                             rsx! {
                                 label { style: "display:flex;align-items:center;gap:3px;font-size:.82rem;cursor:pointer",
-                                    input {
-                                        r#type: "checkbox",
+                                    Switch {
                                         checked,
-                                        onchange: move |e| {
+                                        on_change: move |v| {
                                             if let Some(StreamRule::Quality { values, .. }) = rules.write().get_mut(idx) {
-                                                if e.checked() { if !values.contains(&src) { values.push(src.clone()); } }
+                                                if v { if !values.contains(&src) { values.push(src.clone()); } }
                                                 else { values.retain(|s| s != &src); }
                                             }
                                         },
                                     }
-                                    "{src.label()}"
+                                    "{src_label}"
                                 }
                             }
                         }
@@ -192,12 +201,11 @@ pub(crate) fn StreamRuleRow(
                                 };
                                 rsx! {
                                     label { style: "display:flex;align-items:center;gap:3px;font-size:.82rem;cursor:pointer",
-                                        input {
-                                            r#type: "checkbox",
+                                        Switch {
                                             checked,
-                                            onchange: move |e| {
+                                            on_change: move |v| {
                                                 if let Some(StreamRule::AudioLanguage { values, .. }) = rules.write().get_mut(idx) {
-                                                    if e.checked() { if !values.contains(&code) { values.push(code.clone()); } }
+                                                    if v { if !values.contains(&code) { values.push(code.clone()); } }
                                                     else { values.retain(|c| c != &code); }
                                                 }
                                             },
@@ -208,24 +216,46 @@ pub(crate) fn StreamRuleRow(
                             }
                         }
                     }
+                } else if field_val == "addon" {
+                    for addon in addons.read().iter() {
+                        {
+                            let addon_id = addon.id;
+                            let addon_name = addon.name.clone();
+                            let checked = match &rule { StreamRule::Addon { values, .. } => values.contains(&addon_id), _ => false };
+                            rsx! {
+                                label { style: "display:flex;align-items:center;gap:3px;font-size:.82rem;cursor:pointer",
+                                    Switch {
+                                        checked,
+                                        on_change: move |v| {
+                                            if let Some(StreamRule::Addon { values, .. }) = rules.write().get_mut(idx) {
+                                                if v { if !values.contains(&addon_id) { values.push(addon_id); } }
+                                                else { values.retain(|a| a != &addon_id); }
+                                            }
+                                        },
+                                    }
+                                    "{addon_name}"
+                                }
+                            }
+                        }
+                    }
                 } else {
                     for codec in StreamCodec::all() {
                         {
                             let codec = codec.clone();
+                            let codec_label = codec.label().to_string();
                             let checked = match &rule { StreamRule::Codec { values, .. } => values.contains(&codec), _ => false };
                             rsx! {
                                 label { style: "display:flex;align-items:center;gap:3px;font-size:.82rem;cursor:pointer",
-                                    input {
-                                        r#type: "checkbox",
+                                    Switch {
                                         checked,
-                                        onchange: move |e| {
+                                        on_change: move |v| {
                                             if let Some(StreamRule::Codec { values, .. }) = rules.write().get_mut(idx) {
-                                                if e.checked() { if !values.contains(&codec) { values.push(codec.clone()); } }
+                                                if v { if !values.contains(&codec) { values.push(codec.clone()); } }
                                                 else { values.retain(|c| c != &codec); }
                                             }
                                         },
                                     }
-                                    "{codec.label()}"
+                                    "{codec_label}"
                                 }
                             }
                         }
@@ -251,6 +281,7 @@ pub(crate) fn StreamRuleRow(
 pub(crate) fn StreamFilterEditor(
     match_mode: Signal<FilterMatchMode>,
     rules: Signal<Vec<StreamRule>>,
+    addons: Signal<Vec<AddonDto>>,
 ) -> Element {
     let rule_count = rules
         .read()
@@ -279,7 +310,7 @@ pub(crate) fn StreamFilterEditor(
                 }
             }
             for (idx, rule) in rules.read().iter().enumerate() {
-                StreamRuleRow { key: "{idx}", idx, rule: rule.clone(), rules }
+                StreamRuleRow { key: "{idx}", idx, rule: rule.clone(), rules, addons }
             }
             button {
                 class: "btn btn-ghost",
@@ -296,18 +327,18 @@ pub(crate) fn StreamFilterEditor(
 #[component]
 pub fn StreamGroupsCard(app_state: AppState) -> Element {
     let mut groups: Signal<Vec<StreamGroupDto>> = use_signal(Vec::new);
+    let addons: Signal<Vec<AddonDto>> = use_signal(Vec::new);
     let mut show_ungrouped = use_signal(|| true);
     let mut base_cfg: Signal<Option<ServerConfiguration>> = use_signal(|| None);
     let mut loading = use_signal(|| true);
     let mut error: Signal<Option<String>> = use_signal(|| None);
-    let mut refresh = use_signal(|| 0_u32);
+    let mut page_refresh = use_signal(|| 0_u32);
 
     // Create modal state
     let mut show_create = use_signal(|| false);
     let mut create_name = use_signal(String::new);
     let mut create_match: Signal<FilterMatchMode> = use_signal(|| FilterMatchMode::All);
     let mut create_rules: Signal<Vec<StreamRule>> = use_signal(Vec::new);
-    let mut create_priority = use_signal(|| 0_i64);
     let mut creating = use_signal(|| false);
 
     // Edit modal state
@@ -331,13 +362,16 @@ pub fn StreamGroupsCard(app_state: AppState) -> Element {
     let mut preview_data: Signal<Option<StreamGroupPreviewDto>> = use_signal(|| None);
     let mut preview_loading = use_signal(|| false);
     let mut preview_error: Signal<Option<String>> = use_signal(|| None);
+    let mut preview_refresh = use_signal(|| 0_u32);
 
     let app_state_preview = app_state.clone();
     use_effect(move || {
         let imdb = preview_imdb
             .read()
             .clone();
-        let _r = *refresh.read();
+        // depend on the following two signals; will re-trigger effect
+        let _page_refresh = *page_refresh.read();
+        let _preview_refresh = *preview_refresh.read();
         if imdb.is_empty() {
             return;
         }
@@ -362,8 +396,9 @@ pub fn StreamGroupsCard(app_state: AppState) -> Element {
     });
 
     let app_state_effect = app_state.clone();
+    let mut addons_effect = addons;
     use_effect(move || {
-        let _r = *refresh.read();
+        let _r = *page_refresh.read();
         loading.set(true);
         let client = app_state_effect.clone();
         spawn(async move {
@@ -373,6 +408,12 @@ pub fn StreamGroupsCard(app_state: AppState) -> Element {
             let cfg_res = client
                 .execute(GetSystemConfiguration)
                 .await;
+            if let Ok(a) = client
+                .execute(ListAddons)
+                .await
+            {
+                addons_effect.set(a);
+            }
             match (groups_res, cfg_res) {
                 (Ok(g), Ok(cfg)) => {
                     show_ungrouped.set(
@@ -398,41 +439,26 @@ pub fn StreamGroupsCard(app_state: AppState) -> Element {
                 span { class: "card-title", "Settings" }
             }
             div { class: "card-body",
-                div {
-                    class: "flex items-center justify-between",
-                    style: "padding:8px 0",
-                    div {
-                        div { style: "font-size:.85rem;font-weight:500", "Show ungrouped streams" }
-                        div { style: "font-size:.75rem;color:var(--text-muted)",
-                            "Show streams that don't match any group as individual entries."
-                        }
-                    }
-                    div { class: "flex items-center gap-2",
-                        if *saving_setting.read() {
-                            span { style: "font-size:.72rem;color:var(--text-muted)", "Saving…" }
-                        }
-                        input {
-                            r#type: "checkbox",
-                            checked: *show_ungrouped.read(),
-                            disabled: *saving_setting.read(),
-                            onchange: {
-                                let client = app_state.clone();
-                                move |e: Event<FormData>| {
-                                    let checked = e.checked();
-                                    show_ungrouped.set(checked);
-                                    let Some(cfg) = base_cfg.peek().clone() else { return };
-                                    let updated = ServerConfiguration {
-                                        stream_groups_show_ungrouped: Some(checked),
-                                        ..cfg
-                                    };
-                                    saving_setting.set(true);
-                                    let c = client.clone();
-                                    spawn(async move {
-                                        let _ = c.execute(UpdateSystemConfiguration { config: updated }).await;
-                                        saving_setting.set(false);
-                                    });
-                                }
-                            }
+                ToggleRow {
+                    label: "Show ungrouped streams",
+                    description: "Show streams that don't match any group as individual entries.",
+                    checked: *show_ungrouped.read(),
+                    disabled: *saving_setting.read(),
+                    on_change: {
+                        let client = app_state.clone();
+                        move |v| {
+                            show_ungrouped.set(v);
+                            let Some(cfg) = base_cfg.peek().clone() else { return };
+                            let updated = ServerConfiguration {
+                                stream_groups_show_ungrouped: Some(v),
+                                ..cfg
+                            };
+                            saving_setting.set(true);
+                            let c = client.clone();
+                            spawn(async move {
+                                let _ = c.execute(UpdateSystemConfiguration { config: updated }).await;
+                                saving_setting.set(false);
+                            });
                         }
                     }
                 }
@@ -450,7 +476,6 @@ pub fn StreamGroupsCard(app_state: AppState) -> Element {
                         create_name.set(String::new());
                         create_match.set(FilterMatchMode::All);
                         create_rules.set(vec![]);
-                        create_priority.set(0);
                         show_create.set(true);
                     },
                     "+ New Group"
@@ -465,16 +490,28 @@ pub fn StreamGroupsCard(app_state: AppState) -> Element {
                 } else if groups.read().is_empty() {
                     EmptyState { message: "No stream groups — create one to consolidate similar streams." }
                 } else {
-                    div { class: "row-list",
-                        for group in groups.read().clone() {
-                            {
+                    {
+                        let group_items = groups.read().clone();
+                        let groups_by_id: HashMap<Uuid, StreamGroupDto> = group_items
+                            .iter()
+                            .cloned()
+                            .map(|group| (group.id, group))
+                            .collect();
+                        let list_key = group_items
+                            .iter()
+                            .map(|group| group.id.to_string())
+                            .collect::<Vec<_>>()
+                            .join(":");
+                        let items: Vec<Element> = group_items
+                            .into_iter()
+                            .map(|group| {
                                 let gid = group.id;
                                 let gid_del = group.id;
                                 rsx! {
                                     div {
-                                        class: "flex items-center border-b border-[var(--border)] hover:bg-[rgba(0,0,0,0.03)]",
+                                        class: "flex min-h-20 items-center",
                                         key: "{group.id}",
-                                        div { class: "flex-1 min-w-0 px-3 py-[10px]",
+                                        div { class: "h-full flex-1 min-w-0 px-3 py-[10px]",
                                             div { style: "font-weight:500;font-size:.85rem", "{group.name}" }
                                             div { style: "font-size:.72rem;color:var(--text-muted);margin-top:3px;display:flex;flex-wrap:wrap;gap:4px",
                                                 for rule in group.filter.rules.iter() {
@@ -499,6 +536,15 @@ pub fn StreamGroupsCard(app_state: AppState) -> Element {
                                                             StreamRule::Size { op, value } => {
                                                                 (format_size_rule(*op, *value), false, "background:rgba(245,158,11,.12);color:rgb(217,119,6);padding:1px 6px;border-radius:4px")
                                                             }
+                                                            StreamRule::Addon { op, values } => {
+                                                                let known = addons.read();
+                                                                let lbl = values
+                                                                    .iter()
+                                                                    .map(|id| known.iter().find(|a| a.id == *id).map(|a| a.name.clone()).unwrap_or_else(|| "Unknown".to_string()))
+                                                                    .collect::<Vec<_>>()
+                                                                    .join("/");
+                                                                (lbl, matches!(op, SetOp::NotIn), "background:rgba(59,130,246,.12);color:rgb(37,99,235);padding:1px 6px;border-radius:4px")
+                                                            }
                                                         };
                                                         let prefix = if is_excl { "NOT " } else { "" };
                                                         rsx! { span { style: "{color_style}", "{prefix}{label}" } }
@@ -509,7 +555,6 @@ pub fn StreamGroupsCard(app_state: AppState) -> Element {
                                                         {if group.filter.match_mode == FilterMatchMode::All { "AND" } else { "OR" }}
                                                     }
                                                 }
-                                                span { style: "color:var(--text-muted)", "priority {group.priority}" }
                                                 if !group.enabled {
                                                     span { style: "color:var(--error)", "disabled" }
                                                 }
@@ -517,9 +562,19 @@ pub fn StreamGroupsCard(app_state: AppState) -> Element {
                                         }
                                         div { class: "shrink-0 px-3 py-[10px] flex items-center gap-2",
                                             button {
+                                                r#type: "button",
+                                                draggable: "false",
                                                 class: "btn btn-ghost",
                                                 style: "height:30px;font-size:.68rem;padding:0 10px",
-                                                onclick: move |_| {
+                                                onpointerdown: move |e| e.stop_propagation(),
+                                                onmousedown: move |e| e.stop_propagation(),
+                                                onmouseup: move |e| e.stop_propagation(),
+                                                ondragstart: move |e| {
+                                                    e.prevent_default();
+                                                    e.stop_propagation();
+                                                },
+                                                onclick: move |e| {
+                                                    e.stop_propagation();
                                                     edit_name.set(group.name.clone());
                                                     edit_match.set(group.filter.match_mode.clone());
                                                     edit_rules.set(group.filter.rules.clone());
@@ -531,14 +586,83 @@ pub fn StreamGroupsCard(app_state: AppState) -> Element {
                                                 "Edit"
                                             }
                                             button {
+                                                r#type: "button",
+                                                draggable: "false",
                                                 class: "btn btn-ghost",
                                                 style: "height:30px;font-size:.68rem;padding:0 10px;color:var(--error);border-color:var(--error)",
-                                                onclick: move |_| id_to_delete.set(Some(gid_del)),
+                                                onpointerdown: move |e| e.stop_propagation(),
+                                                onmousedown: move |e| e.stop_propagation(),
+                                                onmouseup: move |e| e.stop_propagation(),
+                                                ondragstart: move |e| {
+                                                    e.prevent_default();
+                                                    e.stop_propagation();
+                                                },
+                                                onclick: move |e| {
+                                                    e.stop_propagation();
+                                                    id_to_delete.set(Some(gid_del));
+                                                },
                                                 "Delete"
                                             }
                                         }
                                     }
                                 }
+                            })
+                            .collect();
+                        let client = app_state.clone();
+
+                        rsx! {
+                            DragAndDropList {
+                                key: "{list_key}",
+                                items,
+                                aria_label: "Stream groups",
+                                on_reorder: move |new_order: Vec<String>| {
+                                    let reordered_groups: Vec<StreamGroupDto> = new_order
+                                        .iter()
+                                        .enumerate()
+                                        .filter_map(|(index, id)| {
+                                            let id = id.parse::<Uuid>().ok()?;
+                                            let mut group = groups_by_id.get(&id)?.clone();
+                                            group.priority = index as i64 * 10;
+                                            Some(group)
+                                        })
+                                        .collect();
+                                    let updates: Vec<(Uuid, UpdateStreamGroupRequest)> =
+                                        reordered_groups
+                                            .iter()
+                                            .map(|group| {
+                                                (
+                                                    group.id,
+                                                    UpdateStreamGroupRequest {
+                                                        name: group.name.clone(),
+                                                        filter: group.filter.clone(),
+                                                        priority: group.priority,
+                                                        enabled: group.enabled,
+                                                        hidden: group.hidden,
+                                                    },
+                                                )
+                                            })
+                                            .collect();
+
+                                    groups.set(reordered_groups);
+                                    let client = client.clone();
+                                    spawn(async move {
+                                        for (id, payload) in updates {
+                                            if let Err(e) = client
+                                                .execute(UpdateStreamGroup { id, payload })
+                                                .await
+                                            {
+                                                error.set(Some(format!(
+                                                    "Failed to update stream group order: {e}"
+                                                )));
+                                                let value = *page_refresh.peek() + 1;
+                                                page_refresh.set(value);
+                                                return;
+                                            }
+                                        }
+                                        let value = *preview_refresh.peek() + 1;
+                                        preview_refresh.set(value);
+                                    });
+                                },
                             }
                         }
                     }
@@ -626,19 +750,7 @@ pub fn StreamGroupsCard(app_state: AppState) -> Element {
                             }
                         }
                         FormGroup { label: "Filter rules",
-                            StreamFilterEditor { match_mode: create_match, rules: create_rules }
-                        }
-                        FormGroup { label: "Priority (lower = shown first)",
-                            input {
-                                class: "form-input",
-                                r#type: "number",
-                                value: "{create_priority}",
-                                oninput: move |e| {
-                                    if let Ok(n) = e.value().parse::<i64>() {
-                                        create_priority.set(n);
-                                    }
-                                },
-                            }
+                            StreamFilterEditor { match_mode: create_match, rules: create_rules, addons }
                         }
                     }
                     div { class: "modal-footer",
@@ -660,19 +772,24 @@ pub fn StreamGroupsCard(app_state: AppState) -> Element {
                                         match_mode: create_match.peek().clone(),
                                         rules: create_rules.peek().clone(),
                                     };
-                                    let prio = *create_priority.peek();
+                                    let priority = groups
+                                        .peek()
+                                        .iter()
+                                        .map(|group| group.priority)
+                                        .max()
+                                        .map_or(0, |priority| priority.saturating_add(10));
                                     spawn(async move {
                                         match c.execute(CreateStreamGroup {
                                             payload: CreateStreamGroupRequest {
                                                 name,
                                                 filter,
-                                                priority: prio,
+                                                priority,
                                             },
                                         }).await {
                                             Ok(_) => {
                                                 show_create.set(false);
-                                                let v = *refresh.peek() + 1;
-                                                refresh.set(v);
+                                                let v = *page_refresh.peek() + 1;
+                                                page_refresh.set(v);
                                             }
                                             Err(e) => {
                                                 error.set(Some(format!("Failed to create: {e}")));
@@ -707,38 +824,20 @@ pub fn StreamGroupsCard(app_state: AppState) -> Element {
                             }
                         }
                         FormGroup { label: "Filter rules",
-                            StreamFilterEditor { match_mode: edit_match, rules: edit_rules }
+                            StreamFilterEditor { match_mode: edit_match, rules: edit_rules, addons }
                         }
-                        FormGroup { label: "Priority (lower = shown first)",
-                            input {
-                                class: "form-input",
-                                r#type: "number",
-                                value: "{edit_priority}",
-                                oninput: move |e| {
-                                    if let Ok(n) = e.value().parse::<i64>() {
-                                        edit_priority.set(n);
-                                    }
-                                },
+                        div { class: "form-group",
+                            ToggleRow {
+                                label: "Enabled",
+                                checked: *edit_enabled.read(),
+                                on_change: move |v| edit_enabled.set(v),
                             }
                         }
                         div { class: "form-group",
-                            label { class: "form-label", style: "display:flex;align-items:center;gap:8px",
-                                input {
-                                    r#type: "checkbox",
-                                    checked: *edit_enabled.read(),
-                                    onchange: move |e| edit_enabled.set(e.checked()),
-                                }
-                                "Enabled"
-                            }
-                        }
-                        div { class: "form-group",
-                            label { class: "form-label", style: "display:flex;align-items:center;gap:8px",
-                                input {
-                                    r#type: "checkbox",
-                                    checked: *edit_hidden.read(),
-                                    onchange: move |e| edit_hidden.set(e.checked()),
-                                }
-                                "Hide group"
+                            ToggleRow {
+                                label: "Hide group",
+                                checked: *edit_hidden.read(),
+                                on_change: move |v| edit_hidden.set(v),
                             }
                         }
                     }
@@ -778,8 +877,8 @@ pub fn StreamGroupsCard(app_state: AppState) -> Element {
                                         }).await {
                                             Ok(_) => {
                                                 id_to_edit.set(None);
-                                                let v = *refresh.peek() + 1;
-                                                refresh.set(v);
+                                                let v = *page_refresh.peek() + 1;
+                                                page_refresh.set(v);
                                             }
                                             Err(e) => {
                                                 error.set(Some(format!("Failed to update: {e}")));
@@ -830,8 +929,8 @@ pub fn StreamGroupsCard(app_state: AppState) -> Element {
                                         match c.execute(DeleteStreamGroup { id }).await {
                                             Ok(_) => {
                                                 id_to_delete.set(None);
-                                                let v = *refresh.peek() + 1;
-                                                refresh.set(v);
+                                                let v = *page_refresh.peek() + 1;
+                                                page_refresh.set(v);
                                             }
                                             Err(e) => {
                                                 error.set(Some(format!("Failed to delete: {e}")));

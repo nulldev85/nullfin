@@ -49,14 +49,14 @@ jobs:
         uses: actions/cache@v4
         with:
           path: jellyfin-web/
-          key: jellyfin-web-v10.11.9
+          key: jellyfin-web-v10.11.11
 
       - name: Checkout jellyfin-web
         if: steps.cache.outputs.cache-hit != 'true'
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
         with:
           repository: jellyfin/jellyfin-web
-          ref: v10.11.9
+          ref: v10.11.11
 
       - name: Setup Node
         if: steps.cache.outputs.cache-hit != 'true'
@@ -93,7 +93,7 @@ jobs:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: "sccache"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref }}
 
@@ -103,7 +103,7 @@ jobs:
           targets: wasm32-unknown-unknown
 
       - name: Set up sccache
-        uses: mozilla-actions/sccache-action@v0.0.11
+        uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
@@ -120,8 +120,6 @@ jobs:
           cargo set-version "${{ inputs.cargo_version }}"
 
       - name: Install dioxus-cli
-        # Match the dashboard's Dioxus libraries and keep the CLI's published
-        # lockfile so transitive CSS parser versions cannot drift in CI.
         run: cargo binstall dioxus-cli@0.7.9 --no-confirm --force --locked
 
       - name: Build dashboard
@@ -135,7 +133,42 @@ jobs:
           path: target/dx/remux-dashboard/release/web/public/
           retention-days: 2
 
+  server-targets:
+    # Computes build-server's matrix so the macOS legs can be left out of the
+    # list entirely for docker-only builds (desktop: false) — a job-level
+    # `if:` can't reference `matrix.*` (only github/inputs/needs/vars are
+    # available there), so excluding a leg has to happen in the matrix data
+    # itself, not via a condition on the job.
+    name: Compute server build matrix
+    runs-on: ubuntu-latest
+    outputs:
+      include: ${{ steps.set.outputs.include }}
+    steps:
+      - name: Set matrix
+        id: set
+        run: |
+          if [ "${{ inputs.desktop }}" = "true" ]; then
+            include='[
+              {"runner":"ubuntu-latest","target":"x86_64-unknown-linux-gnu","arch":"amd64","os_name":"linux"},
+              {"runner":"ubuntu-24.04-arm","target":"aarch64-unknown-linux-gnu","arch":"arm64","os_name":"linux"},
+              {"runner":"macos-latest","target":"x86_64-apple-darwin","arch":"amd64","os_name":"macos"},
+              {"runner":"macos-latest","target":"aarch64-apple-darwin","arch":"arm64","os_name":"macos"}
+            ]'
+          else
+            include='[
+              {"runner":"ubuntu-latest","target":"x86_64-unknown-linux-gnu","arch":"amd64","os_name":"linux"},
+              {"runner":"ubuntu-24.04-arm","target":"aarch64-unknown-linux-gnu","arch":"arm64","os_name":"linux"}
+            ]'
+          fi
+          echo "include=$(echo "$include" | jq -c .)" >> "$GITHUB_OUTPUT"
+
   build-server:
+    # macOS legs produce the standalone server binaries release.yml/nightly.yml
+    # attach to a release — build-docker only ever pulls server-linux-*, and
+    # build-desktop bundles remux-desktop directly rather than downloading
+    # these artifacts. Excluded from the matrix entirely for docker-only
+    # builds (desktop: false) by server-targets above.
+    needs: server-targets
     name: Build server (${{ matrix.os_name }}-${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
     env:
@@ -144,23 +177,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - runner: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            arch: amd64
-            os_name: linux
-          - runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            arch: arm64
-            os_name: linux
-          - runner: macos-latest
-            target: x86_64-apple-darwin
-            arch: amd64
-            os_name: macos
-          - runner: macos-latest
-            target: aarch64-apple-darwin
-            arch: arm64
-            os_name: macos
+        include: ${{ fromJSON(needs.server-targets.outputs.include) }}
     steps:
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
@@ -172,7 +189,7 @@ jobs:
         if: runner.os == 'macOS'
         run: echo "PKG_CONFIG_PATH=$(brew --prefix openssl@3)/lib/pkgconfig" >> $GITHUB_ENV
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref }}
 
@@ -182,7 +199,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Set up sccache
-        uses: mozilla-actions/sccache-action@v0.0.11
+        uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
@@ -232,7 +249,7 @@ jobs:
             target: x86_64-pc-windows-msvc
             artifact: remux-desktop-windows-x86_64
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref }}
 
@@ -259,7 +276,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Set up sccache
-        uses: mozilla-actions/sccache-action@v0.0.11
+        uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Install cargo-binstall
         uses: cargo-bins/cargo-binstall@main
@@ -271,7 +288,7 @@ jobs:
           cargo set-version "${{ inputs.cargo_version }}"
 
       - name: Install cargo-bundle
-        run: cargo binstall cargo-bundle --no-confirm --force
+        run: cargo binstall cargo-bundle --no-confirm --force --locked
 
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'
@@ -438,7 +455,7 @@ jobs:
           platform=${{ matrix.platform }}
           echo "PLATFORM_PAIR=${platform//\//-}" >> $GITHUB_ENV
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref }}
 

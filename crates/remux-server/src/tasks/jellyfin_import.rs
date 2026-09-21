@@ -152,33 +152,38 @@ impl Task for JellyfinImportTask {
                 i + 1,
                 local_users.len()
             );
-            let (played, resumable, favorited) = tokio::join!(
-                client.execute(GetJellyfinUserItems {
-                    user_id: jf_id.to_string(),
-                    filter: "IsPlayed"
-                }),
-                client.execute(GetJellyfinUserItems {
-                    user_id: jf_id.to_string(),
-                    filter: "IsResumable"
-                }),
-                client.execute(GetJellyfinUserItems {
-                    user_id: jf_id.to_string(),
-                    filter: "IsFavorite"
-                }),
-            );
             let mut seen = std::collections::HashSet::new();
-            let items: Vec<_> = played?
-                .items
-                .into_iter()
-                .chain(resumable?.items)
-                .chain(favorited?.items)
-                .filter(|it| {
-                    seen.insert(
-                        it.id
-                            .clone(),
-                    )
-                })
-                .collect();
+            let mut items: Vec<JellyfinItem> = Vec::new();
+            for filter in &["IsPlayed", "IsResumable", "IsFavorite"] {
+                const PAGE: i32 = 100;
+                let mut start = 0i32;
+                loop {
+                    let page = client
+                        .execute(GetJellyfinUserItems {
+                            user_id: jf_id.to_string(),
+                            filter,
+                            start_index: start,
+                            limit: PAGE,
+                        })
+                        .await?;
+                    let fetched = page
+                        .items
+                        .len() as i32;
+                    let total = page.total_record_count;
+                    for it in page.items {
+                        if seen.insert(
+                            it.id
+                                .clone(),
+                        ) {
+                            items.push(it);
+                        }
+                    }
+                    start += fetched;
+                    if (start as i64) >= total || fetched < PAGE {
+                        break;
+                    }
+                }
+            }
             debug!("got {} items for '{username}'", items.len());
 
             for item in &items {
@@ -456,37 +461,61 @@ impl Task for JellyfinImportTask {
                     Some("Episode") => db::MediaKind::Episode,
                     _ => db::MediaKind::Movie,
                 };
-                // For Season/Episode: check if we resolved a series IMDB (used for has_ids).
-                // ProviderIds["Imdb"] is NOT used — it can be the episode's own IMDB.
-                let series_imdb_resolved =
-                    matches!(kind, db::MediaKind::Season | db::MediaKind::Episode)
-                        && (item
-                            .series_provider_ids
-                            .as_ref()
-                            .and_then(|p| p.get("Imdb"))
-                            .is_some()
-                            || item
-                                .series_id
-                                .as_deref()
-                                .and_then(|sid| series_imdb_map.get(sid))
-                                .is_some());
+                let is_season_or_episode =
+                    matches!(kind, db::MediaKind::Season | db::MediaKind::Episode);
 
+                // The series' own ids, used (below) as the Season/Episode identity —
+                // ProviderIds on the *item* is NOT used for that: on an episode it can
+                // be the episode's own IMDB, a different identity than the series.
+                let series_provider_ids = item
+                    .series_provider_ids
+                    .as_ref();
+                let series_imdb = series_provider_ids
+                    .and_then(|p| p.get("Imdb"))
+                    .map(String::as_str)
+                    .or_else(|| {
+                        item.series_id
+                            .as_deref()
+                            .and_then(|sid| series_imdb_map.get(sid))
+                            .map(String::as_str)
+                    });
+                let series_tmdb = series_provider_ids
+                    .and_then(|p| p.get("Tmdb"))
+                    .and_then(|v| {
+                        v.parse::<i64>()
+                            .ok()
+                    });
+                let series_tvdb = series_provider_ids
+                    .and_then(|p| p.get("Tvdb"))
+                    .and_then(|v| {
+                        v.parse::<i64>()
+                            .ok()
+                    });
+
+                // For Season/Episode this must be the *series'* external ids, not the
+                // item's own — mirrors `Media::identity_raw`'s ancestor substitution,
+                // so this row's `media_raw` (below) actually matches the real row's
+                // once the series is imported, instead of comparing unrelated ids.
                 let raw = db::MediaIdRaw {
                     kind: kind.clone(),
-                    external_ids: db::ExternalIds {
-                        imdb: matches!(
-                            kind,
-                            db::MediaKind::Movie | db::MediaKind::Series
-                        )
-                        .then(|| {
-                            imdb.and_then(|s| {
+                    external_ids: if is_season_or_episode {
+                        db::ExternalIds {
+                            imdb: series_imdb.and_then(|s| {
                                 db::NonEmptyString::try_new(s.to_string()).ok()
-                            })
-                        })
-                        .flatten(),
-                        tmdb,
-                        tvdb,
-                        ..Default::default()
+                            }),
+                            tmdb: series_tmdb,
+                            tvdb: series_tvdb,
+                            ..Default::default()
+                        }
+                    } else {
+                        db::ExternalIds {
+                            imdb: imdb.and_then(|s| {
+                                db::NonEmptyString::try_new(s.to_string()).ok()
+                            }),
+                            tmdb,
+                            tvdb,
+                            ..Default::default()
+                        }
                     },
                     season: item.parent_index_number,
                     episode: item.index_number,
@@ -496,7 +525,6 @@ impl Task for JellyfinImportTask {
                     .external_ids
                     .imdb
                     .is_some()
-                    || series_imdb_resolved
                     || raw
                         .external_ids
                         .tmdb
@@ -521,20 +549,109 @@ impl Task for JellyfinImportTask {
                 }
 
                 // Use the local DB UUID when the item is already imported; otherwise
-                // derive the stable UUID from external IDs so get_or_new can find the
-                // state row via ext_id_uuid_candidates when the item is imported later.
-                let media_uuid = resolve_from_index(&index, imdb, tmdb, tvdb)
-                    .unwrap_or_else(|| uuid::Uuid::from(&raw));
+                // derive a best-effort UUID from external IDs as a key for this state
+                // row. `media_raw` (set below) is the real reattachment key — once the
+                // item is actually imported, `UserMediaState::get_or_new` finds this
+                // row by identity regardless of what media_id it's sitting under here.
+                //
+                // For episodes/seasons: ID-based lookup rarely matches (Remux stores
+                // stremio/tmdb, Jellyfin stores imdb/tvdb). Fall back to positional
+                // lookup via (grandparent_series_uuid, season, episode).
+                let media_uuid = if let Some(uuid) =
+                    resolve_from_index(&index, imdb, tmdb, tvdb)
+                {
+                    uuid
+                } else if is_season_or_episode {
+                    let positional = if let Some(series_uuid) = resolve_from_index(
+                        &index,
+                        series_imdb,
+                        series_tmdb,
+                        series_tvdb,
+                    ) {
+                        match kind {
+                            db::MediaKind::Episode => {
+                                if let (Some(season_num), Some(ep_num)) =
+                                    (item.parent_index_number, item.index_number)
+                                {
+                                    sqlx::query_scalar(
+                                        "SELECT id FROM media WHERE kind = 'episode' \
+                                         AND grandparent_id = ? AND parent_idx = ? AND idx = ? LIMIT 1",
+                                    )
+                                    .bind(series_uuid)
+                                    .bind(season_num as i64)
+                                    .bind(ep_num as i64)
+                                    .fetch_optional(&ctx.db)
+                                    .await
+                                    .ok()
+                                    .flatten()
+                                } else {
+                                    None
+                                }
+                            }
+                            db::MediaKind::Season => {
+                                if let Some(season_num) = item.index_number {
+                                    sqlx::query_scalar(
+                                        "SELECT id FROM media WHERE kind = 'season' \
+                                         AND parent_id = ? AND idx = ? LIMIT 1",
+                                    )
+                                    .bind(series_uuid)
+                                    .bind(season_num as i64)
+                                    .fetch_optional(&ctx.db)
+                                    .await
+                                    .ok()
+                                    .flatten()
+                                } else {
+                                    None
+                                }
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    positional.unwrap_or_else(|| {
+                        // Derive a per-item stable UUID from series identity + position
+                        // so unresolved episodes/seasons don't all collapse to one row.
+                        let series_key = series_imdb
+                            .map(|s| s.to_string())
+                            .or_else(|| series_tmdb.map(|id| format!("tmdb:{id}")))
+                            .or_else(|| series_tvdb.map(|id| format!("tvdb:{id}")))
+                            .unwrap_or_default();
+                        let canonical = match kind {
+                            db::MediaKind::Episode => format!(
+                                "{}:{}:{}",
+                                series_key,
+                                item.parent_index_number
+                                    .unwrap_or(0),
+                                item.index_number
+                                    .unwrap_or(0)
+                            ),
+                            // Jellyfin seasons use index_number for the season number
+                            db::MediaKind::Season => format!(
+                                "{}:{}",
+                                series_key,
+                                item.index_number
+                                    .unwrap_or(0)
+                            ),
+                            _ => series_key,
+                        };
+                        crate::common::stable_media_uuid(&kind, &canonical)
+                    })
+                } else {
+                    uuid::Uuid::from(&raw)
+                };
 
+                let played_at = ud
+                    .last_played_date
+                    .map(|dt| dt.naive_utc());
+                let last_played_at = played_at;
                 let state = db::UserMediaState {
                     user_id: local_user.id,
                     media_id: media_uuid,
-                    media_raw: serde_json::to_string(&raw).ok(),
+                    media_raw: raw.identity_key(),
                     favorite,
                     play_count,
-                    played_at: ud
-                        .last_played_date
-                        .map(|dt| dt.naive_utc()),
+                    played_at,
                     playback_position: position / 10_000_000,
                     ..Default::default()
                 };
@@ -574,7 +691,7 @@ impl Task for JellyfinImportTask {
                 .bind(state.play_count)
                 .bind(state.played_at)
                 .bind(state.playback_position)
-                .bind(state.played_at)
+                .bind(last_played_at)
                 .execute(&ctx.db)
                 .await?;
                 states_imported += 1;

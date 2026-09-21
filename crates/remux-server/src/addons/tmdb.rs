@@ -8,8 +8,8 @@ use uuid::Uuid;
 
 use super::{
     AddonCapabilities, AddonKind, AddonMetadata, AddonPreset, AddonPresetRegistration,
-    CatalogAddon, CatalogInfo, MediaKind, MetaAddon, MetricSnapshot, MetricValue,
-    MetricsAddon, MetricsCtx, ResourceType, SearchAddon, TreeAddon,
+    CatalogAddon, CatalogInfo, MediaKind, MetaAddon, ResourceType, SearchAddon,
+    TreeAddon,
 };
 use crate::{
     AppContext, api, common, db, sdks,
@@ -37,7 +37,6 @@ impl AddonPreset for TmdbPreset {
                 AddonMetadata::simple_resource(ResourceType::Meta),
                 AddonMetadata::simple_resource(ResourceType::Search),
                 AddonMetadata::simple_resource(ResourceType::Catalog),
-                AddonMetadata::simple_resource(ResourceType::Metrics),
             ],
             supported_types: vec![
                 MediaKind::Movie,
@@ -45,7 +44,7 @@ impl AddonPreset for TmdbPreset {
                 MediaKind::Episode,
                 MediaKind::Person,
             ],
-            supported_resources_user: vec![ResourceType::Search, ResourceType::Metrics],
+            supported_resources_user: vec![ResourceType::Search],
             supported_types_user: vec![
                 MediaKind::Movie,
                 MediaKind::Series,
@@ -62,16 +61,13 @@ impl AddonPreset for TmdbPreset {
         _cfg: &serde_json::Value,
         _config: &crate::Config,
     ) -> Result<AddonCapabilities> {
-        let addon = Arc::new(TmdbAddon {
-            popularity_max: Mutex::new(None),
-        });
+        let addon = Arc::new(TmdbAddon);
         Ok(AddonCapabilities {
             kind: Some(addon.clone()),
             meta: Some(addon.clone()),
             search: Some(addon.clone()),
             tree: Some(addon.clone()),
             catalog: Some(addon.clone()),
-            metrics: Some(addon),
             ..Default::default()
         })
     }
@@ -81,58 +77,7 @@ inventory::submit! {
     AddonPresetRegistration(|| Box::new(TmdbPreset))
 }
 
-pub struct TmdbAddon {
-    // (fetched_at, movie_max, tv_max) — refreshed every hour from discover page 1
-    popularity_max: Mutex<Option<(chrono::DateTime<chrono::Utc>, f64, f64)>>,
-}
-
-impl TmdbAddon {
-    async fn popularity_max(&self, api_key: &str, base_url: &str) -> (f64, f64) {
-        let now = chrono::Utc::now();
-        let mut cache = self
-            .popularity_max
-            .lock()
-            .await;
-        if cache
-            .as_ref()
-            .map_or(true, |(t, _, _)| (now - *t).num_minutes() >= 60)
-        {
-            let Ok(client) = tmdb_client(api_key, base_url) else {
-                return (1_000.0, 1_000.0);
-            };
-            let q = sdks::tmdb::DiscoverQuery {
-                sort_by: Some("popularity.desc".into()),
-                page: Some(1),
-                ..Default::default()
-            };
-            let movie_max = client
-                .execute(sdks::tmdb::DiscoverMovieEndpoint { query: q.clone() })
-                .await
-                .ok()
-                .and_then(|r| {
-                    r.results
-                        .into_iter()
-                        .next()
-                })
-                .and_then(|m| m.popularity)
-                .unwrap_or(1_000.0);
-            let tv_max = client
-                .execute(sdks::tmdb::DiscoverTvEndpoint { query: q })
-                .await
-                .ok()
-                .and_then(|r| {
-                    r.results
-                        .into_iter()
-                        .next()
-                })
-                .and_then(|s| s.popularity)
-                .unwrap_or(1_000.0);
-            *cache = Some((now, movie_max, tv_max));
-        }
-        let (_, movie_max, tv_max) = cache.unwrap();
-        (movie_max, tv_max)
-    }
-}
+pub struct TmdbAddon;
 
 fn tmdb_image(path: Option<&str>, kind: db::ImageKind) -> Option<String> {
     let size = match kind {
@@ -176,12 +121,19 @@ impl MetaAddon for TmdbAddon {
         }
     }
 
+    async fn rate_limit_cooldown(&self) -> Duration {
+        common::tmdb_rate_limit()
+            .remaining_cooldown()
+            .await
+    }
+
     async fn images_fetch(
         &self,
         media: &db::Media,
         ctx: &AppContext,
+        options: super::ImageFetchOptions,
     ) -> Result<Vec<crate::api::RemoteImageInfo>> {
-        tmdb_remote_images(ctx, media).await
+        tmdb_remote_images(ctx, media, options).await
     }
 }
 
@@ -300,135 +252,47 @@ impl CatalogAddon for TmdbAddon {
         )?;
 
         let stream: Pin<Box<dyn Stream<Item = db::Media> + Send>> = match local_id {
-            "popular_movies" => Box::pin(with_imdb_resolved(
-                discover_movie_stream(
-                    client.clone(),
-                    sdks::tmdb::DiscoverQuery {
-                        sort_by: Some("popularity.desc".into()),
-                        ..Default::default()
-                    },
-                ),
+            "popular_movies" => Box::pin(discover_movie_stream(
                 client,
-                false,
+                sdks::tmdb::DiscoverQuery {
+                    sort_by: Some("popularity.desc".into()),
+                    ..Default::default()
+                },
             )),
-            "popular_tv" => Box::pin(with_imdb_resolved(
-                discover_tv_stream(
-                    client.clone(),
-                    sdks::tmdb::DiscoverQuery {
-                        sort_by: Some("popularity.desc".into()),
-                        ..Default::default()
-                    },
-                ),
+            "popular_tv" => Box::pin(discover_tv_stream(
                 client,
-                true,
+                sdks::tmdb::DiscoverQuery {
+                    sort_by: Some("popularity.desc".into()),
+                    ..Default::default()
+                },
             )),
-            "top_rated_movies" => Box::pin(with_imdb_resolved(
-                discover_movie_stream(
-                    client.clone(),
-                    sdks::tmdb::DiscoverQuery {
-                        sort_by: Some("vote_average.desc".into()),
-                        vote_count_gte: Some(300),
-                        ..Default::default()
-                    },
-                ),
+            "top_rated_movies" => Box::pin(discover_movie_stream(
                 client,
-                false,
+                sdks::tmdb::DiscoverQuery {
+                    sort_by: Some("vote_average.desc".into()),
+                    vote_count_gte: Some(300),
+                    ..Default::default()
+                },
             )),
-            "top_rated_tv" => Box::pin(with_imdb_resolved(
-                discover_tv_stream(
-                    client.clone(),
-                    sdks::tmdb::DiscoverQuery {
-                        sort_by: Some("vote_average.desc".into()),
-                        vote_count_gte: Some(300),
-                        ..Default::default()
-                    },
-                ),
+            "top_rated_tv" => Box::pin(discover_tv_stream(
                 client,
-                true,
+                sdks::tmdb::DiscoverQuery {
+                    sort_by: Some("vote_average.desc".into()),
+                    vote_count_gte: Some(300),
+                    ..Default::default()
+                },
             )),
-            "trending_movies_week" => Box::pin(with_imdb_resolved(
-                trending_movie_stream(client.clone(), sdks::tmdb::TrendingWindow::Week),
+            "trending_movies_week" => Box::pin(trending_movie_stream(
                 client,
-                false,
+                sdks::tmdb::TrendingWindow::Week,
             )),
-            "trending_tv_week" => Box::pin(with_imdb_resolved(
-                trending_tv_stream(client.clone(), sdks::tmdb::TrendingWindow::Week),
-                client,
-                true,
-            )),
+            "trending_tv_week" => {
+                Box::pin(trending_tv_stream(client, sdks::tmdb::TrendingWindow::Week))
+            }
             _ => return Ok(None),
         };
 
         Ok(Some(stream))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// MetricsAddon
-// ---------------------------------------------------------------------------
-
-#[async_trait]
-impl MetricsAddon for TmdbAddon {
-    async fn metric(
-        &self,
-        media: &db::Media,
-        ctx: &MetricsCtx,
-    ) -> Result<Option<MetricSnapshot>> {
-        let Some(tmdb_id) = media
-            .external_ids
-            .tmdb
-        else {
-            return Ok(None);
-        };
-        let api_key = ctx
-            .settings
-            .get_tmdb_key();
-        let (movie_max, tv_max) = self
-            .popularity_max(
-                api_key,
-                &ctx.config
-                    .tmdb_base_url,
-            )
-            .await;
-        let client = tmdb_client(
-            api_key,
-            &ctx.config
-                .tmdb_base_url,
-        )?;
-        let today = chrono::Utc::now().date_naive();
-
-        let popularity: Option<(f64, f64)> = match media.kind {
-            db::MediaKind::Movie => client
-                .execute(sdks::tmdb::MovieEndpoint {
-                    id: tmdb_id,
-                    language: None,
-                    append_to_response: vec![],
-                })
-                .await
-                .ok()
-                .and_then(|m| m.popularity)
-                .map(|p| (p, movie_max)),
-            db::MediaKind::Series => client
-                .execute(sdks::tmdb::SeriesEndpoint {
-                    id: tmdb_id,
-                    language: None,
-                    append_to_response: vec![],
-                })
-                .await
-                .ok()
-                .map(|s| (s.popularity, tv_max)),
-            _ => return Ok(None),
-        };
-
-        let external_id = format!("tmdb:{}", tmdb_id);
-        Ok(popularity.map(|(p, max)| MetricSnapshot {
-            source: "tmdb".to_string(),
-            media_id: Some(media.id),
-            media_raw: Some(external_id.clone()),
-            external_id,
-            value: MetricValue::from_raw(p, max),
-            date: today,
-        }))
     }
 }
 
@@ -482,34 +346,6 @@ fn series_result_to_stub(s: sdks::tmdb::SeriesSearchResult) -> db::Media {
         media.set_image(db::ImageKind::Primary, url);
     }
     media
-}
-
-/// Wraps a catalog stub stream and resolves the IMDB ID for each item inline,
-/// recomputing the stable UUID from the IMDB ID. Items that cannot be resolved
-/// are dropped (no IMDB ID = no canonical identity).
-fn with_imdb_resolved(
-    stream: impl Stream<Item = db::Media> + Send + 'static,
-    client: sdks::RestClient<sdks::BearerAuth>,
-    is_tv: bool,
-) -> impl Stream<Item = db::Media> + Send {
-    stream
-        .map(move |mut stub| {
-            let c = client.clone();
-            async move {
-                let imdb = MediaResolveService::resolve_imdb_from_ids(
-                    &stub.external_ids,
-                    is_tv,
-                    &c,
-                )
-                .await?;
-                stub.id = common::stable_media_uuid(&stub.kind, imdb.as_str());
-                stub.external_ids
-                    .imdb = Some(imdb);
-                Some(stub)
-            }
-        })
-        .buffer_unordered(10)
-        .filter_map(futures::future::ready)
 }
 
 fn discover_movie_stream(
@@ -650,6 +486,23 @@ fn trending_tv_stream(
 // TMDB SDK type → db::Media conversions
 // ---------------------------------------------------------------------------
 
+fn tmdb_external_ids(
+    tmdb_id: i64,
+    external: Option<&sdks::tmdb::ExternalIds>,
+) -> db::ExternalIds {
+    db::ExternalIds {
+        tmdb: Some(tmdb_id),
+        imdb: external
+            .and_then(|ids| {
+                ids.imdb_id
+                    .as_ref()
+            })
+            .and_then(|id| db::NonEmptyString::try_new(id.clone()).ok()),
+        tvdb: external.and_then(|ids| ids.tvdb_id),
+        ..Default::default()
+    }
+}
+
 impl From<&sdks::tmdb::Season> for db::Media {
     fn from(s: &sdks::tmdb::Season) -> Self {
         let air_date = s
@@ -657,16 +510,17 @@ impl From<&sdks::tmdb::Season> for db::Media {
             .and_then(|d| d.and_hms_opt(0, 0, 0));
         let mut media = db::Media {
             kind: db::MediaKind::Season,
-            title: format!("Season {}", s.season_number),
+            title: crate::addons::season_title(s.season_number),
             description: s
                 .overview
                 .clone()
                 .filter(|o| !o.is_empty()),
             idx: Some(s.season_number),
-            external_ids: db::ExternalIds {
-                tmdb: Some(s.id),
-                ..Default::default()
-            },
+            external_ids: tmdb_external_ids(
+                s.id,
+                s.external_ids
+                    .as_ref(),
+            ),
             released_at: air_date,
             digital_released_at: air_date,
             ..Default::default()
@@ -693,6 +547,7 @@ impl From<&sdks::tmdb::Episode> for db::Media {
                         .vote_count
                         .map(|v| v as u32),
                 }),
+            ..Default::default()
         };
         let mut media = db::Media {
             kind: db::MediaKind::Episode,
@@ -705,10 +560,11 @@ impl From<&sdks::tmdb::Episode> for db::Media {
                 .filter(|o| !o.is_empty()),
             idx: Some(ep.episode_number),
             parent_idx: Some(ep.season_number),
-            external_ids: db::ExternalIds {
-                tmdb: Some(ep.id),
-                ..Default::default()
-            },
+            external_ids: tmdb_external_ids(
+                ep.id,
+                ep.external_ids
+                    .as_ref(),
+            ),
             released_at: ep
                 .air_date
                 .and_then(|d| d.and_hms_opt(0, 0, 0)),
@@ -752,6 +608,12 @@ impl TreeAddon for TmdbAddon {
             _ => Ok(None),
         }
     }
+
+    async fn rate_limit_cooldown(&self) -> Duration {
+        common::tmdb_rate_limit()
+            .remaining_cooldown()
+            .await
+    }
 }
 
 fn tmdb_client(
@@ -762,7 +624,22 @@ fn tmdb_client(
         .with_auth(sdks::BearerAuth {
             token: api_key.to_string(),
         })
-        .with_retry(sdks::ExponentialBackoff::builder().build_with_max_retries(3)))
+        .with_retry(sdks::ExponentialBackoff::builder().build_with_max_retries(3))
+        // TMDB never sends a `Retry-After` header on 429s (they dropped
+        // fixed rate limiting in 2019), so without this every 429 falls
+        // back to the SDK's generic 60s default, which is far longer than
+        // TMDB's actual throttle window. Keep this in sync with
+        // `common::tmdb_client_from_config`'s value — both share one
+        // cooldown, and a 429 seen on either client installs its own
+        // fallback as the block duration.
+        .with_default_retry_after(std::time::Duration::from_secs(2))
+        // This is the client TmdbAddon's own meta_fetch/tree/catalog use —
+        // the highest-traffic TMDB path during a refresh. Without sharing
+        // the same cooldown as `common::tmdb_client`, a 429 seen here would
+        // never throttle calls made through that other factory, and vice
+        // versa: two independent clients, two independent (and inconsistent)
+        // views of whether TMDB is currently rate-limiting us.
+        .with_shared_rate_limit(common::tmdb_rate_limit()))
 }
 
 async fn tmdb_client_from_ctx(
@@ -1256,6 +1133,25 @@ fn watch_provider_tags(
         .collect()
 }
 
+/// Image languages to request alongside the configured metadata language so
+/// `best_logo`/`best_thumb` (which look for English-tagged title-card art)
+/// can find a match even when the server's preferred language isn't English.
+/// Without `include_image_language`, TMDB restricts `images.backdrops`/
+/// `logos` to the request's `language` plus untagged entries, so an "en"
+/// entry never comes back unless the configured language already is "en".
+fn thumb_and_logo_languages(preferred_language: Option<&str>) -> String {
+    let mut langs = vec!["en", "null"];
+    if let Some(primary) = preferred_language.and_then(|l| {
+        l.split('-')
+            .next()
+    }) && !primary.is_empty()
+        && !langs.contains(&primary)
+    {
+        langs.insert(0, primary);
+    }
+    langs.join(",")
+}
+
 async fn fetch_tmdb_meta(
     media: &db::Media,
     ctx: &AppContext,
@@ -1277,25 +1173,11 @@ async fn fetch_tmdb_meta(
 
     match media.kind {
         db::MediaKind::Movie => {
-            // Use the TMDB ID directly if known; otherwise discover it via /find.
-            let tmdb_movie_id: Option<i64> = if let Some(id) = ids.tmdb {
-                Some(id)
-            } else {
-                match MediaResolveService::tmdb_search_key(ids, None).await {
-                    Some((external_id, external_source)) => {
-                        MediaResolveService::find_tmdb_id_by(
-                            external_id,
-                            external_source,
-                            false,
-                            &client,
-                        )
-                        .await
-                        .ok()
-                        .flatten()
-                    }
-                    None => return Ok(None),
-                }
-            };
+            // `resolve_external_ids` (called at the top of
+            // `refresh_meta`, before any addon runs) already resolves a
+            // tmdb id from whatever else is known, if one is resolvable at
+            // all — nothing left to discover here.
+            let tmdb_movie_id: Option<i64> = ids.tmdb;
 
             if let Some(tmdb_id) = tmdb_movie_id {
                 let movie_details = client
@@ -1306,6 +1188,11 @@ async fn fetch_tmdb_meta(
                                 .preferred_metadata_language
                                 .clone(),
                         )
+                        .with_image_languages(thumb_and_logo_languages(
+                            config
+                                .preferred_metadata_language
+                                .as_deref(),
+                        ))
                         .with_cache(Duration::from_secs(360)),
                     )
                     .await?;
@@ -1394,6 +1281,7 @@ async fn fetch_tmdb_meta(
                                 .vote_count
                                 .map(|v| v as u32),
                         }),
+                    ..Default::default()
                 };
                 let mut patch = db::Media {
                     title: movie_details.title,
@@ -1463,37 +1351,15 @@ async fn fetch_tmdb_meta(
                     .await
                     .ok();
                 patch.tags = watch_provider_tags(providers.as_ref(), &metadata_country);
-                patch.pending_popularity = movie_details
-                    .popularity
-                    .map(|p| {
-                        (
-                            format!("tmdb:{}", tmdb_id),
-                            MetricValue::from_raw(p, 1_000.0),
-                        )
-                    });
                 return Ok(Some(patch));
             }
         }
         db::MediaKind::Series => {
-            // Use the TMDB ID directly if known; otherwise discover it via /find.
-            let tmdb_series_id: Option<i64> = if let Some(id) = ids.tmdb {
-                Some(id)
-            } else {
-                match MediaResolveService::tmdb_search_key(ids, None).await {
-                    Some((external_id, external_source)) => {
-                        MediaResolveService::find_tmdb_id_by(
-                            external_id,
-                            external_source,
-                            true,
-                            &client,
-                        )
-                        .await
-                        .ok()
-                        .flatten()
-                    }
-                    None => return Ok(None),
-                }
-            };
+            // `resolve_external_ids` (called at the top of
+            // `refresh_meta`, before any addon runs) already resolves a
+            // tmdb id from whatever else is known, if one is resolvable at
+            // all — nothing left to discover here.
+            let tmdb_series_id: Option<i64> = ids.tmdb;
 
             if let Some(tmdb_id) = tmdb_series_id {
                 let tv_details = client
@@ -1504,6 +1370,11 @@ async fn fetch_tmdb_meta(
                                 .preferred_metadata_language
                                 .clone(),
                         )
+                        .with_image_languages(thumb_and_logo_languages(
+                            config
+                                .preferred_metadata_language
+                                .as_deref(),
+                        ))
                         .with_cache(Duration::from_secs(360)),
                     )
                     .await?;
@@ -1568,6 +1439,7 @@ async fn fetch_tmdb_meta(
                             score,
                             vote_count: Some(tv_details.vote_count as u32),
                         }),
+                    ..Default::default()
                 };
                 let tmdb_status = tv_details
                     .status
@@ -1708,10 +1580,6 @@ async fn fetch_tmdb_meta(
                     .await
                     .ok();
                 patch.tags = watch_provider_tags(providers.as_ref(), &metadata_country);
-                patch.pending_popularity = Some((
-                    format!("tmdb:{}", tmdb_id),
-                    MetricValue::from_raw(tv_details.popularity, 1_000.0),
-                ));
                 return Ok(Some(patch));
             }
         }
@@ -1865,6 +1733,29 @@ async fn fetch_tmdb_season_meta(
     ) {
         patch.set_image(db::ImageKind::Primary, url);
     }
+    patch.external_ids = tmdb_external_ids(
+        season.id,
+        season
+            .external_ids
+            .as_ref(),
+    );
+    match client
+        .execute(
+            sdks::tmdb::SeasonExternalIdsEndpoint {
+                series_id: tmdb_id,
+                season_number: season_idx,
+            }
+            .with_cache(Duration::from_secs(360)),
+        )
+        .await
+    {
+        Ok(ids) => patch
+            .external_ids
+            .merge(&tmdb_external_ids(season.id, Some(&ids)), true),
+        Err(error) => {
+            warn!(%error, series_id = tmdb_id, season = season_idx, "TMDB season external IDs unavailable")
+        }
+    }
     Ok(Some(patch))
 }
 
@@ -1989,9 +1880,98 @@ async fn search_tmdb_series(
 // Remote images
 // ---------------------------------------------------------------------------
 
+fn tmdb_remote_image_languages(
+    image_type: Option<&api::ImageType>,
+    include_all_languages: bool,
+) -> Option<&'static str> {
+    (!include_all_languages && matches!(image_type, Some(api::ImageType::Backdrop)))
+        .then_some("null")
+}
+
+fn tmdb_remote_metadata_language(
+    preferred_language: Option<&str>,
+    include_all_languages: bool,
+) -> Option<String> {
+    (!include_all_languages)
+        .then(|| preferred_language.map(str::to_string))
+        .flatten()
+}
+
+fn map_remote_image(
+    type_label: &str,
+    entry: &sdks::tmdb::ImageEntry,
+) -> api::RemoteImageInfo {
+    let url = format!("https://image.tmdb.org/t/p/original{}", entry.file_path);
+    let thumb = format!("https://image.tmdb.org/t/p/w300{}", entry.file_path);
+    api::RemoteImageInfo {
+        provider_name: Some("TheMovieDb".to_string()),
+        url: Some(url),
+        thumbnail_url: Some(thumb),
+        type_: Some(type_label.to_string()),
+        width: entry.width,
+        height: entry.height,
+    }
+}
+
+fn extend_from_tmdb_images(
+    out: &mut Vec<api::RemoteImageInfo>,
+    images: &sdks::tmdb::Images,
+    language_neutral_backdrops: bool,
+) {
+    out.extend(
+        images
+            .backdrops
+            .iter()
+            .filter(|entry| {
+                !language_neutral_backdrops
+                    || entry
+                        .iso_639_1
+                        .is_none()
+            })
+            .map(|entry| map_remote_image("Backdrop", entry)),
+    );
+    out.extend(
+        images
+            .posters
+            .iter()
+            .map(|entry| map_remote_image("Primary", entry)),
+    );
+    out.extend(
+        images
+            .logos
+            .iter()
+            .map(|entry| map_remote_image("Logo", entry)),
+    );
+    out.extend(
+        images
+            .stills
+            .iter()
+            .filter(|entry| {
+                !language_neutral_backdrops
+                    || entry
+                        .iso_639_1
+                        .is_none()
+            })
+            .map(|entry| map_remote_image("Backdrop", entry)),
+    );
+    out.extend(
+        images
+            .stills
+            .iter()
+            .map(|entry| map_remote_image("Screenshot", entry)),
+    );
+    out.extend(
+        images
+            .stills
+            .iter()
+            .map(|entry| map_remote_image("Thumb", entry)),
+    );
+}
+
 async fn tmdb_remote_images(
     ctx: &AppContext,
     media: &db::Media,
+    options: super::ImageFetchOptions,
 ) -> Result<Vec<api::RemoteImageInfo>> {
     let config = crate::db::Settings::get_config(&ctx.db).await?;
     let api_key = config.get_tmdb_key();
@@ -2003,64 +1983,19 @@ async fn tmdb_remote_images(
         &ctx.config
             .tmdb_base_url,
     )?;
-
-    fn map_image(
-        type_label: &str,
-        entry: &sdks::tmdb::ImageEntry,
-    ) -> api::RemoteImageInfo {
-        let url = format!("https://image.tmdb.org/t/p/original{}", entry.file_path);
-        let thumb = format!("https://image.tmdb.org/t/p/w300{}", entry.file_path);
-        api::RemoteImageInfo {
-            provider_name: Some("TheMovieDb".to_string()),
-            url: Some(url),
-            thumbnail_url: Some(thumb),
-            type_: Some(type_label.to_string()),
-            width: entry.width,
-            height: entry.height,
-        }
-    }
-
-    fn extend_from_images(
-        out: &mut Vec<api::RemoteImageInfo>,
-        images: &sdks::tmdb::Images,
-    ) {
-        out.extend(
-            images
-                .backdrops
-                .iter()
-                .map(|e| map_image("Backdrop", e)),
-        );
-        out.extend(
-            images
-                .posters
-                .iter()
-                .map(|e| map_image("Primary", e)),
-        );
-        out.extend(
-            images
-                .logos
-                .iter()
-                .map(|e| map_image("Logo", e)),
-        );
-        out.extend(
-            images
-                .stills
-                .iter()
-                .map(|e| map_image("Backdrop", e)),
-        );
-        out.extend(
-            images
-                .stills
-                .iter()
-                .map(|e| map_image("Screenshot", e)),
-        );
-        out.extend(
-            images
-                .stills
-                .iter()
-                .map(|e| map_image("Thumb", e)),
-        );
-    }
+    let image_languages = tmdb_remote_image_languages(
+        options
+            .image_type
+            .as_ref(),
+        options.include_all_languages,
+    );
+    let language_neutral_backdrops = image_languages.is_some();
+    let preferred_language = tmdb_remote_metadata_language(
+        config
+            .preferred_metadata_language
+            .as_deref(),
+        options.include_all_languages,
+    );
 
     let mut out = Vec::new();
 
@@ -2085,19 +2020,20 @@ async fn tmdb_remote_images(
                 None
             };
             if let Some(tmdb_id) = tmdb_id {
+                let mut endpoint =
+                    sdks::tmdb::MovieEndpoint::new(tmdb_id, preferred_language.clone());
+                if let Some(languages) = image_languages {
+                    endpoint = endpoint.with_image_languages(languages);
+                }
                 let movie = client
-                    .execute(
-                        sdks::tmdb::MovieEndpoint::new(
-                            tmdb_id,
-                            config
-                                .preferred_metadata_language
-                                .clone(),
-                        )
-                        .with_cache(Duration::from_secs(360)),
-                    )
+                    .execute(endpoint.with_cache(Duration::from_secs(360)))
                     .await?;
                 if let Some(images) = &movie.images {
-                    extend_from_images(&mut out, images);
+                    extend_from_tmdb_images(
+                        &mut out,
+                        images,
+                        language_neutral_backdrops,
+                    );
                 }
                 if out
                     .iter()
@@ -2167,19 +2103,22 @@ async fn tmdb_remote_images(
                 None
             };
             if let Some(tmdb_id) = tmdb_id {
+                let mut endpoint = sdks::tmdb::SeriesEndpoint::new(
+                    tmdb_id,
+                    preferred_language.clone(),
+                );
+                if let Some(languages) = image_languages {
+                    endpoint = endpoint.with_image_languages(languages);
+                }
                 let tv = client
-                    .execute(
-                        sdks::tmdb::SeriesEndpoint::new(
-                            tmdb_id,
-                            config
-                                .preferred_metadata_language
-                                .clone(),
-                        )
-                        .with_cache(Duration::from_secs(360)),
-                    )
+                    .execute(endpoint.with_cache(Duration::from_secs(360)))
                     .await?;
                 if let Some(images) = &tv.images {
-                    extend_from_images(&mut out, images);
+                    extend_from_tmdb_images(
+                        &mut out,
+                        images,
+                        language_neutral_backdrops,
+                    );
                 }
             }
         }
@@ -2189,18 +2128,17 @@ async fn tmdb_remote_images(
             if let (Some(tmdb_id), Some(s_n), Some(e_n)) =
                 (series_tmdb_id, media.parent_idx, media.idx)
             {
+                let mut endpoint = sdks::tmdb::EpisodeEndpoint::new(
+                    tmdb_id,
+                    s_n,
+                    e_n,
+                    preferred_language,
+                );
+                if let Some(languages) = image_languages {
+                    endpoint = endpoint.with_image_languages(languages);
+                }
                 let ep = client
-                    .execute(
-                        sdks::tmdb::EpisodeEndpoint::new(
-                            tmdb_id,
-                            s_n,
-                            e_n,
-                            config
-                                .preferred_metadata_language
-                                .clone(),
-                        )
-                        .with_cache(Duration::from_secs(360)),
-                    )
+                    .execute(endpoint.with_cache(Duration::from_secs(360)))
                     .await?;
                 if let Some(images) = ep
                     .as_ref()
@@ -2209,7 +2147,11 @@ async fn tmdb_remote_images(
                             .as_ref()
                     })
                 {
-                    extend_from_images(&mut out, images);
+                    extend_from_tmdb_images(
+                        &mut out,
+                        images,
+                        language_neutral_backdrops,
+                    );
                 }
                 if out
                     .iter()
@@ -2260,4 +2202,242 @@ async fn tmdb_remote_images(
     }
 
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use remux_sdks::Endpoint;
+
+    #[test]
+    fn season_and_episode_external_ids_are_mapped() {
+        let ids = sdks::tmdb::ExternalIds {
+            imdb_id: Some("tt1234567".into()),
+            tvdb_id: Some(456),
+        };
+        let season = sdks::tmdb::Season {
+            id: 123,
+            external_ids: Some(ids.clone()),
+            ..Default::default()
+        };
+        let episode = sdks::tmdb::Episode {
+            id: 789,
+            external_ids: Some(ids),
+            ..Default::default()
+        };
+        for (patch, tmdb) in [
+            (db::Media::from(&season), 123),
+            (db::Media::from(&episode), 789),
+        ] {
+            assert_eq!(
+                patch
+                    .external_ids
+                    .tmdb,
+                Some(tmdb)
+            );
+            assert_eq!(
+                patch
+                    .external_ids
+                    .tvdb,
+                Some(456)
+            );
+            assert_eq!(
+                patch
+                    .external_ids
+                    .imdb
+                    .as_deref()
+                    .map(String::as_str),
+                Some("tt1234567")
+            );
+        }
+    }
+
+    #[test]
+    fn external_id_refresh_preserves_missing_values_and_respects_force() {
+        let existing = db::ExternalIds {
+            tmdb: Some(123),
+            tvdb: Some(456),
+            ..Default::default()
+        };
+        for force in [false, true] {
+            let mut media = db::Media {
+                external_ids: existing.clone(),
+                ..Default::default()
+            };
+            let empty = sdks::tmdb::ExternalIds {
+                imdb_id: Some(String::new()),
+                tvdb_id: None,
+            };
+            super::super::apply_meta(
+                &mut media,
+                db::Media {
+                    external_ids: tmdb_external_ids(123, Some(&empty)),
+                    ..Default::default()
+                },
+                force,
+            );
+            assert_eq!(
+                media
+                    .external_ids
+                    .tvdb,
+                Some(456)
+            );
+            assert!(
+                media
+                    .external_ids
+                    .imdb
+                    .is_none()
+            );
+            super::super::apply_meta(
+                &mut media,
+                db::Media {
+                    external_ids: tmdb_external_ids(
+                        123,
+                        Some(&sdks::tmdb::ExternalIds {
+                            imdb_id: Some("tt1234567".into()),
+                            tvdb_id: Some(999),
+                        }),
+                    ),
+                    ..Default::default()
+                },
+                force,
+            );
+            assert_eq!(
+                media
+                    .external_ids
+                    .tvdb,
+                Some(if force { 999 } else { 456 })
+            );
+            assert_eq!(
+                media
+                    .external_ids
+                    .imdb
+                    .as_deref()
+                    .map(String::as_str),
+                Some("tt1234567")
+            );
+        }
+    }
+
+    fn image_entry(path: &str, language: Option<&str>) -> sdks::tmdb::ImageEntry {
+        sdks::tmdb::ImageEntry {
+            file_path: path.to_string(),
+            iso_639_1: language.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn remote_backdrops_only_include_language_neutral_images() {
+        let images = sdks::tmdb::Images {
+            backdrops: vec![
+                image_entry("/neutral.jpg", None),
+                image_entry("/localized.jpg", Some("en")),
+            ],
+            posters: vec![
+                image_entry("/localized-poster.jpg", Some("en")),
+                image_entry("/neutral-poster.jpg", None),
+            ],
+            logos: vec![
+                image_entry("/localized-logo.svg", Some("en")),
+                image_entry("/neutral-logo.svg", None),
+            ],
+            ..Default::default()
+        };
+        let mut remote_images = Vec::new();
+
+        extend_from_tmdb_images(&mut remote_images, &images, true);
+
+        let backdrop_urls = remote_images
+            .iter()
+            .filter(|image| {
+                image
+                    .type_
+                    .as_deref()
+                    == Some("Backdrop")
+            })
+            .filter_map(|image| {
+                image
+                    .url
+                    .as_deref()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            backdrop_urls,
+            ["https://image.tmdb.org/t/p/original/neutral.jpg"]
+        );
+        let primary_count = remote_images
+            .iter()
+            .filter(|image| {
+                image
+                    .type_
+                    .as_deref()
+                    == Some("Primary")
+            })
+            .count();
+        assert_eq!(primary_count, 2);
+
+        let mut all_languages = Vec::new();
+        extend_from_tmdb_images(&mut all_languages, &images, false);
+        assert_eq!(
+            all_languages
+                .iter()
+                .filter(|image| image
+                    .type_
+                    .as_deref()
+                    == Some("Backdrop"))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn remote_image_queries_respect_include_all_languages() {
+        assert_eq!(
+            tmdb_remote_image_languages(Some(&api::ImageType::Backdrop), false),
+            Some("null")
+        );
+        assert_eq!(
+            tmdb_remote_image_languages(Some(&api::ImageType::Primary), false),
+            None
+        );
+        assert_eq!(
+            tmdb_remote_image_languages(Some(&api::ImageType::Backdrop), true),
+            None
+        );
+        assert_eq!(tmdb_remote_image_languages(None, false), None);
+        assert_eq!(
+            tmdb_remote_metadata_language(Some("nl-NL"), false),
+            Some("nl-NL".to_string())
+        );
+        assert_eq!(tmdb_remote_metadata_language(Some("nl-NL"), true), None);
+
+        let backdrop_query =
+            sdks::tmdb::MovieEndpoint::new(1, Some("nl-NL".to_string()))
+                .with_image_languages("null")
+                .query();
+        let primary_query =
+            sdks::tmdb::MovieEndpoint::new(1, Some("nl-NL".to_string())).query();
+
+        assert!(
+            backdrop_query.contains(&("include_image_language".into(), "null".into()))
+        );
+        assert!(
+            primary_query
+                .iter()
+                .all(|(key, _)| key != "include_image_language")
+        );
+    }
+
+    /// TMDB restricts `images.backdrops`/`logos` to the request's `language`
+    /// plus untagged entries, so an "en"-tagged title card never comes back
+    /// unless "en" is explicitly requested — regardless of the server's
+    /// configured metadata language.
+    #[test]
+    fn thumb_and_logo_languages_always_include_english_and_null() {
+        assert_eq!(thumb_and_logo_languages(None), "en,null");
+        assert_eq!(thumb_and_logo_languages(Some("en")), "en,null");
+        assert_eq!(thumb_and_logo_languages(Some("nl")), "nl,en,null");
+        assert_eq!(thumb_and_logo_languages(Some("nl-NL")), "nl,en,null");
+    }
 }

@@ -7,23 +7,22 @@ pub mod remux;
 pub mod remuxdb;
 pub mod stremio;
 pub mod tmdb;
-pub mod trakt;
 
-use bytes::Bytes;
+mod rate_limit;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub use rate_limit::SharedRateLimit;
+
 use http::{Extensions, HeaderMap, HeaderValue, Method, header};
 use itertools::Itertools;
+use remux_utils::Secret;
 use reqwest_middleware::{ClientBuilder as MwClientBuilder, ClientWithMiddleware};
 pub use reqwest_retry::policies::ExponentialBackoff;
 use reqwest_retry::{RetryPolicy, RetryTransientMiddleware};
 use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use std::{collections::HashMap, fmt, iter, ops, sync::Arc, time::Duration};
 #[cfg(not(target_arch = "wasm32"))]
-use {
-    async_trait::async_trait,
-    md5,
-    remux_utils::Store,
-    reqwest_middleware::{Middleware, Next},
-};
+use {md5, remux_utils::Store};
 
 #[cfg(not(target_arch = "wasm32"))]
 static HTTP_CACHE: std::sync::LazyLock<Store> =
@@ -37,16 +36,22 @@ pub fn clear_http_cache() {
     HTTP_CACHE.clear();
 }
 
-/// Returns `(entry_count, weighted_size)` for the HTTP response cache.
+/// Returns `(entry_count, weighted_size)` for the deserialized response cache.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn http_cache_stats() -> (u64, u64) {
     (HTTP_CACHE.entry_count(), HTTP_CACHE.weighted_size())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn hash_key(key: &str) -> String {
-    let result = md5::compute(key.as_bytes());
-    format!("{:x}", result)
+fn cache_key<T>(url: &str) -> String {
+    // A URL can legitimately be decoded into more than one output type (for
+    // example an endpoint wrapped in `Option<T>`). Keep those entries apart so
+    // `Store::get` is always a typed cache hit rather than a downcast miss.
+    format!(
+        "{}:{:x}",
+        std::any::type_name::<T>(),
+        md5::compute(url.as_bytes())
+    )
 }
 
 pub trait Auth: Send + Sync + Clone {
@@ -92,7 +97,14 @@ pub struct JellyfinApiKeyAuth {
 
 impl Auth for JellyfinApiKeyAuth {
     fn apply(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        req.header("X-Emby-Token", &self.api_key)
+        let val = format!(
+            r#"MediaBrowser Client="remux", Device="server", DeviceId="remux-server", Version="1.0.0", Token="{}""#,
+            self.api_key
+        );
+        match HeaderValue::from_str(&val) {
+            Ok(v) => req.header(header::AUTHORIZATION, v),
+            Err(_) => req.header("X-Emby-Token", &self.api_key),
+        }
     }
 }
 
@@ -102,19 +114,19 @@ pub enum ClientError {
     Unauthorized,
     #[error("rate limited, retry after {retry_after_secs}s")]
     RateLimited { retry_after_secs: u64 },
-    #[error("http error (status={status}) endpoint={endpoint:?}: {message}")]
+    #[error("http error (status={status}): {message}")]
     Http {
         status: u16,
         message: String,
-        endpoint: Option<String>,
-        body: Option<String>,
+        endpoint: Option<Secret<String>>,
+        body: Option<Secret<String>>,
     },
-    #[error("json error (status={status}) endpoint={endpoint:?}: {source}")]
+    #[error("json error (status={status}): {source}")]
     Json {
         status: u16,
         source: serde_json::Error,
-        endpoint: Option<String>,
-        body: Option<String>,
+        endpoint: Option<Secret<String>>,
+        body: Option<Secret<String>>,
     },
     #[error(transparent)]
     Transport(#[from] reqwest::Error),
@@ -134,6 +146,30 @@ impl ClientError {
             ClientError::Http { message, .. } => message.clone(),
             other => other.to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod client_error_tests {
+    use super::*;
+
+    #[test]
+    fn error_formatting_redacts_credentialed_endpoints() {
+        let secret = "do-not-log-this-token";
+        let error = ClientError::Http {
+            status: 502,
+            message: "upstream unavailable".to_string(),
+            endpoint: Some(Secret::new(format!(
+                "https://addon.example/manifest.json?token={secret}"
+            ))),
+            body: None,
+        };
+        assert!(
+            !error
+                .to_string()
+                .contains(secret)
+        );
+        assert!(!format!("{error:?}").contains(secret));
     }
 }
 
@@ -160,8 +196,8 @@ fn default_error_mapper(status: u16, endpoint: &str, body: &str) -> ClientError 
         ClientError::Http {
             status,
             message,
-            endpoint: Some(endpoint.to_string()),
-            body: Some(body.to_string()),
+            endpoint: Some(Secret::new(endpoint.to_string())),
+            body: Some(Secret::new(body.to_string())),
         }
     }
 }
@@ -256,95 +292,6 @@ pub trait Endpoint {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-#[derive(Clone, Copy)]
-struct CacheTTL(Duration);
-
-#[cfg(not(target_arch = "wasm32"))]
-#[derive(Clone)]
-struct CachedResponse {
-    status: u16,
-    body: String,
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-struct InMemoryCacheMiddleware;
-
-#[cfg(not(target_arch = "wasm32"))]
-#[async_trait]
-impl Middleware for InMemoryCacheMiddleware {
-    async fn handle(
-        &self,
-        req: reqwest::Request,
-        extensions: &mut Extensions,
-        next: Next<'_>,
-    ) -> reqwest_middleware::Result<reqwest::Response> {
-        let ttl = extensions
-            .get::<CacheTTL>()
-            .copied();
-        // Derive the cache key from the pre-redirect URL so hits are consistent
-        // regardless of whether the server redirects the request.
-        let key = ttl.map(|_| {
-            hash_key(
-                req.url()
-                    .as_str(),
-            )
-        });
-
-        if let Some(ref k) = key {
-            if let Some(cached) = HTTP_CACHE.get::<CachedResponse>(k) {
-                let resp = http::Response::builder()
-                    .status(cached.status)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Bytes::from(
-                        cached
-                            .body
-                            .clone(),
-                    ))
-                    .unwrap();
-                return Ok(reqwest::Response::from(resp));
-            }
-        }
-
-        let resp = next
-            .run(req, extensions)
-            .await?;
-
-        if let (Some(CacheTTL(ttl)), Some(k)) = (ttl, key) {
-            if resp
-                .status()
-                .is_success()
-            {
-                let status = resp.status();
-                let text = resp
-                    .text()
-                    .await
-                    .map_err(reqwest_middleware::Error::Reqwest)?;
-                let weight = text
-                    .len()
-                    .min(u32::MAX as usize) as u32;
-                HTTP_CACHE.save_arc_with_weight(
-                    k,
-                    Arc::new(CachedResponse {
-                        status: status.as_u16(),
-                        body: text.clone(),
-                    }),
-                    weight,
-                    ttl,
-                );
-                let rebuilt = http::Response::builder()
-                    .status(status)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Bytes::from(text))
-                    .unwrap();
-                return Ok(reqwest::Response::from(rebuilt));
-            }
-        }
-
-        Ok(resp)
-    }
-}
-
 struct DynRetryPolicy(Arc<dyn RetryPolicy + Send + Sync>);
 
 impl RetryPolicy for DynRetryPolicy {
@@ -358,20 +305,25 @@ impl RetryPolicy for DynRetryPolicy {
     }
 }
 
-fn build_mw(retry: Option<Arc<dyn RetryPolicy + Send + Sync>>) -> ClientWithMiddleware {
-    #[cfg(not(target_arch = "wasm32"))]
-    let builder =
-        MwClientBuilder::new(SHARED_HTTP_CLIENT.clone()).with(InMemoryCacheMiddleware);
-    #[cfg(target_arch = "wasm32")]
+fn build_mw(
+    retry: Option<Arc<dyn RetryPolicy + Send + Sync>>,
+    default_retry_after: Duration,
+    #[cfg(not(target_arch = "wasm32"))] shared_rate_limit: Option<SharedRateLimit>,
+) -> ClientWithMiddleware {
     let builder = MwClientBuilder::new(SHARED_HTTP_CLIENT.clone());
-    match retry {
-        Some(policy) => builder
-            .with(RetryTransientMiddleware::new_with_policy(DynRetryPolicy(
-                policy,
-            )))
-            .build(),
-        None => builder.build(),
-    }
+    let builder = match retry {
+        Some(policy) => builder.with(
+            RetryTransientMiddleware::new_with_policy(DynRetryPolicy(policy))
+                .with_retry_log_level(tracing::Level::DEBUG),
+        ),
+        None => builder,
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    let builder = builder.with(rate_limit::RetryAfterMiddleware {
+        default_retry_after,
+        shared_rate_limit,
+    });
+    builder.build()
 }
 
 #[derive(Clone)]
@@ -380,15 +332,29 @@ pub struct RestClient<A: Auth = NoAuth> {
     base: url::Url,
     auth: Arc<A>,
     map_error: fn(u16, &str, &str) -> ClientError,
+    retry: Option<Arc<dyn RetryPolicy + Send + Sync>>,
+    default_retry_after: Duration,
+    #[cfg(not(target_arch = "wasm32"))]
+    shared_rate_limit: Option<SharedRateLimit>,
 }
 
 impl RestClient<NoAuth> {
     pub fn new(base: &str) -> Result<Self, url::ParseError> {
+        let default_retry_after = rate_limit::DEFAULT_RETRY_AFTER;
         Ok(Self {
-            mw: build_mw(None),
+            mw: build_mw(
+                None,
+                default_retry_after,
+                #[cfg(not(target_arch = "wasm32"))]
+                None,
+            ),
             base: url::Url::parse(format!("{}/", base.trim_end_matches('/')).as_str())?,
             auth: Arc::new(NoAuth),
             map_error: default_error_mapper,
+            retry: None,
+            default_retry_after,
+            #[cfg(not(target_arch = "wasm32"))]
+            shared_rate_limit: None,
         })
     }
 }
@@ -400,6 +366,10 @@ impl<A: Auth + Clone> RestClient<A> {
             base: self.base,
             auth: Arc::new(auth),
             map_error: self.map_error,
+            retry: self.retry,
+            default_retry_after: self.default_retry_after,
+            #[cfg(not(target_arch = "wasm32"))]
+            shared_rate_limit: self.shared_rate_limit,
         }
     }
 
@@ -412,7 +382,57 @@ impl<A: Auth + Clone> RestClient<A> {
         mut self,
         policy: P,
     ) -> Self {
-        self.mw = build_mw(Some(Arc::new(policy)));
+        self.retry = Some(Arc::new(policy));
+        self.mw = build_mw(
+            self.retry
+                .clone(),
+            self.default_retry_after,
+            #[cfg(not(target_arch = "wasm32"))]
+            self.shared_rate_limit
+                .clone(),
+        );
+        self
+    }
+
+    /// Overrides how long to wait before retrying a 429 response that carries
+    /// no (or an unparseable) `Retry-After` header. Some upstreams — TMDB in
+    /// particular — never send that header at all, so without this every 429
+    /// falls back to the same conservative default meant for well-behaved
+    /// APIs that do send one.
+    pub fn with_default_retry_after(mut self, default: Duration) -> Self {
+        self.default_retry_after = default;
+        self.mw = build_mw(
+            self.retry
+                .clone(),
+            default,
+            #[cfg(not(target_arch = "wasm32"))]
+            self.shared_rate_limit
+                .clone(),
+        );
+        self
+    }
+
+    /// Shares an upstream 429 cooldown with other clients.
+    ///
+    /// The same [`SharedRateLimit`] should be supplied to every client that
+    /// targets one upstream provider. It is deliberately opt-in: unrelated
+    /// providers must not block each other after one returns a 429.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn with_shared_rate_limit(
+        mut self,
+        shared_rate_limit: SharedRateLimit,
+    ) -> Self {
+        self.shared_rate_limit = Some(shared_rate_limit);
+        self.mw = build_mw(
+            self.retry
+                .clone(),
+            self.default_retry_after,
+            Some(
+                self.shared_rate_limit
+                    .clone()
+                    .expect("shared rate limit was set"),
+            ),
+        );
         self
     }
 
@@ -428,6 +448,28 @@ impl<A: Auth + Clone> RestClient<A> {
     pub async fn execute_arc<EP: Endpoint + Clone>(
         &self,
         endpoint: EP,
+    ) -> Result<Arc<EP::Output>, ClientError> {
+        self.execute_arc_observed(endpoint, |_, _| {})
+            .await
+    }
+
+    /// Executes an endpoint and exposes the final HTTP status and raw response
+    /// body to `on_response` before deserializing it. Cached responses do not
+    /// invoke the callback because no HTTP request was made.
+    pub async fn execute_observed<EP: Endpoint + Clone>(
+        &self,
+        endpoint: EP,
+        on_response: impl FnOnce(u16, &str),
+    ) -> Result<EP::Output, ClientError> {
+        self.execute_arc_observed(endpoint, on_response)
+            .await
+            .map(|arc| Arc::try_unwrap(arc).unwrap_or_else(|arc| (*arc).clone()))
+    }
+
+    async fn execute_arc_observed<EP: Endpoint + Clone>(
+        &self,
+        endpoint: EP,
+        on_response: impl FnOnce(u16, &str),
     ) -> Result<Arc<EP::Output>, ClientError> {
         let path = endpoint.path();
         let mut url = self
@@ -448,6 +490,17 @@ impl<A: Auth + Clone> RestClient<A> {
             url.set_query(Some(&qs));
         }
 
+        #[cfg(not(target_arch = "wasm32"))]
+        let cache_key = endpoint
+            .cache_options()
+            .map(|_| cache_key::<EP::Output>(url.as_str()));
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(ref key) = cache_key {
+            if let Some(cached) = HTTP_CACHE.get::<EP::Output>(key) {
+                return Ok(cached);
+            }
+        }
+
         let mut req = SHARED_HTTP_CLIENT
             .request(endpoint.method(), url.clone())
             .headers(endpoint.headers());
@@ -460,8 +513,8 @@ impl<A: Auth + Clone> RestClient<A> {
                 let bytes = serde_json::to_vec(&v).map_err(|e| ClientError::Json {
                     status: 0,
                     source: e,
-                    endpoint: Some(url.to_string()),
-                    body: Some(v.to_string()),
+                    endpoint: Some(Secret::new(url.to_string())),
+                    body: Some(Secret::new(v.to_string())),
                 })?;
                 req.header(
                     header::CONTENT_TYPE,
@@ -485,11 +538,6 @@ impl<A: Auth + Clone> RestClient<A> {
             .map_err(ClientError::Transport)?;
 
         let mut ext = Extensions::new();
-        #[cfg(not(target_arch = "wasm32"))]
-        if let Some(opts) = endpoint.cache_options() {
-            ext.insert(CacheTTL(opts.ttl));
-        }
-
         let resp = self
             .mw
             .execute_with_extensions(request, &mut ext)
@@ -502,25 +550,22 @@ impl<A: Auth + Clone> RestClient<A> {
         let status = resp
             .status()
             .as_u16();
-        if status == 429 {
-            let retry_after_secs = resp
-                .headers()
-                .get("Retry-After")
-                .and_then(|v| {
-                    v.to_str()
-                        .ok()
-                })
-                .and_then(|s| {
-                    s.parse::<u64>()
-                        .ok()
-                })
-                .unwrap_or(60);
-            return Err(ClientError::RateLimited { retry_after_secs });
-        }
+        let retry_after_secs = (status == 429).then(|| {
+            rate_limit::retry_after(
+                resp.headers(),
+                std::time::SystemTime::now(),
+                self.default_retry_after,
+            )
+            .as_secs()
+        });
         let text = resp
             .text()
             .await
             .unwrap_or_default();
+        on_response(status, &text);
+        if let Some(retry_after_secs) = retry_after_secs {
+            return Err(ClientError::RateLimited { retry_after_secs });
+        }
         let on_statuses = endpoint
             .cache_options()
             .map(|o| o.on_statuses)
@@ -536,8 +581,8 @@ impl<A: Auth + Clone> RestClient<A> {
                     .map_err(|e| ClientError::Json {
                         status: s,
                         source: e,
-                        endpoint: Some(url.to_string()),
-                        body: Some(text.clone()),
+                        endpoint: Some(Secret::new(url.to_string())),
+                        body: Some(Secret::new(text.clone())),
                     })?;
                 #[cfg(not(target_arch = "wasm32"))]
                 if let Some(ttl) = endpoint.should_cache(&arc) {
@@ -545,11 +590,8 @@ impl<A: Auth + Clone> RestClient<A> {
                         .len()
                         .min(u32::MAX as usize) as u32;
                     HTTP_CACHE.save_arc_with_weight(
-                        hash_key(url.as_str()),
-                        Arc::new(CachedResponse {
-                            status: s,
-                            body: text,
-                        }),
+                        cache_key.expect("cache key exists for a cacheable response"),
+                        Arc::clone(&arc),
                         weight,
                         ttl,
                     );
@@ -563,17 +605,14 @@ impl<A: Auth + Clone> RestClient<A> {
                     .map_err(|e| ClientError::Json {
                         status: s,
                         source: e,
-                        endpoint: Some(url.to_string()),
-                        body: Some(text.clone()),
+                        endpoint: Some(Secret::new(url.to_string())),
+                        body: Some(Secret::new(text.clone())),
                     })?;
                 #[cfg(not(target_arch = "wasm32"))]
                 if let Some(ttl) = endpoint.should_cache(&arc) {
                     HTTP_CACHE.save_arc_with_weight(
-                        hash_key(url.as_str()),
-                        Arc::new(CachedResponse {
-                            status: s,
-                            body: "null".to_string(),
-                        }),
+                        cache_key.expect("cache key exists for a cacheable response"),
+                        Arc::clone(&arc),
                         4,
                         ttl,
                     );
@@ -588,8 +627,8 @@ impl<A: Auth + Clone> RestClient<A> {
                     .map_err(|e| ClientError::Json {
                         status: s,
                         source: e,
-                        endpoint: Some(url.to_string()),
-                        body: Some(text.clone()),
+                        endpoint: Some(Secret::new(url.to_string())),
+                        body: Some(Secret::new(text.clone())),
                     })
             }
             s => Err((self.map_error)(s, &url.to_string(), &text)),
@@ -1051,6 +1090,26 @@ mod cache_tests {
             .await
             .unwrap();
         assert_eq!(mock.hits(), 2, "asked again once the short TTL was up");
+    }
+
+    #[tokio::test]
+    async fn cached_execute_arc_reuses_the_deserialized_value() {
+        let server = httpmock::MockServer::start();
+        let (mock, client, probe) =
+            probe(&server, "typed-arc", serde_json::json!(["found"]));
+        let endpoint = probe.with_cache(NEVER);
+
+        let first = client
+            .execute_arc(endpoint.clone())
+            .await
+            .unwrap();
+        let second = client
+            .execute_arc(endpoint)
+            .await
+            .unwrap();
+
+        assert_eq!(mock.hits(), 1);
+        assert!(Arc::ptr_eq(&first, &second));
     }
 
     #[tokio::test]

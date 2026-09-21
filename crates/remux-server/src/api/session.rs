@@ -21,10 +21,10 @@ use crate::{
     db,
     db::auth,
     playback::session::TranscodeSession,
+    playback_session,
     services::{self, MediaResolveService},
     signals::{
-        Event, PlaybackProgressInfo, PlaybackStartedInfo, PlaybackStoppedInfo,
-        RemoteCommandInfo, RemotePlayInfo, RemotePlaystateInfo,
+        Event, PlaybackContext, RemoteCommandInfo, RemotePlayInfo, RemotePlaystateInfo,
     },
 };
 
@@ -57,6 +57,9 @@ pub async fn sessions_capabilities(
             &state
                 .ctx
                 .db,
+            session
+                .user
+                .id,
             &session
                 .device
                 .id,
@@ -71,7 +74,7 @@ pub async fn sessions_capabilities(
 pub async fn sessions_capabilities_by_id(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    _session: auth::AuthSession,
+    session: auth::AuthSession,
     body: Option<Json<api::ClientCapabilitiesDto>>,
 ) -> Result<StatusCode> {
     if let Some(Json(caps)) = body {
@@ -79,6 +82,9 @@ pub async fn sessions_capabilities_by_id(
             &state
                 .ctx
                 .db,
+            session
+                .user
+                .id,
             &id,
             &caps,
         )
@@ -118,10 +124,18 @@ pub async fn report_playback_start(
         .ctx
         .signals
         .emit(Event::SessionsChanged);
+    let playback = state
+        .ctx
+        .sessions
+        .get_by_device(
+            &session
+                .device
+                .id,
+        );
     state
         .ctx
         .signals
-        .emit(Event::PlaybackStarted(PlaybackStartedInfo {
+        .emit(Event::PlaybackStarted(PlaybackContext {
             user_id: session
                 .user
                 .id,
@@ -129,7 +143,7 @@ pub async fn report_playback_start(
             position_ticks: data
                 .position_ticks
                 .unwrap_or(0),
-            ..Default::default()
+            ..PlaybackContext::from_parts(&session, &data, playback.as_ref(), None)
         }));
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -184,10 +198,14 @@ pub async fn report_playback_progress(
             .signals
             .emit(Event::SessionsChanged);
         if data.is_paused && !was_paused {
+            let playback = state
+                .ctx
+                .sessions
+                .get(psid);
             state
                 .ctx
                 .signals
-                .emit(Event::PlaybackProgress(PlaybackProgressInfo {
+                .emit(Event::PlaybackProgress(PlaybackContext {
                     user_id: session
                         .user
                         .id,
@@ -196,7 +214,12 @@ pub async fn report_playback_progress(
                         .position_ticks
                         .unwrap_or(0),
                     is_paused: true,
-                    ..Default::default()
+                    ..PlaybackContext::from_parts(
+                        &session,
+                        &data,
+                        playback.as_ref(),
+                        Some(psid),
+                    )
                 }));
         }
     }
@@ -226,15 +249,27 @@ pub async fn report_playback_stopped(
     if let Some(ref psid) = effective_psid {
         // Read before `stopped` clears the session, and the only id a client
         // is guaranteed to have given us: a stop report may carry none.
+        let playback = state
+            .ctx
+            .sessions
+            .get(psid);
+        let position_ticks = data
+            .position_ticks
+            .or_else(|| {
+                playback
+                    .as_ref()
+                    .map(|playback| playback.position_ticks)
+            })
+            .unwrap_or(0);
+        let pctx =
+            PlaybackContext::from_parts(&session, &data, playback.as_ref(), Some(psid));
         let changed_item_id = (!data
             .item_id
             .is_nil())
         .then_some(data.item_id)
         .or_else(|| {
-            state
-                .ctx
-                .sessions
-                .get(psid)
+            playback
+                .as_ref()
                 .map(|playback| playback.item_id)
                 .filter(|item_id| !item_id.is_nil())
         });
@@ -262,18 +297,49 @@ pub async fn report_playback_stopped(
             state
                 .ctx
                 .signals
-                .emit(Event::PlaybackStopped(PlaybackStoppedInfo {
+                .emit(Event::PlaybackStopped(PlaybackContext {
                     user_id: session
                         .user
                         .id,
                     media_id: item_id,
-                    position_ticks: data
-                        .position_ticks
-                        .unwrap_or(0),
+                    position_ticks,
                     played,
-                    ..Default::default()
+                    ..pctx
                 }));
         }
+    } else if !data
+        .item_id
+        .is_nil()
+    {
+        // No play session to attach this stop to: the client never reported a
+        // start and sent no `PlaySessionId`. The stop
+        // still names the item and the position, and Jellyfin persists it
+        // regardless of session state, so record it the same way.
+        let position_ticks = data
+            .position_ticks
+            .unwrap_or(0);
+        let played = playback_session::PlaybackSessionManager::persist_stop(
+            &state
+                .ctx
+                .db,
+            &session.user,
+            Some(data.item_id),
+            data.position_ticks,
+        )
+        .await
+        .context_internal("failed to record stop")?;
+        state
+            .ctx
+            .signals
+            .emit(Event::PlaybackStopped(PlaybackContext {
+                user_id: session
+                    .user
+                    .id,
+                media_id: data.item_id,
+                position_ticks,
+                played,
+                ..PlaybackContext::from_parts(&session, &data, None, None)
+            }));
     }
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -307,6 +373,9 @@ pub async fn sessions_capabilities_full(
             &state
                 .ctx
                 .db,
+            session
+                .user
+                .id,
             &session
                 .device
                 .id,
@@ -321,7 +390,7 @@ pub async fn sessions_capabilities_full(
 pub async fn sessions_capabilities_full_by_id(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    _session: auth::AuthSession,
+    session: auth::AuthSession,
     body: Option<Json<api::ClientCapabilitiesDto>>,
 ) -> Result<StatusCode> {
     if let Some(Json(caps)) = body {
@@ -329,6 +398,9 @@ pub async fn sessions_capabilities_full_by_id(
             &state
                 .ctx
                 .db,
+            session
+                .user
+                .id,
             &id,
             &caps,
         )
@@ -1329,6 +1401,176 @@ mod tests {
             "invalid"
                 .parse::<PlaystateCommand>()
                 .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod e2e_tests {
+    use crate::integration_test::{
+        auth_header_with_token, authenticated_server, seed_movie,
+    };
+    use http::{StatusCode, header::HeaderValue};
+    use serde_json::json;
+
+    /// Some clients never call `/sessions/playing` or
+    /// `/sessions/playing/progress`; their only report is the stop, carrying
+    /// the item id and position but no `PlaySessionId`. That report must still
+    /// create a resume point, as it does on Jellyfin.
+    #[tokio::test]
+    async fn stop_report_without_play_session_creates_resume_point() {
+        let (server, ctx, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let media = seed_movie(&ctx.0).await;
+        let item_id = media
+            .id
+            .simple()
+            .to_string();
+        let position_ticks: i64 = 600 * 10_000_000;
+
+        let resp = server
+            .post("/sessions/playing/stopped")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .json(&json!({
+                "ItemId": item_id,
+                "PositionTicks": position_ticks,
+                "CanSeek": true,
+                "IsPaused": false,
+                "IsMuted": false,
+            }))
+            .await;
+        resp.assert_status(StatusCode::NO_CONTENT);
+
+        let resp = server
+            .get("/users/me/items/resume")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await;
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        let items = body["Items"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            items.len(),
+            1,
+            "a session-less stop report must still land in Continue Watching"
+        );
+        assert_eq!(
+            items[0]["Id"]
+                .as_str()
+                .unwrap(),
+            item_id
+        );
+        assert_eq!(
+            items[0]["UserData"]["PlaybackPositionTicks"]
+                .as_i64()
+                .unwrap(),
+            position_ticks
+        );
+    }
+
+    /// A session-less stop under the resume threshold on an item with no prior
+    /// state must leave no trace: no resume point, and no `LastPlayedDate`
+    /// either — Jellyfin only writes that on playback start, which such a
+    /// client never sends, and some clients render "last played, position 0, not
+    /// played" as a fully watched episode.
+    #[tokio::test]
+    async fn abandoned_stop_report_without_play_session_leaves_no_state() {
+        let (server, ctx, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let media = seed_movie(&ctx.0).await;
+        let item_id = media
+            .id
+            .simple()
+            .to_string();
+        // 60 s into a 6000 s movie: 1 %, under the 5 % default.
+        let resp = server
+            .post("/sessions/playing/stopped")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .json(&json!({
+                "ItemId": item_id,
+                "PositionTicks": 60 * 10_000_000i64,
+                "CanSeek": true,
+                "IsPaused": false,
+                "IsMuted": false,
+            }))
+            .await;
+        resp.assert_status(StatusCode::NO_CONTENT);
+
+        let resp = server
+            .get(&format!("/items/{item_id}"))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await;
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        let user_data = &body["UserData"];
+        assert_eq!(user_data["PlaybackPositionTicks"].as_i64(), Some(0));
+        assert_eq!(user_data["Played"].as_bool(), Some(false));
+        assert!(
+            user_data["LastPlayedDate"].is_null(),
+            "no LastPlayedDate for an abandoned session-less play: {user_data}"
+        );
+    }
+
+    /// A `/sessions/playing` report is the actual playback-start event.
+    /// Per the comment on `UserMediaState::update_playback`, Jellyfin's
+    /// `LastPlayedDate` is meant to come from playback start (a stop never
+    /// writes it — see `abandoned_stop_report_without_play_session_leaves_no_state`
+    /// above) — so starting playback must record it immediately, otherwise an
+    /// item that's only ever been started (never finished, never stopped
+    /// past the resume threshold) has no timestamp at all and DatePlayed-sorted
+    /// lists (Continue Watching, Next Up) can't rank it by recency.
+    #[tokio::test]
+    async fn playback_start_sets_last_played_date() {
+        let (server, ctx, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let media = seed_movie(&ctx.0).await;
+        let item_id = media
+            .id
+            .simple()
+            .to_string();
+
+        let resp = server
+            .post("/sessions/playing")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .json(&json!({
+                "ItemId": item_id,
+                "PositionTicks": 60 * 10_000_000i64,
+                "CanSeek": true,
+                "IsPaused": false,
+                "IsMuted": false,
+            }))
+            .await;
+        resp.assert_status(StatusCode::NO_CONTENT);
+
+        let resp = server
+            .get(&format!("/items/{item_id}"))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await;
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        let user_data = &body["UserData"];
+        assert!(
+            !user_data["LastPlayedDate"].is_null(),
+            "playback start must set LastPlayedDate: {user_data}"
         );
     }
 }

@@ -1,8 +1,10 @@
 pub mod codecs;
+pub mod provider_ids;
 pub use codecs::{
     AudioCodec, AudioContainer, DlnaProfileType, SubtitleCodec, TranscodingProtocol,
     VideoCodec, VideoContainer,
 };
+pub use provider_ids::{AnyProviderIds, ExternalIdProvider};
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use http::{HeaderValue, Method};
@@ -17,6 +19,191 @@ use uuid::Uuid;
 
 pub use crate::stremio::ResourceType;
 use crate::{Auth, Body, Endpoint, RestClient, stremio};
+
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    strum_macros::Display,
+    strum_macros::EnumString,
+)]
+#[serde(rename_all = "PascalCase")]
+#[strum(serialize_all = "PascalCase")]
+pub enum WebhookEvent {
+    #[serde(alias = "PlaybackStarted")]
+    #[strum(
+        to_string = "PlaybackStart",
+        serialize = "PlaybackStart",
+        serialize = "PlaybackStarted"
+    )]
+    PlaybackStart,
+    PlaybackProgress,
+    #[serde(alias = "PlaybackStopped")]
+    #[strum(
+        to_string = "PlaybackStop",
+        serialize = "PlaybackStop",
+        serialize = "PlaybackStopped"
+    )]
+    PlaybackStop,
+    UserDataSaved,
+    UserUpdated,
+    UserDeleted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct HttpWebhookConfig {
+    pub url: String,
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", content = "config", rename_all = "snake_case")]
+pub enum WebhookDestination {
+    Http(HttpWebhookConfig),
+}
+
+impl Default for WebhookDestination {
+    fn default() -> Self {
+        Self::Http(HttpWebhookConfig::default())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct WebhookConfig {
+    pub id: Uuid,
+    pub name: String,
+    pub enabled: bool,
+    #[serde(default)]
+    pub destination: WebhookDestination,
+    #[serde(default)]
+    pub events: Vec<WebhookEvent>,
+    #[serde(default)]
+    pub user_ids: Vec<Uuid>,
+    #[serde(default)]
+    pub media_types: Vec<String>,
+    #[serde(default)]
+    pub template: String,
+    #[serde(default)]
+    pub fields: HashMap<String, String>,
+    #[serde(default)]
+    pub send_all_properties: bool,
+    #[serde(default)]
+    pub trim_whitespace: bool,
+    #[serde(default)]
+    pub skip_empty_body: bool,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct GetWebhooks;
+impl Endpoint for GetWebhooks {
+    type Output = Vec<WebhookConfig>;
+    fn path(&self) -> String {
+        "/remux/webhooks".into()
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CreateWebhook {
+    pub config: WebhookConfig,
+}
+impl Endpoint for CreateWebhook {
+    type Output = WebhookConfig;
+    fn path(&self) -> String {
+        "/remux/webhooks".into()
+    }
+    fn method(&self) -> Method {
+        Method::POST
+    }
+    fn body(&self) -> Body {
+        Body::Json(serde_json::to_value(&self.config).unwrap_or_default())
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UpdateWebhook {
+    pub config: WebhookConfig,
+}
+impl Endpoint for UpdateWebhook {
+    type Output = WebhookConfig;
+    fn path(&self) -> String {
+        format!(
+            "/remux/webhooks/{}",
+            self.config
+                .id
+        )
+    }
+    fn method(&self) -> Method {
+        Method::PUT
+    }
+    fn body(&self) -> Body {
+        Body::Json(serde_json::to_value(&self.config).unwrap_or_default())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DeleteWebhook {
+    pub id: Uuid,
+}
+impl Endpoint for DeleteWebhook {
+    type Output = serde_json::Value;
+    fn path(&self) -> String {
+        format!("/remux/webhooks/{}", self.id)
+    }
+    fn method(&self) -> Method {
+        Method::DELETE
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewWebhook {
+    pub template: String,
+    pub send_all_properties: bool,
+    pub trim_whitespace: bool,
+}
+impl Endpoint for PreviewWebhook {
+    type Output = WebhookTestResponse;
+    fn path(&self) -> String {
+        "/remux/webhooks/preview".into()
+    }
+    fn method(&self) -> Method {
+        Method::POST
+    }
+    fn body(&self) -> Body {
+        Body::Json(serde_json::to_value(self).unwrap_or_default())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TestWebhook {
+    pub id: Uuid,
+}
+impl Endpoint for TestWebhook {
+    type Output = WebhookTestResponse;
+    fn path(&self) -> String {
+        format!("/remux/webhooks/{}/test", self.id)
+    }
+    fn method(&self) -> Method {
+        Method::POST
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct WebhookTestResponse {
+    pub body: String,
+}
 
 fn serialize_comma<S>(v: &[String], s: S) -> Result<S::Ok, S::Error>
 where
@@ -230,6 +417,7 @@ pub struct AddonDto {
     pub http_redirect_stream: bool,
     #[serde(default)]
     pub service_filter: Vec<String>,
+    pub description: Option<String>,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
 }
@@ -371,11 +559,9 @@ pub struct RemuxBrandingExtensions {
 #[dto]
 pub struct BrandingOptions {
     pub login_disclaimer: Option<String>,
-    #[default(Some(concat!(
-        "@import url(\"https://cdn.jsdelivr.net/gh/lscambo13/ElegantFin@main/Theme/ElegantFin-jellyfin-theme-build-latest-minified.css\");\n\n",
-        ".trackSelections {\n    order: 1;\n}\n\n",
-        ".docspinner {\n    top: 80px;\n    right: 21px;\n    left: unset;\n    width: 46px;\n    height: 46px;\n}"
-    ).to_string()))]
+    #[default(Some(
+        "@import url(\"https://cdn.jsdelivr.net/gh/lscambo13/ElegantFin@main/Theme/ElegantFin-jellyfin-theme-build-latest-minified.css\");".to_string()
+    ))]
     pub custom_css: Option<String>,
     pub splashscreen_enabled: Option<bool>,
     #[serde(rename = "remux")]
@@ -439,6 +625,39 @@ pub struct Username(String);
 )]
 pub struct AioUrl(String);
 
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    Default,
+    strum_macros::Display,
+    strum_macros::EnumString,
+)]
+#[serde(rename_all = "PascalCase")]
+#[strum(serialize_all = "PascalCase")]
+pub enum SortMediaSourcesMode {
+    /// No capability-based sorting — MediaSources stay in probe/addon order.
+    Disabled,
+    /// Direct Play and Direct Stream are treated as equally good (both are
+    /// low-overhead — Direct Stream is just a container remux, no re-encode),
+    /// so quality decides within that group and a higher-bitrate remux-only
+    /// version outranks a lower-bitrate direct-play one. Anything that
+    /// actually needs a re-encode (audio, then video) still ranks below both.
+    /// The default: a mix of the other two modes.
+    #[default]
+    Best,
+    /// Never prefer a version that needs any transcode over one that direct
+    /// plays, and never prefer a remux-only version over a true direct play,
+    /// even if the transcode-needing one is technically higher quality.
+    Compatibility,
+    /// Best quality always wins, regardless of whether it needs a transcode.
+    Quality,
+}
+
 #[dto]
 pub struct ServerConfiguration {
     #[default(Some(false))]
@@ -477,13 +696,13 @@ pub struct ServerConfiguration {
     pub transcoding_temp_path: Option<String>,
     #[default(Some(250_i64))]
     pub catalog_max_items: Option<i64>,
-    /// Number of items to process concurrently during metadata fetch (default: 12).
-    #[default(12_i64)]
+    /// Number of items to process concurrently during metadata fetch (default: 14).
+    #[default(14_i64)]
     pub meta_concurrency: i64,
-    /// Number of media trackers drained concurrently; one tracker's queued
-    /// deliveries always go out in order, one at a time (default: 8).
-    #[default(8_i64)]
-    pub delivery_concurrency: i64,
+    /// Max time (seconds) to wait for a single metadata addon's response
+    /// before treating it as failed and moving on (default: 5).
+    #[default(Some(5_i64))]
+    pub addon_fetch_timeout_secs: Option<i64>,
     #[default(Some(true))]
     pub p2p_enabled: Option<bool>,
     #[default(Some(0_i64))]
@@ -534,6 +753,24 @@ pub struct ServerConfiguration {
     /// Items shorter than this are never shown in continue-watching. Default: 90.
     #[default(Some(90_i64))]
     pub min_resume_duration_seconds: Option<i64>,
+    /// Include the next released episode of started series in Continue Watching.
+    /// Disabled by default to retain Jellyfin's standard resume-only behaviour.
+    #[default(Some(false))]
+    pub enable_next_up_in_continue_watching: Option<bool>,
+    /// How to order MediaSources for the requesting device when a DeviceProfile
+    /// is available: `Disabled` (leave probe/addon order alone), `Best`
+    /// (default — Direct Play and Direct Stream count equally, so quality
+    /// picks the winner between them; a real transcode still ranks below
+    /// both), `Compatibility` (never prefer any transcode-needing version,
+    /// and never prefer a remux over a true direct play), or `Quality` (best
+    /// quality always wins, regardless of transcode cost).
+    #[default(Some(SortMediaSourcesMode::Best))]
+    pub sort_media_sources: Option<SortMediaSourcesMode>,
+    /// Append the playback decision ("Direct Play" / "Direct Stream" /
+    /// "Transcode") to each MediaSource's display title, when a DeviceProfile
+    /// is available to judge it against. Default: true.
+    #[default(Some(true))]
+    pub show_playback_decision_in_title: Option<bool>,
 }
 
 #[derive(
@@ -1124,6 +1361,7 @@ pub struct PatchItemPayload {
     pub latest_sort_digital: Option<bool>,
     pub collection_default_sort: Option<Vec<ItemSortBy>>,
     pub collection_default_sort_order: Option<Vec<SortOrder>>,
+    pub image_config: Option<CollectionImageConfig>,
 }
 
 #[dto]
@@ -1275,11 +1513,22 @@ pub struct GetItemsQuery {
     pub start_index: Option<u32>,
     pub limit: Option<u32>,
     pub search_term: Option<String>,
+    /// Emby `AnyProviderIdEquals` — `Tmdb.123,Imdb.tt456,Tvdb.789`.
+    #[serde(
+        deserialize_with = "deserialize_separated_str",
+        serialize_with = "serialize_comma_opt",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    pub any_provider_id_equals: Option<Vec<String>>,
     pub parent_id: Option<Uuid>,
     pub season_id: Option<Uuid>,
     /// Internal server-side constraint. This is not a Jellyfin query parameter.
     #[serde(skip)]
     pub promoted: Option<bool>,
+    /// Internal list query: do not reinterpret a single ID as a details lookup.
+    #[serde(skip)]
+    pub strict_item_filters: bool,
     // #[serde_as(as = "Option<StringWithSeparator::<CommaSeparator, ItemFields>>")]
     //#[serde_as(as = "Option<StringWithSeparator<CommaSeparator, ItemFields>>")]
     #[serde(
@@ -1472,6 +1721,8 @@ impl GetItemsQuery {
             MediaType::Audio,
             MediaType::MusicAlbum,
             MediaType::MusicArtist,
+            MediaType::TvChannel,
+            MediaType::TvProgram,
         ];
 
         if let Some(include_types) = &self.include_item_types {
@@ -1508,6 +1759,15 @@ impl GetItemsQuery {
         //}
 
         requested
+    }
+
+    /// `None` when the client did not send Emby `AnyProviderIdEquals`.
+    /// `Some` (possibly empty) when it did, so callers can return no rows
+    /// instead of ignoring a malformed filter.
+    pub fn any_provider_ids(&self) -> Option<AnyProviderIds> {
+        self.any_provider_id_equals
+            .as_ref()
+            .map(|tokens| AnyProviderIds::parse(tokens))
     }
 }
 
@@ -1643,6 +1903,27 @@ where
     Ok(if items.is_empty() { None } else { Some(items) })
 }
 
+/// Mirrors `deser_csv` so `DeviceProfile` (and friends) round-trip through
+/// our own JSON storage in the same comma-separated-string shape they were
+/// deserialized from, instead of the default `Vec<T>` JSON array shape that
+/// `deser_csv` cannot read back.
+fn ser_csv<S, T>(items: &Option<Vec<T>>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+    T: std::fmt::Display,
+{
+    match items {
+        None => serializer.serialize_none(),
+        Some(items) => serializer.serialize_str(
+            &items
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        ),
+    }
+}
+
 fn deser_csv_video_containers<'de, D>(
     d: D,
 ) -> Result<Option<Vec<VideoContainer>>, D::Error>
@@ -1717,6 +1998,9 @@ pub struct VideoStreamQuery {
     pub device_id: Option<String>,
     pub audio_codec: Option<String>,
     pub video_codec: Option<String>,
+    /// Sample-entry fourcc for an HEVC stream copy (`hvc1`/`hev1`), resolved
+    /// from the client's DeviceProfile at PlaybackInfo time.
+    pub video_codec_tag: Option<String>,
     pub video_bit_rate: Option<i64>,
     pub audio_bit_rate: Option<i64>,
     pub audio_channels: Option<i64>,
@@ -1756,21 +2040,27 @@ pub struct VideoStreamQuery {
     pub live_stream_id: Option<String>,
 }
 
-#[derive(Default, Debug, Deserialize, Clone)]
+#[derive(Default, Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct TranscodingProfile {
     #[serde(deserialize_with = "deser_opt_video_container")]
     pub container: Option<VideoContainer>,
     pub protocol: Option<TranscodingProtocol>,
-    #[serde(deserialize_with = "deser_csv_video_codecs")]
+    #[serde(
+        deserialize_with = "deser_csv_video_codecs",
+        serialize_with = "ser_csv"
+    )]
     pub video_codec: Option<Vec<VideoCodec>>,
-    #[serde(deserialize_with = "deser_csv_audio_codecs")]
+    #[serde(
+        deserialize_with = "deser_csv_audio_codecs",
+        serialize_with = "ser_csv"
+    )]
     pub audio_codec: Option<Vec<AudioCodec>>,
     #[serde(rename = "Type")]
     pub type_: Option<DlnaProfileType>,
 }
 
-#[derive(Default, Debug, Deserialize, Clone)]
+#[derive(Default, Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct DeviceProfile {
     pub name: Option<String>,
@@ -1785,37 +2075,48 @@ pub struct DeviceProfile {
     pub subtitle_profiles: Vec<SubtitleProfile>,
 }
 
-#[derive(Default, Debug, Deserialize, Clone)]
+#[derive(Default, Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct DirectPlayProfile {
-    #[serde(deserialize_with = "deser_csv_video_containers")]
+    #[serde(
+        deserialize_with = "deser_csv_video_containers",
+        serialize_with = "ser_csv"
+    )]
     pub container: Option<Vec<VideoContainer>>,
-    #[serde(deserialize_with = "deser_csv_audio_codecs")]
+    #[serde(
+        deserialize_with = "deser_csv_audio_codecs",
+        serialize_with = "ser_csv"
+    )]
     pub audio_codec: Option<Vec<AudioCodec>>,
-    #[serde(deserialize_with = "deser_csv_video_codecs")]
+    #[serde(
+        deserialize_with = "deser_csv_video_codecs",
+        serialize_with = "ser_csv"
+    )]
     pub video_codec: Option<Vec<VideoCodec>>,
     #[serde(rename = "Type")]
     pub type_: Option<DlnaProfileType>,
 }
 
-#[derive(Default, Debug, Deserialize, Clone)]
+#[derive(Default, Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct ContainerProfile {
+    #[serde(rename = "Type")]
     pub type_: Option<DlnaProfileType>,
     pub container: Option<String>,
     pub conditions: Vec<ProfileCondition>,
 }
 
-#[derive(Default, Debug, Deserialize, Clone)]
+#[derive(Default, Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct CodecProfile {
+    #[serde(rename = "Type")]
     pub type_: Option<DlnaProfileType>,
-    #[serde(deserialize_with = "deser_csv_strings")]
+    #[serde(deserialize_with = "deser_csv_strings", serialize_with = "ser_csv")]
     pub codec: Option<Vec<String>>,
     pub conditions: Vec<ProfileCondition>,
 }
 
-#[derive(Default, Debug, Deserialize, Clone)]
+#[derive(Default, Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct SubtitleProfile {
     pub format: Option<String>,
@@ -1823,11 +2124,97 @@ pub struct SubtitleProfile {
     pub method: Option<SubtitleDeliveryMethod>,
 }
 
-#[derive(Default, Debug, Deserialize, Clone)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, strum_macros::EnumString, strum_macros::Display,
+)]
+#[strum(ascii_case_insensitive)]
+pub enum ProfileConditionType {
+    Equals,
+    NotEquals,
+    EqualsAny,
+    LessThanEqual,
+    GreaterThanEqual,
+    #[strum(default, to_string = "{0}")]
+    Other(String),
+}
+
+impl Serialize for ProfileConditionType {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for ProfileConditionType {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Ok(value
+            .parse()
+            .unwrap_or_else(|_| Self::Other(value)))
+    }
+}
+
+#[derive(
+    Debug, Clone, PartialEq, Eq, strum_macros::EnumString, strum_macros::Display,
+)]
+#[strum(ascii_case_insensitive)]
+pub enum ProfileConditionProperty {
+    VideoRangeType,
+    VideoCodecTag,
+    IsAnamorphic,
+    IsInterlaced,
+    #[strum(to_string = "IsAVC", serialize = "IsAVC", serialize = "IsAvc")]
+    IsAvc,
+    BitDepth,
+    RefFrames,
+    NumAudioStreams,
+    NumVideoStreams,
+    VideoLevel,
+    Level,
+    VideoProfile,
+    Profile,
+    Height,
+    Width,
+    VideoFramerate,
+    Framerate,
+    VideoBitrate,
+    Bitrate,
+    AudioBitrate,
+    AudioChannels,
+    AudioSampleRate,
+    #[strum(default, to_string = "{0}")]
+    Other(String),
+}
+
+impl Serialize for ProfileConditionProperty {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for ProfileConditionProperty {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Ok(value
+            .parse()
+            .unwrap_or_else(|_| Self::Other(value)))
+    }
+}
+
+#[derive(Default, Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct ProfileCondition {
-    pub condition: Option<String>,
-    pub property: Option<String>,
+    pub condition: Option<ProfileConditionType>,
+    pub property: Option<ProfileConditionProperty>,
     #[serde(
         default,
         deserialize_with = "crate::deserialize_option_string_from_any"
@@ -1969,6 +2356,8 @@ pub enum TranscodeReason {
     SubtitleCodecNotSupported(String),
     VideoRangeTypeNotSupported(String),
     VideoCodecTagNotSupported(String),
+    VideoProfileNotSupported(String),
+    VideoBitDepthNotSupported(String),
     ContainerBitrateExceedsLimit,
 }
 
@@ -1981,6 +2370,8 @@ impl TranscodeReason {
             Self::SubtitleCodecNotSupported(_) => "SubtitleCodecNotSupported",
             Self::VideoRangeTypeNotSupported(_) => "VideoRangeTypeNotSupported",
             Self::VideoCodecTagNotSupported(_) => "VideoCodecTagNotSupported",
+            Self::VideoProfileNotSupported(_) => "VideoProfileNotSupported",
+            Self::VideoBitDepthNotSupported(_) => "VideoBitDepthNotSupported",
             Self::ContainerBitrateExceedsLimit => "ContainerBitrateExceedsLimit",
         }
     }
@@ -2000,6 +2391,12 @@ impl std::fmt::Debug for TranscodeReason {
             }
             Self::VideoCodecTagNotSupported(d) => {
                 write!(f, "VideoCodecTagNotSupported({d})")
+            }
+            Self::VideoProfileNotSupported(d) => {
+                write!(f, "VideoProfileNotSupported({d})")
+            }
+            Self::VideoBitDepthNotSupported(d) => {
+                write!(f, "VideoBitDepthNotSupported({d})")
             }
             Self::ContainerBitrateExceedsLimit => {
                 write!(f, "ContainerBitrateExceedsLimit")
@@ -2092,6 +2489,12 @@ impl TranscodeReasons {
                 }
                 "VideoCodecTagNotSupported" => {
                     Some(TranscodeReason::VideoCodecTagNotSupported(String::new()))
+                }
+                "VideoProfileNotSupported" => {
+                    Some(TranscodeReason::VideoProfileNotSupported(String::new()))
+                }
+                "VideoBitDepthNotSupported" => {
+                    Some(TranscodeReason::VideoBitDepthNotSupported(String::new()))
                 }
                 "ContainerBitrateExceedsLimit" => {
                     Some(TranscodeReason::ContainerBitrateExceedsLimit)
@@ -2258,6 +2661,31 @@ impl MediaSourceInfo {
             .any(|s| s.index == index && matches!(s.type_, Some(t) if t == kind))
     }
 
+    /// Among subtitle streams matching `target`'s two-letter language, prefer
+    /// a text-format one (SRT/ASS/VTT/...) over an image-format one
+    /// (PGS/VobSub/DVDSub) — text works almost everywhere with no burn-in or
+    /// OCR needed, so a release with both an image and a text track in the
+    /// same language should default to the text one.
+    fn best_subtitle_for_language(&self, target: &str) -> Option<&MediaStream> {
+        let matches_lang = |s: &&MediaStream| {
+            matches!(s.type_, Some(MediaStreamType::Subtitle))
+                && s.language
+                    .as_deref()
+                    .and_then(lang_to_two_letter)
+                    .as_deref()
+                    == Some(target)
+        };
+        self.media_streams
+            .iter()
+            .filter(matches_lang)
+            .find(|s| s.is_text_subtitle_stream())
+            .or_else(|| {
+                self.media_streams
+                    .iter()
+                    .find(matches_lang)
+            })
+    }
+
     /// Resolve `default_audio_stream_index` and `default_subtitle_stream_index`
     /// for this source from the user's configuration, the request context and
     /// the container facts on the source itself. These two fields are purely
@@ -2391,18 +2819,7 @@ impl MediaSourceInfo {
             if let Some(ref pref) = user.subtitle_language_preference {
                 let pref_two = lang_to_two_letter(pref);
                 if let Some(ref target) = pref_two {
-                    if let Some(stream) = self
-                        .media_streams
-                        .iter()
-                        .find(|s| {
-                            matches!(s.type_, Some(MediaStreamType::Subtitle))
-                                && s.language
-                                    .as_deref()
-                                    .and_then(lang_to_two_letter)
-                                    .as_deref()
-                                    == Some(target.as_str())
-                        })
-                    {
+                    if let Some(stream) = self.best_subtitle_for_language(target) {
                         self.default_subtitle_stream_index = Some(stream.index);
                         subtitle_decided = true;
                     }
@@ -2417,18 +2834,7 @@ impl MediaSourceInfo {
             if let Some(pref) = server_metadata_language {
                 let pref_two = lang_to_two_letter(pref);
                 if let Some(ref target) = pref_two {
-                    if let Some(stream) = self
-                        .media_streams
-                        .iter()
-                        .find(|s| {
-                            matches!(s.type_, Some(MediaStreamType::Subtitle))
-                                && s.language
-                                    .as_deref()
-                                    .and_then(lang_to_two_letter)
-                                    .as_deref()
-                                    == Some(target.as_str())
-                        })
-                    {
+                    if let Some(stream) = self.best_subtitle_for_language(target) {
                         self.default_subtitle_stream_index = Some(stream.index);
                         subtitle_decided = true;
                     }
@@ -2555,12 +2961,39 @@ impl MediaSourceInfo {
     }
 }
 
+/// Where a `MediaSourceInfo`'s `media_streams`/container/bitrate facts came
+/// from. `Ffprobe` and `RemuxDb` are measured/matched and trustworthy —
+/// consumers may treat them as a completed probe. `FilenameGuess` is a
+/// best-effort parse of the release filename and must never count as a
+/// completed probe: it must not block a real ffprobe attempt or a RemuxDB
+/// lookup, and must never be used for playback/transcode decisions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeOrigin {
+    Ffprobe,
+    RemuxDb,
+    FilenameGuess,
+}
+
 #[dto]
 pub struct MediaSourceRemuxInfo {
     pub provider_info: Option<serde_json::Value>,
+    pub source: Option<ProbeOrigin>,
 }
 
 impl MediaSourceInfo {
+    /// True when this source's facts are a filename guess, not a completed
+    /// probe. Callers deciding whether to skip a real probe/RemuxDB lookup
+    /// must check this — `video_stream().is_some()` alone is not enough.
+    pub fn is_filename_guess(&self) -> bool {
+        matches!(
+            self.remux
+                .as_ref()
+                .and_then(|r| r.source),
+            Some(ProbeOrigin::FilenameGuess)
+        )
+    }
+
     pub fn video_stream(&self) -> Option<&MediaStream> {
         self.media_streams
             .iter()
@@ -3166,6 +3599,23 @@ pub struct UserItemDataDto {
     pub item_id: Uuid,
 }
 
+/// Request body for `POST /useritems/{id}/userdata`. Mirrors Jellyfin's
+/// `UpdateUserItemDataDto`: every field is independently optional, and each
+/// present field is applied on its own with no side effects on the others
+/// (no watched-threshold math, no cascading to parent/child rows) — see
+/// `UserDataManager.SaveUserData` in Jellyfin's own server for the reference
+/// behavior this mirrors.
+#[dto]
+pub struct UpdateUserItemDataDto {
+    pub rating: Option<f64>,
+    pub playback_position_ticks: Option<i64>,
+    pub play_count: Option<i32>,
+    pub is_favorite: Option<bool>,
+    pub likes: Option<bool>,
+    pub last_played_date: Option<DateTime<Utc>>,
+    pub played: Option<bool>,
+}
+
 #[derive(
     Default,
     Clone,
@@ -3384,8 +3834,9 @@ pub enum FilterRule {
     Favorite {
         value: bool,
     },
-    /// Matches items the requesting user has (or has not) watched (play_count > 0).
-    Watched {
+    /// Matches items the requesting user has (or has not) played (play_count > 0).
+    #[serde(alias = "watched")]
+    Played {
         value: bool,
     },
     /// Matches items whose media kind is (or is not) in the given set.
@@ -3461,6 +3912,143 @@ where
         .collect())
 }
 
+/// Overlay rendered on top of a collection's generated poster grid.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CollectionOverlay {
+    None,
+    Text {
+        /// Custom text; falls back to collection name when absent.
+        text: Option<String>,
+        /// Font size in pixels (default 80).
+        font_size: Option<u32>,
+        /// Typeface used by the overlay (defaults to Roboto).
+        font_family: Option<CollectionFontFamily>,
+        /// Weight used by the overlay (defaults to bold).
+        font_weight: Option<CollectionFontWeight>,
+    },
+    StreamingLogo {
+        provider_id: i64,
+        provider_name: Option<String>,
+        /// TMDB logo path, e.g. "/t2yyOv40HZeVlLjYsCsPHnWLk4W.jpg"
+        logo_path: Option<String>,
+    },
+}
+
+/// Typeface choices bundled for collection image text overlays.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    strum_macros::Display,
+    strum_macros::EnumString,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum CollectionFontFamily {
+    #[default]
+    #[serde(alias = "bold", alias = "regular")]
+    #[strum(serialize = "roboto", serialize = "bold", serialize = "regular")]
+    Roboto,
+    OpenSans,
+    Lato,
+    Montserrat,
+    Poppins,
+    Oswald,
+    Raleway,
+    Merriweather,
+    PlayfairDisplay,
+    BebasNeue,
+}
+
+/// Weight choices for collection image text overlays.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    strum_macros::Display,
+    strum_macros::EnumString,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum CollectionFontWeight {
+    Regular,
+    #[default]
+    Bold,
+}
+
+impl Default for CollectionOverlay {
+    fn default() -> Self {
+        CollectionOverlay::None
+    }
+}
+
+/// Layout for a collection's generated image.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    strum_macros::Display,
+    strum_macros::EnumString,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum CollectionPosterLayout {
+    /// No poster grid — the overlay is centered on a plain or custom background.
+    None,
+    /// Four-by-four poster grid, skewed as a single oversized background plane.
+    #[default]
+    #[serde(alias = "cascade", alias = "mosaic")]
+    #[strum(serialize = "grid", serialize = "cascade", serialize = "mosaic")]
+    Grid,
+    /// Clean horizontal shelf with minimal spacing.
+    Row,
+    /// Wide artistic scatter with bold angles.
+    Scatter,
+}
+
+/// Stored in `media.collection_image_config` (JSON).
+#[nutype(
+    sanitize(with = |value: String| {
+        let value = value.trim().to_string();
+        if value.starts_with('#') {
+            value
+        } else {
+            format!("#{value}")
+        }
+    }),
+    validate(regex = r"^#[0-9a-fA-F]{6}$"),
+    derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, AsRef, Deref, Display)
+)]
+pub struct HexColor(String);
+
+/// Stored in `media.collection_image_config` (JSON).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct CollectionImageConfig {
+    #[serde(default)]
+    pub overlay: CollectionOverlay,
+    #[serde(default)]
+    pub layout: CollectionPosterLayout,
+    /// Hex background color used for the generated artwork gradient.
+    #[serde(default)]
+    pub background_color: Option<HexColor>,
+}
+
 #[dto]
 pub struct RemuxInfo {
     pub collection_kind: Option<RemuxCollectionKind>,
@@ -3473,6 +4061,7 @@ pub struct RemuxInfo {
     pub latest_sort_digital: Option<bool>,
     pub collection_default_sort: Option<Vec<ItemSortBy>>,
     pub collection_default_sort_order: Option<Vec<SortOrder>>,
+    pub image_config: Option<CollectionImageConfig>,
 }
 
 #[dto]
@@ -4330,6 +4919,10 @@ pub struct HlsVideoQuery {
     #[serde(alias = "mediaSourceId")]
     pub media_source_id: Option<Uuid>,
     pub video_codec: Option<String>,
+    /// Sample-entry fourcc for an HEVC stream copy (`hvc1`/`hev1`), resolved
+    /// from the client's DeviceProfile at PlaybackInfo time and carried here
+    /// because the profile isn't available on this request.
+    pub video_codec_tag: Option<String>,
     pub audio_codec: Option<String>,
     pub segment_length: Option<i32>,
     pub start_time_ticks: Option<i64>,
@@ -4715,6 +5308,7 @@ pub struct CreatePlaylistDto {
     pub ids: Vec<Uuid>,
     pub user_id: Option<Uuid>,
     pub media_type: Option<MediaType>,
+    pub is_public: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -4722,6 +5316,7 @@ pub struct CreatePlaylistDto {
 pub struct UpdatePlaylistDto {
     pub name: Option<String>,
     pub ids: Option<Vec<Uuid>>,
+    pub is_public: Option<bool>,
 }
 
 impl Endpoint for PublicSystemInfo {
@@ -4901,10 +5496,10 @@ impl Endpoint for GetJellyfinItemsByIds {
 
     fn query_params(&self) -> impl serde::Serialize + '_ {
         #[derive(Serialize)]
+        #[serde(rename_all = "PascalCase")]
         struct Q<'a> {
-            #[serde(rename = "Ids", serialize_with = "serialize_comma")]
+            #[serde(serialize_with = "serialize_comma")]
             ids: &'a [String],
-            #[serde(rename = "Fields")]
             fields: &'static str,
         }
         Q {
@@ -4929,6 +5524,8 @@ impl Endpoint for GetJellyfinUsers {
 pub struct GetJellyfinUserItems {
     pub user_id: String,
     pub filter: &'static str,
+    pub start_index: i32,
+    pub limit: i32,
 }
 
 impl Endpoint for GetJellyfinUserItems {
@@ -4940,21 +5537,22 @@ impl Endpoint for GetJellyfinUserItems {
 
     fn query_params(&self) -> impl serde::Serialize + '_ {
         #[derive(Serialize)]
+        #[serde(rename_all = "PascalCase")]
         struct Q<'a> {
-            #[serde(rename = "Recursive")]
             recursive: bool,
-            #[serde(rename = "Fields")]
             fields: &'static str,
-            #[serde(rename = "IncludeItemTypes")]
             include_item_types: &'static str,
-            #[serde(rename = "Filters")]
             filters: &'a str,
+            start_index: i32,
+            limit: i32,
         }
         Q {
             recursive: true,
             fields: "ProviderIds,SeriesProviderIds,UserData,SeriesId,Overview,ProductionYear,RunTimeTicks",
             include_item_types: "Movie,Series,Episode",
             filters: self.filter,
+            start_index: self.start_index,
+            limit: self.limit,
         }
     }
 }
@@ -5381,6 +5979,44 @@ impl Endpoint for UploadItemImage {
     }
 }
 
+/// Render a collection's generated image from draft, unsaved config/filter —
+/// nothing is persisted server-side. Used for the dashboard's live preview so
+/// it never has to PATCH the real collection just to see what a change would
+/// produce; only the real save action does that.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct PreviewCollectionImagePayload {
+    pub image_config: CollectionImageConfig,
+    pub smart_filter: Option<CollectionFilter>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PreviewCollectionImage {
+    pub item_id: String,
+    pub payload: PreviewCollectionImagePayload,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollectionImagePreviewResponse {
+    pub content_type: String,
+    /// Base64-encoded image bytes — the shared HTTP client always reads
+    /// responses as JSON text, so raw binary can't go back as the body.
+    pub data: String,
+}
+
+impl Endpoint for PreviewCollectionImage {
+    type Output = CollectionImagePreviewResponse;
+    fn path(&self) -> String {
+        format!("/items/{}/imagepreview", self.item_id)
+    }
+    fn method(&self) -> Method {
+        Method::POST
+    }
+    fn body(&self) -> Body {
+        Body::Json(serde_json::to_value(&self.payload).unwrap_or_default())
+    }
+}
+
 /// Delete an image for a library item (DELETE /Items/{id}/Images/{type}).
 #[derive(Debug, Clone)]
 pub struct DeleteItemImage {
@@ -5594,9 +6230,7 @@ impl Endpoint for GetItemCounts {
 
 #[dto]
 pub struct MetricsStatus {
-    pub daily_days: i64,
     pub last_updated_days_ago: Option<i64>,
-    pub item_count: i64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -6373,6 +7007,12 @@ pub enum StreamRule {
         op: SetOp,
         values: Vec<String>,
     },
+    /// The configured addon that produced this stream. A stream whose addon is
+    /// unknown passes the rule so it isn't silently dropped.
+    Addon {
+        op: SetOp,
+        values: Vec<Uuid>,
+    },
 }
 
 /// Filter stored on a StreamGroup; analogous to CollectionFilter but evaluated
@@ -6555,9 +7195,88 @@ pub struct RefreshItemQuery {
     pub regenerate_trickplay: bool,
 }
 
+// ---------------------------------------------------------------------------
+// Remux extension endpoints
+// ---------------------------------------------------------------------------
+
+/// `GET /remux/watch-providers`
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WatchProviderItem {
+    #[serde(rename = "provider_id", alias = "providerId")]
+    pub provider_id: i64,
+    #[serde(rename = "provider_name", alias = "providerName")]
+    pub provider_name: String,
+    #[serde(rename = "logo_path", alias = "logoPath")]
+    pub logo_path: Option<String>,
+    pub color: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct GetWatchProviders;
+
+impl Endpoint for GetWatchProviders {
+    type Output = Vec<WatchProviderItem>;
+    fn path(&self) -> String {
+        "/remux/watch-providers".into()
+    }
+}
+
+/// `POST /remux/collections/{id}/image/regenerate`
+#[derive(Debug, Clone)]
+pub struct RegenerateCollectionImage {
+    pub item_id: String,
+}
+
+impl Endpoint for RegenerateCollectionImage {
+    type Output = ();
+    fn path(&self) -> String {
+        format!("/remux/collections/{}/image/regenerate", self.item_id)
+    }
+    fn method(&self) -> Method {
+        Method::POST
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn webhook_destination_round_trips_as_tagged_config() {
+        let destination = WebhookDestination::Http(HttpWebhookConfig {
+            url: "https://example.com/hook".to_string(),
+            headers: HashMap::from([(
+                "Authorization".to_string(),
+                "Bearer token".to_string(),
+            )]),
+        });
+        let json = serde_json::to_value(&destination).unwrap();
+        assert_eq!(json["kind"], "http");
+        assert_eq!(json["config"]["url"], "https://example.com/hook");
+        assert_eq!(json["config"]["headers"]["Authorization"], "Bearer token");
+        assert_eq!(
+            serde_json::from_value::<WebhookDestination>(json).unwrap(),
+            destination
+        );
+    }
+
+    #[test]
+    fn get_items_query_deserializes_any_provider_id_equals() {
+        let q: GetItemsQuery = serde_json::from_value(serde_json::json!({
+            "AnyProviderIdEquals": "Tmdb.27205,Imdb.tt1375666"
+        }))
+        .unwrap();
+        assert_eq!(
+            q.any_provider_id_equals
+                .as_deref(),
+            Some(["Tmdb.27205".to_string(), "Imdb.tt1375666".to_string()].as_slice())
+        );
+        let ids = q
+            .any_provider_ids()
+            .unwrap();
+        assert_eq!(ids.tmdb, vec![27205]);
+        assert_eq!(ids.imdb, vec!["tt1375666".to_string()]);
+    }
 
     #[test]
     fn user_policy_does_not_advertise_unimplemented_sync_play() {
@@ -6870,6 +7589,53 @@ mod tests {
         assert_eq!(src.default_subtitle_stream_index, Some(4));
     }
 
+    /// A release with both a PGS (image) and an SRT (text) track in the same
+    /// language must default to the text one — it works almost everywhere
+    /// with no burn-in/OCR needed, unlike the image track. True regardless of
+    /// which one happens to come first in the container's stream order.
+    #[test]
+    fn resolve_subtitle_prefers_text_over_image_in_same_language() {
+        fn source(image_first: bool) -> MediaSourceInfo {
+            let image = MediaStream {
+                type_: Some(MediaStreamType::Subtitle),
+                index: 0,
+                language: Some("eng".to_string()),
+                codec: Some("pgssub".to_string()),
+                ..Default::default()
+            };
+            let text = MediaStream {
+                type_: Some(MediaStreamType::Subtitle),
+                index: 1,
+                language: Some("eng".to_string()),
+                codec: Some("subrip".to_string()),
+                ..Default::default()
+            };
+            MediaSourceInfo {
+                media_streams: if image_first {
+                    vec![image, text]
+                } else {
+                    vec![text, image]
+                },
+                ..Default::default()
+            }
+        }
+        let mut cfg = user_cfg();
+        cfg.subtitle_language_preference = Some("eng".to_string());
+
+        let mut image_first = source(true);
+        image_first.resolve_default_streams(&cfg, None, None, None, None, None, None);
+        assert_eq!(
+            image_first.default_subtitle_stream_index,
+            Some(1),
+            "text (index 1) must win even though the image track (index 0) \
+             comes first"
+        );
+
+        let mut text_first = source(false);
+        text_first.resolve_default_streams(&cfg, None, None, None, None, None, None);
+        assert_eq!(text_first.default_subtitle_stream_index, Some(1));
+    }
+
     /// Server metadata language is the fallback when the user has no preference.
     #[test]
     fn resolve_server_language_fallback() {
@@ -7113,5 +7879,28 @@ mod tests {
             json.contains(r#""Artists":[]"#),
             "Expected 'Artists':[] in JSON: {json}"
         );
+    }
+
+    #[test]
+    fn profile_condition_vocabulary_round_trips_known_and_unknown_values() {
+        let profile: ProfileCondition = serde_json::from_value(serde_json::json!({
+            "Condition": "LessThanEqual",
+            "Property": "FutureJellyfinProperty",
+            "Value": "42",
+            "IsRequired": true
+        }))
+        .unwrap();
+
+        assert_eq!(profile.condition, Some(ProfileConditionType::LessThanEqual));
+        assert_eq!(
+            profile.property,
+            Some(ProfileConditionProperty::Other(
+                "FutureJellyfinProperty".to_string()
+            ))
+        );
+
+        let json = serde_json::to_value(profile).unwrap();
+        assert_eq!(json["Condition"], "LessThanEqual");
+        assert_eq!(json["Property"], "FutureJellyfinProperty");
     }
 }

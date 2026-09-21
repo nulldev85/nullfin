@@ -29,7 +29,7 @@ run_task = { name = ["dev-server", "dev-build-dash"], fork = true, parallel = tr
 [tasks.dev-server]
 command = "cargo"
 args = ["run" , "-p", "remux-server"]
-watch = true
+watch = { watch = ["${PWD}/crates"] }
 #cwd = "crates/server"
 
 [tasks.dev-serve-dash]
@@ -70,7 +70,7 @@ args = ["buildx", "build", "--network", "host", "-f", "docker/Dockerfile", "-t",
 [tasks.jellyfin-web-checkout]
 description = "Clone jellyfin-web if not already present"
 script = '''
-JELLYFIN_WEB_TAG="v10.11.9"
+JELLYFIN_WEB_TAG="v10.11.11"
 if [ ! -d "jellyfin-web" ]; then
   git clone --depth 1 --branch "$JELLYFIN_WEB_TAG" https://github.com/jellyfin/jellyfin-web.git jellyfin-web
 else
