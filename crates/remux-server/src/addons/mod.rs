@@ -2662,7 +2662,7 @@ impl AddonService {
                 .search(kind, query, limit, ctx)
                 .await
             {
-                Ok(Some(mut results)) => {
+                Ok(Some(mut results)) if !results.is_empty() => {
                     db::Media::adopt_existing_rows(&ctx.db, &mut results).await;
                     for m in &results {
                         ctx.store
@@ -2674,6 +2674,7 @@ impl AddonService {
                     }
                     return Ok(results);
                 }
+                Ok(Some(_)) => continue,
                 Ok(None) => continue,
                 Err(e) => {
                     warn!(addon = %r.row.name, error = %e, "search addon error")
