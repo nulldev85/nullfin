@@ -1615,40 +1615,31 @@ pub async fn item(
     item_for_user(state, session, id, fields, None).await
 }
 
-fn rank_item_sources(
+async fn rank_item_sources(
+    db: &sqlx::SqlitePool,
     sources: &mut [db::Media],
     ranking: SourceRankingContext<'_>,
     user_cfg: &api::UserConfiguration,
     server_metadata_language: Option<&str>,
     original_language: Option<&str>,
+    remembered_audio: Option<i64>,
+    remembered_subtitle: Option<i64>,
 ) {
-    if ranking.mode == remux_sdks::remux::SortMediaSourcesMode::Disabled
-        || sources.len() < 2
-        || sources
-            .iter()
-            .any(|source| {
-                source
-                    .group_id
-                    .is_some()
-            })
-    {
-        return;
-    }
-
-    sources.sort_by_cached_key(|source| {
-        let mut info = api::MediaSourceInfo::from(source.clone());
-        crate::conversions::apply_filename_guess(&mut info, source);
-        info.resolve_default_streams(
+    crate::services::StreamService::rank_media_sources(
+        db,
+        sources,
+        ranking,
+        crate::services::DefaultStreamPrefs {
             user_cfg,
             server_metadata_language,
             original_language,
-            None,
-            None,
-            None,
-            None,
-        );
-        std::cmp::Reverse(ranking.key(&info))
-    });
+            requested_audio: None,
+            requested_subtitle: None,
+            remembered_audio,
+            remembered_subtitle,
+        },
+    )
+    .await;
 }
 
 async fn item_for_user(
@@ -1740,6 +1731,14 @@ async fn item_for_user(
     )
     .await;
 
+    // Same remembered track selections PlaybackInfo resolves with, so both
+    // endpoints rank and default sources identically.
+    let (remembered_audio, remembered_subtitle) = media
+        .user_state
+        .as_ref()
+        .map(|s| (s.audio_idx, s.subtitle_idx))
+        .unwrap_or_default();
+
     let needs_streams = want_streams
         && matches!(
             media.kind,
@@ -1757,12 +1756,20 @@ async fn item_for_user(
             c.0.clone()
         })
         .unwrap_or_default();
-    let persisted_device_profile = session
-        .device
-        .parsed_device_profile();
+    let persisted_device_profile =
+        crate::jellyfin_client::merge_device_profile_subtitles(
+            &session.device,
+            session
+                .device
+                .parsed_device_profile(),
+        );
 
+    // Items detail itself never shows subtitles (embedded or addon external —
+    // see the media_streams-stripping block below), but it still warms the
+    // segment cache in the background so the PlaybackInfo call that follows a
+    // few seconds later doesn't pay the cold-fetch cost.
     if needs_streams {
-        if media.kind == db::MediaKind::Movie || media.kind == db::MediaKind::Episode {
+        if matches!(media.kind, db::MediaKind::Movie | db::MediaKind::Episode) {
             warm_providers_cache(&state.ctx, &media);
         }
         state
@@ -1858,14 +1865,24 @@ async fn item_for_user(
                 .as_mut()
             {
                 rank_item_sources(
+                    &state
+                        .ctx
+                        .db,
                     sources,
                     SourceRankingContext {
                         mode: server_config
                             .sort_media_sources
                             .unwrap_or_default(),
                         device_profile: persisted_device_profile.as_ref(),
+                        is_4k_capable: session
+                            .device
+                            .is_4k_capable
+                            == Some(true),
                         subtitle_mode,
                         explicit_subtitle_index: None,
+                        max_bitrate: persisted_device_profile
+                            .as_ref()
+                            .and_then(|p| p.max_streaming_bitrate),
                     },
                     &user_cfg,
                     server_config
@@ -1874,7 +1891,10 @@ async fn item_for_user(
                     media
                         .original_language
                         .as_deref(),
-                );
+                    remembered_audio,
+                    remembered_subtitle,
+                )
+                .await;
             }
         }
 
@@ -1929,14 +1949,24 @@ async fn item_for_user(
                 .as_mut()
             {
                 rank_item_sources(
+                    &state
+                        .ctx
+                        .db,
                     sources,
                     SourceRankingContext {
                         mode: server_config
                             .sort_media_sources
                             .unwrap_or_default(),
                         device_profile: persisted_device_profile.as_ref(),
+                        is_4k_capable: session
+                            .device
+                            .is_4k_capable
+                            == Some(true),
                         subtitle_mode,
                         explicit_subtitle_index: None,
+                        max_bitrate: persisted_device_profile
+                            .as_ref()
+                            .and_then(|p| p.max_streaming_bitrate),
                     },
                     &user_cfg,
                     server_config
@@ -1945,7 +1975,10 @@ async fn item_for_user(
                     media
                         .original_language
                         .as_deref(),
-                );
+                    remembered_audio,
+                    remembered_subtitle,
+                )
+                .await;
             }
         }
 
@@ -2013,6 +2046,28 @@ async fn item_for_user(
         }]);
     }
 
+    // Items detail never advertises subtitle tracks — neither embedded (from
+    // probe data) nor addon-external. Addon subtitle fetches are the slow
+    // part of building this response (multi-second network round trips per
+    // addon), most clients never surface subtitles on a details page anyway,
+    // and every real client calls PlaybackInfo before it actually starts
+    // playback — that's the one place subtitles (embedded + external) get
+    // advertised, with indexes that stay consistent with the download
+    // endpoint. Strip rather than just not-append, so a stale/cached embedded
+    // subtitle entry from probe data doesn't leak through either.
+    if want_streams
+        && matches!(media.kind, db::MediaKind::Movie | db::MediaKind::Episode)
+    {
+        if let Some(ref mut sources) = base_item.media_sources {
+            for source in sources.iter_mut() {
+                source
+                    .media_streams
+                    .retain(|s| s.type_ != Some(api::MediaStreamType::Subtitle));
+                source.default_subtitle_stream_index = None;
+            }
+        }
+    }
+
     if want_streams {
         if let Some(ref mut sources) = base_item.media_sources {
             // Default audio/subtitle stream indexes are per-request API values
@@ -2030,8 +2085,8 @@ async fn item_for_user(
                         .as_deref(),
                     None,
                     None,
-                    None,
-                    None,
+                    remembered_audio,
+                    remembered_subtitle,
                 );
             }
         }
@@ -2055,15 +2110,21 @@ async fn item_for_user(
                     .sort_media_sources
                     .unwrap_or_default(),
                 device_profile: Some(device_profile),
+                is_4k_capable: session
+                    .device
+                    .is_4k_capable
+                    == Some(true),
                 subtitle_mode,
                 explicit_subtitle_index: None,
+                max_bitrate: device_profile.max_streaming_bitrate,
             };
             if let Some(sources) = base_item
                 .media_sources
                 .as_mut()
             {
                 for source in sources.iter_mut() {
-                    let assessment = ranking.assess(source);
+                    let assessment = // Subtitle streams were stripped above, so extraction feasibility is moot.
+                    ranking.assess(source, false);
                     let source_bitrate = source.bitrate;
                     if let Some(video) = source
                         .media_streams
@@ -2699,6 +2760,18 @@ pub async fn genres(
         .as_ref()
         .and_then(|p| p.parse_smart_filter())
         .cloned();
+    // Jellyfin only computes ItemCounts when asked — matches its own cost
+    // tradeoff (four extra aggregate queries) and keeps the default response
+    // shape unchanged for clients that don't request it.
+    let want_item_counts = q
+        .fields
+        .as_deref()
+        .map(|f| f.contains(&api::ItemFields::ItemCounts))
+        .unwrap_or(false);
+    let policy = session
+        .user
+        .policy
+        .as_ref();
 
     let result = db::Media::get_by_filter(
         &state
@@ -2709,10 +2782,17 @@ pub async fn genres(
             limit: q.limit,
             offset: q.start_index,
             total_count: true,
+            include_child_count: want_item_counts,
             genre_related_kinds,
             parent_id: q.parent_id,
             parent,
             filter_rules: smart_filter,
+            policy_filter: policy
+                .and_then(|p| {
+                    p.filter_rules
+                        .as_ref()
+                })
+                .cloned(),
             user_id: Some(
                 session
                     .user
@@ -2747,7 +2827,7 @@ pub async fn genres(
 #[get("/musicgenres")]
 pub async fn music_genres(
     State(state): State<AppState>,
-    _session: auth::AuthSession,
+    session: auth::AuthSession,
     Query(q): Query<api::GetItemsQuery>,
 ) -> Result<impl IntoResponse> {
     let genre_related_kinds = if q
@@ -2762,6 +2842,15 @@ pub async fn music_genres(
     } else {
         None
     };
+    let want_item_counts = q
+        .fields
+        .as_deref()
+        .map(|f| f.contains(&api::ItemFields::ItemCounts))
+        .unwrap_or(false);
+    let policy = session
+        .user
+        .policy
+        .as_ref();
 
     let result = db::Media::get_by_filter(
         &state
@@ -2772,7 +2861,19 @@ pub async fn music_genres(
             limit: q.limit,
             offset: q.start_index,
             total_count: true,
+            include_child_count: want_item_counts,
             genre_related_kinds,
+            policy_filter: policy
+                .and_then(|p| {
+                    p.filter_rules
+                        .as_ref()
+                })
+                .cloned(),
+            user_id: Some(
+                session
+                    .user
+                    .id,
+            ),
             sort_by: q
                 .sort_by
                 .unwrap_or_default(),
@@ -3236,15 +3337,43 @@ pub async fn update_item(
     }
 
     if let Some(people) = &payload.people {
-        db::MediaRelation::delete_by_right_kinds(
-            &state
-                .ctx
-                .db,
-            id,
-            &[db::MediaKind::Person],
-        )
-        .await?;
+        let mut person_rels: Vec<db::MediaRelation> = Vec::new();
         if !people.is_empty() {
+            // A supplied Id must point at an existing person; otherwise the
+            // replace below would drop the old People for a bogus relation.
+            let supplied_ids: Vec<Uuid> = people
+                .iter()
+                .filter_map(|p| p.id)
+                .collect();
+            let mut known_ids = std::collections::HashSet::new();
+            for chunk in supplied_ids.chunks(50) {
+                let mut qb = sqlx::QueryBuilder::new(
+                    "SELECT id FROM media WHERE kind = 'person' AND id IN (",
+                );
+                let mut sep = qb.separated(", ");
+                for pid in chunk {
+                    sep.push_bind(*pid);
+                }
+                qb.push(")");
+                let rows: Vec<Uuid> = qb
+                    .build_query_scalar()
+                    .fetch_all(
+                        &state
+                            .ctx
+                            .db,
+                    )
+                    .await
+                    .context_internal("Failed to look up people")?;
+                known_ids.extend(rows);
+            }
+            if let Some(bad) = supplied_ids
+                .iter()
+                .find(|pid| !known_ids.contains(*pid))
+            {
+                return Err(anyhow::anyhow!("{bad} is not a person"))
+                    .context_bad_request("People contains an Id that is not a person");
+            }
+
             // Resolve person IDs: prefer the Id supplied by the client (which the
             // client echoes back from our own response), then fall back to a name
             // lookup so we don't create a duplicate record and lose images.
@@ -3281,7 +3410,7 @@ pub async fn update_item(
                                     .db,
                             )
                             .await
-                            .unwrap_or_default();
+                            .context_internal("Failed to look up people")?;
                         for (pid, title) in rows {
                             map.insert(title.to_lowercase(), pid);
                         }
@@ -3290,7 +3419,6 @@ pub async fn update_item(
                 };
 
             let mut person_medias: Vec<db::Media> = Vec::new();
-            let mut person_rels: Vec<db::MediaRelation> = Vec::new();
             for (i, p) in people
                 .iter()
                 .enumerate()
@@ -3357,19 +3485,21 @@ pub async fn update_item(
                     &person_medias,
                 )
                 .await
-                .inspect_err(|e| warn!(error = %e, "failed to upsert person media"))
-                .ok();
+                .context_internal("Failed to save people")?;
             }
-            db::MediaRelation::upsert(
-                &state
-                    .ctx
-                    .db,
-                &person_rels,
-            )
-            .await
-            .inspect_err(|e| warn!(error = %e, "failed to upsert person relations"))
-            .ok();
         }
+        // Delete + insert in one transaction: dropping this request (client
+        // disconnect/timeout) or a failed insert keeps the old People.
+        db::MediaRelation::replace_by_right_kinds(
+            &state
+                .ctx
+                .db,
+            id,
+            &[db::MediaKind::Person],
+            &person_rels,
+        )
+        .await
+        .context_internal("Failed to update people")?;
     }
 
     Ok(StatusCode::NO_CONTENT)
@@ -3569,14 +3699,19 @@ pub async fn patch_item(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Background-warms the caches PlaybackInfo will hit right after this item is
+/// opened. Subtitles aren't warmed: they're fetched per release while the
+/// stream is probed, so there's nothing item-level to warm.
 fn warm_providers_cache(ctx: &crate::AppContext, media: &db::Media) {
+    // Live TV sources do not have intro markers or a parent metadata tree to
+    // warm. Avoid a pointless addon fan-out whenever
+    // a client opens a channel/program detail page.
+    if media.is_live() {
+        return;
+    }
     let mut media = media.clone();
     let ctx = ctx.clone();
     tokio::spawn(async move {
-        let _ = ctx
-            .addons
-            .fetch_subtitles(&mut media, &ctx.db, true, None)
-            .await;
         let _ = media
             .grandparent(&ctx.db)
             .await;
@@ -4091,6 +4226,297 @@ mod tests {
 
         assert_eq!(names, vec!["Official Video"]);
         assert_eq!(response["TotalRecordCount"], 1);
+    }
+
+    #[tokio::test]
+    async fn genres_populate_movie_and_series_item_counts() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let db = &guard
+            .0
+            .db;
+
+        // Genre rows key off `stable_media_uuid(kind, name)`, which is
+        // deterministic and process-wide (in-memory SQLite tests run inside
+        // the same process) — a common name like "Action" can land on the
+        // same row another parallel test's fixtures also tag, inflating the
+        // count this test observes. A unique name avoids that collision.
+        let genre_name = format!("ItemCountsAction-{}", Uuid::new_v4());
+        let movie_a =
+            insert_media(db, "Movie A", db::MediaKind::Movie, "tt2000001").await;
+        let movie_b =
+            insert_media(db, "Movie B", db::MediaKind::Movie, "tt2000002").await;
+        let series_a =
+            insert_media(db, "Series A", db::MediaKind::Series, "tt2000003").await;
+        add_genre(db, movie_a.id, &genre_name).await;
+        add_genre(db, movie_b.id, &genre_name).await;
+        add_genre(db, series_a.id, &genre_name).await;
+
+        let response: serde_json::Value = server
+            .get("/genres")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .add_query_param("Fields", "ItemCounts")
+            .await
+            .json();
+        let action = response["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["Name"] == genre_name)
+            .expect("genre missing from response");
+
+        assert_eq!(action["ChildCount"], 3);
+        assert_eq!(action["MovieCount"], 2);
+        assert_eq!(action["SeriesCount"], 1);
+    }
+
+    #[tokio::test]
+    async fn genres_item_counts_default_to_zero_not_null() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let db = &guard
+            .0
+            .db;
+
+        // Movie-only genre: SeriesCount must come back as 0, not null —
+        // there's simply no relation row for the aggregate query to return.
+        let genre_name = format!("ItemCountsMovieOnly-{}", Uuid::new_v4());
+        let movie_a =
+            insert_media(db, "Movie A", db::MediaKind::Movie, "tt2100001").await;
+        add_genre(db, movie_a.id, &genre_name).await;
+
+        let response: serde_json::Value = server
+            .get("/genres")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .add_query_param("Fields", "ItemCounts")
+            .await
+            .json();
+        let genre = response["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["Name"] == genre_name)
+            .expect("genre missing from response");
+
+        assert_eq!(genre["MovieCount"], 1);
+        assert_eq!(
+            genre["SeriesCount"], 0,
+            "a genre with no series should report 0, not null: {genre}"
+        );
+        assert_eq!(genre["ChildCount"], 1);
+    }
+
+    #[tokio::test]
+    async fn genres_omit_item_counts_without_fields_param() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let db = &guard
+            .0
+            .db;
+
+        let genre_name = format!("ItemCountsUnrequested-{}", Uuid::new_v4());
+        let movie_a =
+            insert_media(db, "Movie A", db::MediaKind::Movie, "tt2100002").await;
+        add_genre(db, movie_a.id, &genre_name).await;
+
+        // No Fields=ItemCounts this time.
+        let response: serde_json::Value = server
+            .get("/genres")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await
+            .json();
+        let genre = response["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["Name"] == genre_name)
+            .expect("genre missing from response");
+
+        assert!(
+            genre["ChildCount"].is_null(),
+            "counts should stay null when the client didn't ask for them: {genre}"
+        );
+        assert!(genre["MovieCount"].is_null());
+    }
+
+    #[tokio::test]
+    async fn genres_scoped_to_smart_collection_only_count_matching_items() {
+        // Mirrors genres_for_smart_collection_only_include_matching_items'
+        // setup (catalog-filtered smart collection), but checks the *count*
+        // rather than just which genres are returned: a genre shared by an
+        // item inside and an item outside the collection's filter must only
+        // count the one inside it, not both.
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let db = &guard
+            .0
+            .db;
+        let catalog_id = Uuid::new_v4();
+
+        let genre_name = format!("ItemCountsScoped-{}", Uuid::new_v4());
+        let collection = insert_smart_collection_with_filter(
+            db,
+            "Scoped Movies",
+            db::CollectionMediaKind::Movie,
+            Some(catalog_filter(catalog_id)),
+        )
+        .await;
+        let in_scope =
+            insert_media(db, "In Scope", db::MediaKind::Movie, "tt2100003").await;
+        let out_of_scope =
+            insert_media(db, "Out Of Scope", db::MediaKind::Movie, "tt2100004").await;
+        db::MediaRelation::upsert(
+            db,
+            &[db::MediaRelation {
+                left_media_id: catalog_id,
+                right_media_id: in_scope.id,
+                role: Some(db::RelationRole::Catalog),
+                ..Default::default()
+            }],
+        )
+        .await
+        .unwrap();
+        add_genre(db, in_scope.id, &genre_name).await;
+        add_genre(db, out_of_scope.id, &genre_name).await;
+
+        let response: serde_json::Value = server
+            .get("/genres")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .add_query_param(
+                "ParentId",
+                collection
+                    .id
+                    .to_string(),
+            )
+            .add_query_param("Fields", "ItemCounts")
+            .await
+            .json();
+        let genre = response["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["Name"] == genre_name)
+            .expect("genre missing from response");
+
+        assert_eq!(
+            genre["MovieCount"], 1,
+            "count must be scoped to the collection's filter, not global: {genre}"
+        );
+        assert_eq!(genre["ChildCount"], 1);
+    }
+
+    /// Tracks/albums validate on `deezer_track`/`deezer_album` (or
+    /// `youtube_id`), not `imdb` like `insert_media` assumes — a distinct
+    /// helper avoids threading kind-specific external IDs through it.
+    async fn insert_music_media(
+        db: &sqlx::SqlitePool,
+        title: &str,
+        kind: db::MediaKind,
+        deezer_id: i64,
+    ) -> db::Media {
+        let now = Utc::now().naive_utc();
+        let ext = match kind {
+            db::MediaKind::Track => ExternalIds {
+                deezer_track: Some(deezer_id),
+                ..Default::default()
+            },
+            db::MediaKind::Album => ExternalIds {
+                deezer_album: Some(deezer_id),
+                ..Default::default()
+            },
+            _ => panic!("insert_music_media only supports Track/Album"),
+        };
+        let mut m = db::Media {
+            id: Uuid::new_v4(),
+            title: title.to_string(),
+            kind,
+            external_ids: ext,
+            created_at: now,
+            updated_at: now,
+            ..Default::default()
+        };
+        m.save(db)
+            .await
+            .expect("insert_music_media failed");
+        m
+    }
+
+    async fn add_music_genre(db: &sqlx::SqlitePool, media_id: Uuid, genre: &str) {
+        let pairs = db::build_genre_relations_from_names(
+            media_id,
+            &[genre.to_string()],
+            db::MediaKind::MusicGenre,
+        );
+        let genres: Vec<_> = pairs
+            .iter()
+            .map(|(_, media)| media.clone())
+            .collect();
+        let relations: Vec<_> = pairs
+            .into_iter()
+            .map(|(relation, _)| relation)
+            .collect();
+        db::Media::upsert(db, &genres)
+            .await
+            .unwrap();
+        db::MediaRelation::upsert(db, &relations)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn music_genres_populate_song_and_album_item_counts() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let db = &guard
+            .0
+            .db;
+
+        // See the comment in genres_populate_movie_and_series_item_counts:
+        // genre rows are keyed by a deterministic, process-wide UUID, so a
+        // common name like "Synthwave" risks colliding with another
+        // parallel test's fixtures. A unique name avoids that.
+        let genre_name = format!("ItemCountsSynthwave-{}", Uuid::new_v4());
+        let track_a =
+            insert_music_media(db, "Track A", db::MediaKind::Track, 2000001).await;
+        let track_b =
+            insert_music_media(db, "Track B", db::MediaKind::Track, 2000002).await;
+        let album_a =
+            insert_music_media(db, "Album A", db::MediaKind::Album, 2000003).await;
+        add_music_genre(db, track_a.id, &genre_name).await;
+        add_music_genre(db, track_b.id, &genre_name).await;
+        add_music_genre(db, album_a.id, &genre_name).await;
+
+        let response: serde_json::Value = server
+            .get("/musicgenres")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .add_query_param("Fields", "ItemCounts")
+            .await
+            .json();
+        let synthwave = response["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["Name"] == genre_name)
+            .expect("genre missing from response");
+
+        assert_eq!(synthwave["ChildCount"], 3);
+        assert_eq!(synthwave["SongCount"], 2);
+        assert_eq!(synthwave["AlbumCount"], 1);
     }
 
     async fn insert_smart_collection(
@@ -5185,11 +5611,14 @@ mod tests {
         media
     }
 
-    /// The Items endpoint (detail page) must apply the server's global
-    /// preferred_metadata_language as a subtitle fallback when the user has no
-    /// subtitle language preference.
+    /// Items detail deliberately never shows subtitle tracks — addon subtitle
+    /// fetches are slow network round trips and most clients never surface
+    /// subtitles on a details page anyway. Only PlaybackInfo (called when a
+    /// client actually starts playback) advertises them. This must hold even
+    /// when embedded subtitle streams are present in probe data and a server
+    /// metadata-language fallback would otherwise pick one as default.
     #[tokio::test]
-    async fn test_items_detail_applies_server_metadata_language_subtitle_fallback() {
+    async fn test_items_detail_never_shows_subtitle_tracks() {
         use crate::{api::ServerConfiguration, db::Settings};
 
         let (server, guard, token) = authenticated_server().await;
@@ -5218,10 +5647,20 @@ mod tests {
 
         resp.assert_status_ok();
         let body: serde_json::Value = resp.json();
+        let streams = body["MediaSources"][0]["MediaStreams"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            streams
+                .iter()
+                .all(|s| s["Type"] != "Subtitle"),
+            "Items detail must never include subtitle streams, even embedded ones from probe data"
+        );
         assert_eq!(
-            body["MediaSources"][0]["DefaultSubtitleStreamIndex"].as_i64(),
-            Some(2),
-            "detail page should fall back to server preferred_metadata_language 'fr' (French subtitle, index 2) when the user has no subtitle language preference"
+            body["MediaSources"][0]["DefaultSubtitleStreamIndex"],
+            serde_json::Value::Null,
+            "Items detail must never set a default subtitle stream index"
         );
     }
 
@@ -6482,5 +6921,296 @@ mod tests {
                 .map(|items| items.is_empty())
                 .unwrap_or(false)
         );
+    }
+
+    /// Dropping POST /items/{id} part-way (the client disconnects or times
+    /// out, so the handler future is dropped) must leave the old People or
+    /// the new ones, never none. The delete and the insert used to be
+    /// separate writes with other awaits in between.
+    #[tokio::test]
+    async fn update_item_people_survive_a_dropped_request() {
+        use std::future::IntoFuture;
+
+        // A real file-backed DB (WAL, pooled), like production: sqlx discards
+        // a connection whose query future was dropped, and an in-memory DB
+        // would vanish with it.
+        let dir = tempfile::tempdir().unwrap();
+        let (server, guard) =
+            crate::integration_test::new_test_server_with_config(crate::Config {
+                database_url: Some(format!(
+                    "sqlite://{}?mode=rwc",
+                    dir.path()
+                        .join("remux.db")
+                        .display()
+                )),
+                torrent_http_port: None,
+                torrent_peer_port: None,
+                disable_dht: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let token = server
+            .post("/users/authenticatebyname")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_static(crate::integration_test::AUTH_HEADER),
+            )
+            .json(&serde_json::json!({ "Username": "test", "Pw": "test" }))
+            .await
+            .json::<serde_json::Value>()["AccessToken"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let auth = auth_header_with_token(&token);
+        let db = &guard
+            .0
+            .db;
+        let series = insert_media(
+            db,
+            "Dropped Update Series",
+            db::MediaKind::Series,
+            "tt1000901",
+        )
+        .await;
+
+        let now = Utc::now().naive_utc();
+        let mut people = Vec::new();
+        for i in 0..4 {
+            let mut p = db::Media {
+                id: Uuid::new_v4(),
+                title: format!("Person {i}"),
+                kind: db::MediaKind::Person,
+                created_at: now,
+                updated_at: now,
+                ..Default::default()
+            };
+            p.save(db)
+                .await
+                .unwrap();
+            people.push(p);
+        }
+
+        async fn person_count(db: &sqlx::SqlitePool, id: Uuid) -> i64 {
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM media_relations r JOIN media m ON m.id = r.right_media_id \
+                 WHERE r.left_media_id = ? AND m.kind = 'person'",
+            )
+            .bind(id)
+            .fetch_one(db)
+            .await
+            .unwrap()
+        }
+
+        // Old list: the first three people. New list: all four.
+        let body = serde_json::json!({
+            "People": people
+                .iter()
+                .map(|p| serde_json::json!({
+                    "Id": p.id, "Name": p.title, "Type": "Actor", "Role": "Self"
+                }))
+                .collect::<Vec<_>>(),
+        });
+
+        for polls in 1..=400 {
+            db::MediaRelation::delete_by_right_kinds(
+                db,
+                series.id,
+                &[db::MediaKind::Person],
+            )
+            .await
+            .unwrap();
+            let old: Vec<db::MediaRelation> = people[..3]
+                .iter()
+                .enumerate()
+                .map(|(i, p)| db::MediaRelation {
+                    left_media_id: series.id,
+                    right_media_id: p.id,
+                    weight: Some(i as i64),
+                    role: Some(db::RelationRole::Actor),
+                    character: Some("Self".into()),
+                    ..Default::default()
+                })
+                .collect();
+            db::MediaRelation::upsert(db, &old)
+                .await
+                .unwrap();
+            assert_eq!(person_count(db, series.id).await, 3);
+
+            let req = server
+                .post(&format!("/items/{}", series.id))
+                .add_header(
+                    http::header::AUTHORIZATION,
+                    HeaderValue::from_str(&auth).unwrap(),
+                )
+                .json(&body);
+            let mut fut = Box::pin(req.into_future());
+            let mut finished = false;
+            for _ in 0..polls {
+                if futures::poll!(fut.as_mut()).is_ready() {
+                    finished = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            drop(fut);
+            // let anything the dropped request already handed to SQLite land
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+            let n = person_count(db, series.id).await;
+            assert!(
+                n == 3 || n == 4,
+                "dropping POST /items/{{id}} after {polls} polls left {n} People \
+                 (expected the old 3 or the new 4)"
+            );
+            if finished {
+                assert_eq!(n, 4);
+                return;
+            }
+        }
+        panic!("POST /items/{{id}} never completed within 400 polls");
+    }
+
+    /// A People list whose insert fails (here an `Id` with no media row, so the
+    /// relation's foreign key rejects it) must not leave the item with no
+    /// People while the request reports success.
+    #[tokio::test]
+    async fn update_item_people_insert_failure_keeps_old_people() {
+        use futures::FutureExt;
+        use std::future::IntoFuture;
+
+        let (server, guard, token) = authenticated_server().await;
+        let db = &guard
+            .0
+            .db;
+        let auth = auth_header_with_token(&token);
+        let series = insert_media(
+            db,
+            "Failed Update Series",
+            db::MediaKind::Series,
+            "tt1000902",
+        )
+        .await;
+        let now = Utc::now().naive_utc();
+        let mut person = db::Media {
+            id: Uuid::new_v4(),
+            title: "Old Person".to_string(),
+            kind: db::MediaKind::Person,
+            created_at: now,
+            updated_at: now,
+            ..Default::default()
+        };
+        person
+            .save(db)
+            .await
+            .unwrap();
+        db::MediaRelation::upsert(
+            db,
+            &[db::MediaRelation {
+                left_media_id: series.id,
+                right_media_id: person.id,
+                weight: Some(0),
+                role: Some(db::RelationRole::Actor),
+                ..Default::default()
+            }],
+        )
+        .await
+        .unwrap();
+
+        // Checked after the People assertion, so both halves of the bug show.
+        let resp = std::panic::AssertUnwindSafe(
+            server
+                .post(&format!("/items/{}", series.id))
+                .add_header(
+                    http::header::AUTHORIZATION,
+                    HeaderValue::from_str(&auth).unwrap(),
+                )
+                .json(&serde_json::json!({
+                    "People": [{ "Id": Uuid::new_v4(), "Name": "Unknown", "Type": "Actor" }],
+                }))
+                .expect_failure()
+                .into_future(),
+        )
+        .catch_unwind()
+        .await;
+
+        let people: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT right_media_id FROM media_relations WHERE left_media_id = ?",
+        )
+        .bind(series.id)
+        .fetch_all(db)
+        .await
+        .unwrap();
+        assert_eq!(people, vec![person.id], "the old People must survive");
+        assert!(resp.is_ok(), "a failed People write must not return 2xx");
+    }
+
+    /// A People Id that belongs to a movie or a genre is not a person: the
+    /// request must fail with 400 and keep the old People.
+    #[tokio::test]
+    async fn update_item_people_rejects_non_person_ids() {
+        let (server, guard, token) = authenticated_server().await;
+        let db = &guard
+            .0
+            .db;
+        let auth = auth_header_with_token(&token);
+        let series =
+            insert_media(db, "Non Person Series", db::MediaKind::Series, "tt1000903")
+                .await;
+        let movie =
+            insert_media(db, "Some Movie", db::MediaKind::Movie, "tt1000904").await;
+        let genre = insert_media(db, "Drama", db::MediaKind::Genre, "tt1000905").await;
+        let now = Utc::now().naive_utc();
+        let mut person = db::Media {
+            id: Uuid::new_v4(),
+            title: "Old Person".to_string(),
+            kind: db::MediaKind::Person,
+            created_at: now,
+            updated_at: now,
+            ..Default::default()
+        };
+        person
+            .save(db)
+            .await
+            .unwrap();
+        db::MediaRelation::upsert(
+            db,
+            &[db::MediaRelation {
+                left_media_id: series.id,
+                right_media_id: person.id,
+                weight: Some(0),
+                role: Some(db::RelationRole::Actor),
+                ..Default::default()
+            }],
+        )
+        .await
+        .unwrap();
+
+        for bad in [movie.id, genre.id] {
+            let resp = server
+                .post(&format!("/items/{}", series.id))
+                .add_header(
+                    http::header::AUTHORIZATION,
+                    HeaderValue::from_str(&auth).unwrap(),
+                )
+                .json(&serde_json::json!({
+                    "People": [
+                        { "Id": person.id, "Name": "Old Person", "Type": "Actor" },
+                        { "Id": bad, "Name": "Not A Person", "Type": "Actor" },
+                    ],
+                }))
+                .expect_failure()
+                .await;
+            assert_eq!(resp.status_code(), http::StatusCode::BAD_REQUEST);
+
+            let people: Vec<Uuid> = sqlx::query_scalar(
+                "SELECT right_media_id FROM media_relations WHERE left_media_id = ?",
+            )
+            .bind(series.id)
+            .fetch_all(db)
+            .await
+            .unwrap();
+            assert_eq!(people, vec![person.id], "the old People must survive");
+        }
     }
 }

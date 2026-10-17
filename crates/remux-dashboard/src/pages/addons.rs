@@ -15,15 +15,26 @@ use remux_sdks::{
     },
     stremio::ResourceType,
 };
-use std::collections::HashMap;
 use url::Url;
 use uuid::Uuid;
 
 #[component]
 pub fn AddonsPage(app_state: AppState) -> Element {
-    let mut addons: Signal<Vec<AddonDto>> = use_signal(Vec::new);
-    let mut global_addon_order: Signal<Vec<String>> = use_signal(Vec::new);
-    let mut user_addon_order: Signal<Vec<String>> = use_signal(Vec::new);
+    // Addons split by tab: `is_default` addons on Global, the rest on User.
+    let mut global_addons: Signal<Vec<AddonDto>> = use_signal(Vec::new);
+    let mut user_addons: Signal<Vec<AddonDto>> = use_signal(Vec::new);
+    let find_addon = move |id: Uuid| -> Option<AddonDto> {
+        global_addons
+            .read()
+            .iter()
+            .chain(
+                user_addons
+                    .read()
+                    .iter(),
+            )
+            .find(|addon| addon.id == id)
+            .cloned()
+    };
     let mut kinds: Signal<Vec<AddonMetadata>> = use_signal(Vec::new);
     let mut loading = use_signal(|| true);
     let mut error: Signal<Option<String>> = use_signal(|| None);
@@ -64,6 +75,8 @@ pub fn AddonsPage(app_state: AppState) -> Element {
     > = use_signal(std::collections::HashMap::new);
 
     let mut edit_http_redirect_stream = use_signal(|| false);
+    let mut edit_subtitle_extraction = use_signal(|| false);
+    let mut edit_probe_on_scan = use_signal(|| false);
     let mut edit_service_filter = use_signal(String::new);
 
     // Confirm-delete state
@@ -84,28 +97,12 @@ pub fn AddonsPage(app_state: AppState) -> Element {
                 .await;
             match (kinds_res, addons_res) {
                 (Ok(k), Ok(a)) => {
-                    global_addon_order.set(
-                        a.iter()
-                            .filter(|addon| addon.is_default)
-                            .map(|addon| {
-                                addon
-                                    .id
-                                    .to_string()
-                            })
-                            .collect(),
-                    );
-                    user_addon_order.set(
-                        a.iter()
-                            .filter(|addon| !addon.is_default)
-                            .map(|addon| {
-                                addon
-                                    .id
-                                    .to_string()
-                            })
-                            .collect(),
-                    );
                     kinds.set(k);
-                    addons.set(a);
+                    let (global, user): (Vec<AddonDto>, Vec<AddonDto>) = a
+                        .into_iter()
+                        .partition(|addon| addon.is_default);
+                    global_addons.set(global);
+                    user_addons.set(user);
                     error.set(None);
                 }
                 (Err(e), _) | (_, Err(e)) => {
@@ -166,17 +163,11 @@ pub fn AddonsPage(app_state: AppState) -> Element {
                         }
                     }
                     {
-                        let visible: Vec<AddonDto> = addons.read().clone().into_iter()
-                            .filter(|a| if *active_tab.read() == "global" { a.is_default } else { !a.is_default })
-                            .collect();
+                        let mut tab_addons = if *active_tab.read() == "global" { global_addons } else { user_addons };
+                        let visible: Vec<AddonDto> = tab_addons.read().clone();
                         if visible.is_empty() {
                             rsx! { EmptyState { message: "No addons configured — add one to get started." } }
                         } else {
-                            let mut addon_order = if *active_tab.read() == "global" {
-                                global_addon_order
-                            } else {
-                                user_addon_order
-                            };
                             let list_key = visible
                                 .iter()
                                 .map(|addon| addon.id.to_string())
@@ -230,7 +221,7 @@ pub fn AddonsPage(app_state: AppState) -> Element {
                                                         let client = app_state.clone();
                                                         move |e| {
                                                             e.stop_propagation();
-                                                            if let Some(a) = addons.read().iter().find(|a| a.id == id).cloned() {
+                                                            if let Some(a) = find_addon(id) {
                                                                 edit_name_input.set(a.name.clone());
                                                                 let mut config_map: std::collections::HashMap<String, serde_json::Value> = a.config.as_object()
                                                                     .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
@@ -259,6 +250,8 @@ pub fn AddonsPage(app_state: AppState) -> Element {
                                                                 edit_types.set(type_set);
                                                                 edit_is_default.set(a.is_default);
                                                                 edit_http_redirect_stream.set(a.http_redirect_stream);
+                                                                edit_subtitle_extraction.set(a.subtitle_extraction);
+                                                                edit_probe_on_scan.set(a.probe_on_scan);
                                                                 edit_service_filter.set(a.service_filter.join(", "));
                                                                 let has_catalog = a.resources.contains(&ResourceType::Catalog);
                                                                 edit_catalogs.set(Vec::new());
@@ -322,27 +315,22 @@ pub fn AddonsPage(app_state: AppState) -> Element {
                                     items,
                                     aria_label: "Addons",
                                     on_reorder: move |new_order: Vec<String>| {
-                                        let previous_positions: HashMap<String, usize> = addon_order
-                                            .peek()
+                                        let mut reordered_addons = tab_addons.peek().clone();
+                                        reordered_addons.sort_by_key(|addon| {
+                                            new_order.iter().position(|id| *id == addon.id.to_string())
+                                        });
+                                        for (index, addon) in reordered_addons.iter_mut().enumerate() {
+                                            addon.priority = index as i64 * 10;
+                                        }
+                                        let reorder_updates: Vec<(Uuid, i64)> = reordered_addons
                                             .iter()
-                                            .enumerate()
-                                            .map(|(index, id)| (id.clone(), index))
+                                            .map(|addon| (addon.id, addon.priority))
                                             .collect();
-                                        let updates: Vec<(Uuid, i64)> = new_order
-                                            .iter()
-                                            .enumerate()
-                                            .filter_map(|(index, id)| {
-                                                let priority = index as i64 * 10;
-                                                (previous_positions.get(id).copied() != Some(index))
-                                                    .then(|| id.parse().ok().map(|id| (id, priority)))
-                                                    .flatten()
-                                            })
-                                            .collect();
-                                        addon_order.set(new_order);
+                                        tab_addons.set(reordered_addons);
                                         let client = client.clone();
                                         let mut reorder_error = error;
                                         spawn(async move {
-                                            for (id, priority) in updates {
+                                            for (id, priority) in reorder_updates {
                                                 if let Err(e) = client
                                                     .execute(UpdateAddon {
                                                         id,
@@ -379,6 +367,9 @@ pub fn AddonsPage(app_state: AppState) -> Element {
                     }
                     div { class: "modal-body",
                         if *create_step.read() == 0 {
+                            if *active_tab.read() == "user" {
+                                span { class: "field-hint", "User addons only provide per-user resources. Catalogs and metadata apply to the whole library, so add those addons on the Global tab." }
+                            }
                             div { class: "addon-kind-list",
                                 for k in kinds.read().clone().into_iter().filter(|k| {
                                     if *active_tab.read() == "user" { !k.supported_resources_user.is_empty() } else { true }
@@ -421,14 +412,12 @@ pub fn AddonsPage(app_state: AppState) -> Element {
                                                         onclick: move |e| {
                                                             e.stop_propagation();
                                                             name_input.set(k_name.clone());
-                                                            let mut defaults = std::collections::HashMap::new();
-                                                            if let Some(meta) = kinds.read().iter().find(|m| m.id == k_id_cfg).cloned() {
-                                                                for opt in &meta.options {
-                                                                    if let Some(default) = &opt.default {
-                                                                        defaults.insert(opt.id.clone(), default.clone());
-                                                                    }
-                                                                }
-                                                            }
+                                                            let defaults = kinds
+                                                                .read()
+                                                                .iter()
+                                                                .find(|m| m.id == k_id_cfg)
+                                                                .map(|meta| initial_option_values(&meta.options))
+                                                                .unwrap_or_default();
                                                             form_values.set(defaults);
                                                             create_step.set(1);
                                                         },
@@ -493,6 +482,14 @@ pub fn AddonsPage(app_state: AppState) -> Element {
                                         );
                                         creating.set(true);
                                         let is_default = *create_is_default.peek();
+                                        // New addons go to the top of their tab.
+                                        let target_addons = if is_default { global_addons } else { user_addons };
+                                        let new_prio = target_addons
+                                            .peek()
+                                            .iter()
+                                            .map(|addon| addon.priority)
+                                            .min()
+                                            .map_or(0, |priority| priority.saturating_sub(10));
                                         let c = client.clone();
                                         spawn(async move {
                                             let payload = CreateAddonRequest {
@@ -500,7 +497,7 @@ pub fn AddonsPage(app_state: AppState) -> Element {
                                                 name,
                                                 resources: Vec::new(),
                                                 types: Vec::new(),
-                                                priority: 0,
+                                                priority: new_prio,
                                                 is_default,
                                             };
                                             match c.execute(CreateAddon { payload }).await {
@@ -527,16 +524,13 @@ pub fn AddonsPage(app_state: AppState) -> Element {
 
         if let Some(edit_id) = *id_to_edit.read() {
             {
-                let edit_kind = addons.read().iter().find(|a| a.id == edit_id).map(|a| a.kind.clone());
+                let edit_kind = find_addon(edit_id).map(|a| a.kind);
                 let edit_kind_meta = edit_kind.as_ref().and_then(|k| kinds.read().iter().find(|m| m.id == *k).cloned());
                 // Use supported_resources from the addon row (manifest-derived for Stremio,
                 // kind-static for others) as the checkbox option list.
                 let is_user_addon = !*edit_is_default.read();
-                let resource_options: Vec<ResourceType> = addons
-                    .read()
-                    .iter()
-                    .find(|a| a.id == edit_id)
-                    .map(|a| if is_user_addon { a.supported_resources_user.clone() } else { a.supported_resources.clone() })
+                let resource_options: Vec<ResourceType> = find_addon(edit_id)
+                    .map(|a| if is_user_addon { a.supported_resources_user } else { a.supported_resources })
                     .unwrap_or_default();
                 rsx! {
                     div { class: "modal-backdrop",
@@ -575,7 +569,7 @@ pub fn AddonsPage(app_state: AppState) -> Element {
                                                     let res_str = format!("{res}");
                                                     let res_str_check = res_str.clone();
                                                     let checked = edit_resources.read().contains(&res_str);
-                                                    let is_system = addons.read().iter().find(|a| a.id == edit_id).map(|a| a.system).unwrap_or(false);
+                                                    let is_system = find_addon(edit_id).is_some_and(|a| a.system);
                                                     rsx! {
                                                         div { class: "check-row",
                                                             Switch {
@@ -600,11 +594,8 @@ pub fn AddonsPage(app_state: AppState) -> Element {
                                 }
                                 // Types section
                                 {
-                                    let type_options: Vec<remux_sdks::remux::MediaKind> = addons
-                                        .read()
-                                        .iter()
-                                        .find(|a| a.id == edit_id)
-                                        .map(|a| if is_user_addon { a.supported_types_user.clone() } else { a.supported_types.clone() })
+                                    let type_options: Vec<remux_sdks::remux::MediaKind> = find_addon(edit_id)
+                                        .map(|a| if is_user_addon { a.supported_types_user } else { a.supported_types })
                                         .unwrap_or_default();
                                     if !type_options.is_empty() {
                                         rsx! {
@@ -616,7 +607,7 @@ pub fn AddonsPage(app_state: AppState) -> Element {
                                                             let t_str = format!("{t}");
                                                             let t_str_check = t_str.clone();
                                                             let checked = edit_types.read().contains(&t_str);
-                                                            let is_system = addons.read().iter().find(|a| a.id == edit_id).map(|a| a.system).unwrap_or(false);
+                                                            let is_system = find_addon(edit_id).is_some_and(|a| a.system);
                                                             rsx! {
                                                                 div { class: "check-row",
                                                                     Switch {
@@ -647,21 +638,44 @@ pub fn AddonsPage(app_state: AppState) -> Element {
                                 if edit_resources.read().contains("stream") {
                                     div { class: "form-group",
                                         ToggleRow {
-                                            label: "Direct stream",
-                                            description: "Send the client directly to the source URL instead of proxying through remux. Only applies to HTTP streams and direct play — transcoding always routes through remux.",
+                                            label: "Bypass Remux proxy",
+                                            description: "Send compatible HTTP sources directly to the client instead of proxying them through Remux, when the source is played unchanged.",
                                             checked: *edit_http_redirect_stream.read(),
                                             on_change: move |v| edit_http_redirect_stream.set(v),
                                         }
+                                        span { class: "field-hint", "Streams that FFmpeg processes, whether remuxed into a new container or re-encoded, always run through Remux." }
                                     }
                                     div { class: "form-group",
-                                        label { class: "form-label", "Direct stream service filter" }
+                                        label { class: "form-label", "Bypass proxy service filter" }
                                         input {
                                             class: "form-input",
                                             placeholder: "real-debrid, alldebrid",
                                             value: "{edit_service_filter}",
                                             oninput: move |e| edit_service_filter.set(e.value()),
                                         }
-                                        span { class: "field-hint", "Comma-separated list of service IDs (from streamData.service.id) or addon names (from streamData.addon) to stream directly. Leave empty to apply to all." }
+                                        span { class: "field-hint", "Comma-separated list of service IDs (from streamData.service.id) or addon names (from streamData.addon) to bypass Remux's proxy. Leave empty to apply to all." }
+                                    }
+                                }
+                                if edit_kind.as_deref().is_some_and(|k| k.starts_with("opendal")) && edit_resources.read().contains("stream") {
+                                    div { class: "form-group",
+                                        ToggleRow {
+                                            label: "Enable subtitle extraction",
+                                            description: "Extract embedded subtitles from files on this source so clients can show them as external subtitles.",
+                                            checked: *edit_subtitle_extraction.read(),
+                                            on_change: move |v| edit_subtitle_extraction.set(v),
+                                        }
+                                        span { class: "field-hint", "Extraction reads the entire file over the network the first time a subtitle is requested, so it can be slow and use a lot of bandwidth on remote sources." }
+                                    }
+                                    if edit_form_values.read().get("media_kind").and_then(|v| v.as_str()) != Some("track") {
+                                    div { class: "form-group",
+                                        ToggleRow {
+                                            label: "Probe files during scan",
+                                            description: "Read stream details (codecs, resolution, audio and subtitle tracks) for new and changed files when the library is scanned, so playback doesn't have to probe them first.",
+                                            checked: *edit_probe_on_scan.read(),
+                                            on_change: move |v| edit_probe_on_scan.set(v),
+                                        }
+                                        span { class: "field-hint", "Probing reads the start of each new or changed file, so the first scan of a large remote library takes longer." }
+                                    }
                                     }
                                 }
                                 // Catalogs section (only shown for global addons with catalog resource active)
@@ -793,6 +807,8 @@ pub fn AddonsPage(app_state: AppState) -> Element {
                                             let c = client.clone();
                                             let is_default = *edit_is_default.peek();
                                             let http_redirect_stream = *edit_http_redirect_stream.peek();
+                                            let subtitle_extraction = *edit_subtitle_extraction.peek();
+                                            let probe_on_scan = *edit_probe_on_scan.peek();
                                             let service_filter: Vec<String> = edit_service_filter
                                                 .peek()
                                                 .split(',')
@@ -809,6 +825,8 @@ pub fn AddonsPage(app_state: AppState) -> Element {
                                                     priority: None,
                                                     is_default: Some(is_default),
                                                     http_redirect_stream: Some(http_redirect_stream),
+                                                    subtitle_extraction: Some(subtitle_extraction),
+                                                    probe_on_scan: Some(probe_on_scan),
                                                     service_filter: Some(service_filter),
                                                 };
                                                 let addon_res = c.execute(UpdateAddon { id: edit_id, payload }).await;
@@ -1021,13 +1039,16 @@ pub(crate) fn AddonOptionField(
                 AddonOptionType::Select { options } => rsx! {
                     select {
                         class: "form-input",
-                        value: "{current_str}",
                         onchange: move |e| {
                             let mut map = values.write();
                             map.insert(id_select.clone(), serde_json::Value::String(e.value()));
                         },
                         for so in options.iter().cloned() {
-                            option { value: "{so.value}", "{so.label}" }
+                            option {
+                                value: "{so.value}",
+                                selected: current_str == so.value,
+                                "{so.label}"
+                            }
                         }
                     }
                 },
@@ -1138,6 +1159,38 @@ pub(crate) fn AddonOptionField(
 /// Stremio addon manifests conventionally live at `/manifest.json`, while the
 /// corresponding setup page is served from the same base path at `/configure`.
 /// Query parameters and fragments are intentionally retained.
+/// Starting form values for a new addon: each option's default, or for a
+/// required select with none, its first choice, so what the dropdown shows is
+/// what gets saved.
+fn initial_option_values(
+    options: &[AddonOption],
+) -> std::collections::HashMap<String, serde_json::Value> {
+    options
+        .iter()
+        .filter_map(|opt| {
+            let value = match (&opt.default, &opt.kind) {
+                (Some(default), _) => default.clone(),
+                (None, AddonOptionType::Select { options: choices })
+                    if opt.required =>
+                {
+                    serde_json::Value::String(
+                        choices
+                            .first()?
+                            .value
+                            .clone(),
+                    )
+                }
+                _ => return None,
+            };
+            Some((
+                opt.id
+                    .clone(),
+                value,
+            ))
+        })
+        .collect()
+}
+
 fn manifest_configure_url(value: &str) -> Option<String> {
     let mut url = Url::parse(value.trim()).ok()?;
     let path = url
@@ -1158,7 +1211,46 @@ fn manifest_configure_url(value: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::manifest_configure_url;
+    use super::{initial_option_values, manifest_configure_url};
+    use remux_sdks::remux::{AddonOption, AddonOptionType, AddonSelectOption};
+
+    fn select(id: &str, required: bool, default: Option<&str>) -> AddonOption {
+        AddonOption {
+            id: id.to_string(),
+            name: id.to_string(),
+            description: None,
+            required,
+            default: default.map(|d| serde_json::json!(d)),
+            kind: AddonOptionType::Select {
+                options: vec![
+                    AddonSelectOption {
+                        label: "Movies".to_string(),
+                        value: "movie".to_string(),
+                    },
+                    AddonSelectOption {
+                        label: "Tracks".to_string(),
+                        value: "track".to_string(),
+                    },
+                ],
+            },
+        }
+    }
+
+    #[test]
+    fn required_select_without_default_starts_on_first_choice() {
+        let values = initial_option_values(&[select("media_kind", true, None)]);
+        assert_eq!(values["media_kind"], serde_json::json!("movie"));
+    }
+
+    #[test]
+    fn explicit_default_wins_and_optional_select_stays_unset() {
+        let values = initial_option_values(&[
+            select("a", true, Some("track")),
+            select("b", false, None),
+        ]);
+        assert_eq!(values["a"], serde_json::json!("track"));
+        assert!(!values.contains_key("b"));
+    }
 
     #[test]
     fn manifest_configure_url_replaces_manifest_path_and_preserves_query() {

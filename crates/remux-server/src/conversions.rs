@@ -373,7 +373,7 @@ impl From<db::Media> for api::MediaSourceInfo {
             provider_info: source
                 .stream_info
                 .as_ref()
-                .and_then(|si| serde_json::to_value(si).ok()),
+                .and_then(|si| si.to_public_json()),
             source: probe_source,
         });
 
@@ -565,6 +565,33 @@ impl TryFrom<stremio::Episode> for db::Media {
             media.set_image(db::ImageKind::Primary, url);
         }
         Ok(media)
+    }
+}
+
+/// Converts a subtitle attached directly to a Stremio `Stream` response
+/// (`StreamInfo.subtitles`, one release's own bundled subs — not the
+/// dedicated subtitle-provider-addon fetch, which already produces
+/// `SubtitleInfo` directly) into the same `SubtitleInfo` shape
+/// `append_external_subtitles` already knows how to surface.
+pub fn stremio_subtitle_to_subtitle_info(sub: &stremio::Subtitle) -> SubtitleInfo {
+    SubtitleInfo {
+        id: sub
+            .id
+            .clone(),
+        url: Some(StreamDescriptor::http(
+            sub.url
+                .clone(),
+        )),
+        lang: sub
+            .lang
+            .clone(),
+        is_forced: false,
+        is_hi: false,
+        filename: sub
+            .subtitle_file_name
+            .clone(),
+        from_trusted: sub.from_trusted,
+        ai_translated: sub.ai_translated,
     }
 }
 

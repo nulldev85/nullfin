@@ -35,6 +35,13 @@ pub enum SubtitleCodec {
 }
 
 impl SubtitleCodec {
+    /// Parses an ffmpeg/profile codec name. Never fails: an unrecognized
+    /// name becomes `Other` carrying the original string.
+    pub fn from_codec_name(name: &str) -> Self {
+        name.parse()
+            .unwrap_or_else(|_| Self::Other(name.to_string()))
+    }
+
     pub fn is_image(&self) -> bool {
         matches!(self, Self::Pgs | Self::DvdSub | Self::DvbSub)
     }
@@ -407,6 +414,38 @@ pub enum DlnaProfileType {
     Photo,
     #[strum(default, to_string = "{0}")]
     Other(String),
+}
+
+/// The stream component constrained by a Jellyfin codec profile.
+///
+/// This is distinct from [`DlnaProfileType`]: `VideoAudio` describes the
+/// audio stream inside a video source, while `Audio` describes audio-only
+/// media.
+#[derive(
+    Debug, Clone, PartialEq, Eq, strum_macros::EnumString, strum_macros::Display,
+)]
+#[strum(ascii_case_insensitive)]
+pub enum CodecProfileType {
+    Video,
+    VideoAudio,
+    Audio,
+    #[strum(default, to_string = "{0}")]
+    Other(String),
+}
+
+impl serde::Serialize for CodecProfileType {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for CodecProfileType {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(d)?;
+        Ok(value
+            .parse()
+            .unwrap_or_else(|_| Self::Other(value)))
+    }
 }
 
 impl serde::Serialize for DlnaProfileType {
