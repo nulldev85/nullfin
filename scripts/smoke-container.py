@@ -80,6 +80,8 @@ class Fixture(http.server.BaseHTTPRequestHandler):
 
 
 class Server:
+    fixture_origin = ""
+
     def __init__(self, data):
         self.data = data
         self.name = "nullfin-smoke-" + uuid.uuid4().hex[:12]
@@ -91,6 +93,9 @@ class Server:
         docker("run", "-d", "--name", self.name, "--network", "host",
                "--user", f"{os.getuid()}:{os.getgid()}",
                "-v", f"{self.data}:/data", "-e", f"PORT={self.port}",
+               "-e", "HOST=127.0.0.1",
+               "-e", f"TMDB_BASE_URL={self.fixture_origin}",
+               "-e", f"REMUXDB_URL={self.fixture_origin}",
                "-e", "DISABLE_DHT=true", "-e", "DISABLE_STARTUP_TASKS=true",
                "-e", "TORRENT_HTTP_PORT=0", image)
         deadline = time.monotonic() + 90
@@ -102,7 +107,9 @@ class Server:
                 if docker("inspect", self.name, "--format", "{{.State.Running}}") != "true":
                     break
                 time.sleep(1)
-        raise RuntimeError("container did not become healthy: " + docker("logs", self.name)[-6000:])
+        logs = docker("logs", self.name)[-6000:]
+        self.stop()
+        raise RuntimeError("container did not become healthy: " + logs)
 
     def stop(self):
         docker("rm", "-f", self.name)
@@ -116,9 +123,13 @@ class Server:
             data=json.dumps(body).encode() if body is not None else None,
             headers={"Authorization": auth, "Content-Type": "application/json", **(headers or {})},
         )
-        with urllib.request.urlopen(request, timeout=45) as response:
-            data = response.read()
-            return data if raw else (json.loads(data) if data else None)
+        try:
+            with urllib.request.urlopen(request, timeout=45) as response:
+                data = response.read()
+                return data if raw else (json.loads(data) if data else None)
+        except urllib.error.HTTPError as error:
+            error.add_note(f"Fixture request {path}: {error.read().decode(errors='replace')[:2000]}")
+            raise
 
     def setup(self):
         self.request("/startup/user", {"Name": "smoke", "Password": "ci-disposable-password"})
@@ -170,6 +181,7 @@ def main():
     args = parser.parse_args()
     Fixture.video = pathlib.Path("crates/remux-server/assets/no-streams.mp4").read_bytes()
     with http.server.ThreadingHTTPServer(("127.0.0.1", 0), Fixture) as fixture:
+        Server.fixture_origin = f"http://127.0.0.1:{fixture.server_port}/"
         threading.Thread(target=fixture.serve_forever, daemon=True).start()
         with tempfile.TemporaryDirectory(prefix="nullfin-smoke-") as folder:
             folder = pathlib.Path(folder)
@@ -192,7 +204,7 @@ def main():
                 # Populate a real old-version database with a library item. This
                 # checks that migrations preserve content and rebuild stream rows.
                 with sqlite3.connect(data / "db.sqlite") as db:
-                    db.execute("INSERT INTO media (id,title,kind,external_ids,created_at,updated_at,refreshed_at) VALUES (?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                    db.execute("INSERT INTO media (id,title,kind,external_ids,locked_fields,created_at,updated_at,refreshed_at) VALUES (?,?,?,?,'[]',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
                                (uuid.UUID(movie_id).bytes, "Nullfin Smoke Movie", "movie", json.dumps({"imdb": "tt0113277"})))
                 server.start(args.previous)
                 running = True
@@ -230,6 +242,10 @@ def main():
                     html = server.request(path, raw=True).lower()
                     assert b"<html" in html or b"<!doctype" in html, f"missing UI: {path}"
                 print("PASS: old-version migration, admin login, library/addon/settings persistence, source playback, restart, fresh setup, and both web UIs")
+            except Exception:
+                if running:
+                    print(docker("logs", "--tail", "100", server.name), flush=True)
+                raise
             finally:
                 if running:
                     server.stop()
