@@ -288,7 +288,17 @@ jobs:
           cargo set-version "${{ inputs.cargo_version }}"
 
       - name: Install cargo-bundle
-        run: cargo binstall cargo-bundle --no-confirm --force --locked
+        if: runner.os != 'macOS' || runner.arch != 'ARM64'
+        run: cargo binstall cargo-bundle@0.12.0 --no-confirm --force --locked
+
+      - name: Build native cargo-bundle on Apple Silicon
+        if: runner.os == 'macOS' && runner.arch == 'ARM64'
+        run: |
+          # QuickInstall currently supplies an Intel executable, which runs
+          # child build tools under Rosetta and cannot load the ARM-only CLT.
+          cargo install cargo-bundle --version 0.12.0 --locked --force
+          lipo -verify_arch "$(uname -m)" "$CARGO_HOME/bin/cargo-bundle"
+          cargo bundle --version
 
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'
