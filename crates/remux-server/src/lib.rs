@@ -66,6 +66,7 @@ pub mod playback_session;
 pub mod services;
 pub mod signals;
 pub mod stream;
+mod subtitle_selection;
 pub mod tasks;
 mod torrent;
 mod web_client;
@@ -316,6 +317,10 @@ pub async fn init_app(
             .as_deref()
             .unwrap_or("/dev/dri/renderD128");
         let driver = crate::playback::engine::detect_vaapi_driver(device).await;
+        let opencl =
+            crate::playback::engine::detect_opencl_tonemap(device, &driver).await;
+        tracing::info!(opencl_tonemap = opencl, "OpenCL tone mapping probed");
+        crate::playback::hw_accel::set_opencl_tonemap_available(opencl);
         enc_opts.vaapi_driver = Some(driver);
         db::Settings::set_encoding_config(&conn, &enc_opts).await?;
     }
@@ -371,14 +376,18 @@ pub async fn init_app(
         .register(services::media_tracker::MediaTrackerSubscriber { ctx: ctx.clone() });
     ctx.signals
         .register(api::webhooks::WebhookSubscriber { ctx: ctx.clone() });
+    ctx.signals
+        .register(services::four_k_capability::FourKCapabilitySubscriber::new(
+            ctx.clone(),
+        ));
 
     // Sync intro items at startup (best-effort; errors are logged not fatal).
     if let Err(e) = intro::sync_intros(&ctx).await {
         warn!(err = ?e, "intro sync failed at startup");
     }
 
-    // Kill idle sessions after 30 minutes of no activity.
-    // 30 min matches a "stepped away" scenario; pings keep active sessions alive indefinitely.
+    // Kill idle sessions after 15 minutes of no activity.
+    // Pings keep active sessions alive indefinitely.
     ctx.sessions
         .clone()
         .spawn_cleanup_task(
@@ -393,9 +402,14 @@ pub async fn init_app(
     task_service
         .start()
         .await?;
-    task_service
-        .run_startup_tasks()
-        .await?;
+    if !ctx
+        .config
+        .disable_startup_tasks
+    {
+        task_service
+            .run_startup_tasks()
+            .await?;
+    }
 
     let state = AppState {
         ctx: ctx.clone(),
@@ -601,6 +615,13 @@ pub struct Config {
     /// configured or when running in a restricted network environment.
     #[serde(default)]
     pub disable_dht: bool,
+    /// Skip running `StartupTrigger`-tagged tasks (e.g. the default library
+    /// refresh) during `init_app`. Only meant for test/benchmark harnesses
+    /// that bulk-write their own fixture data immediately after startup —
+    /// letting the real startup tasks run concurrently races the same
+    /// tables and can corrupt fixture writes.
+    #[serde(default)]
+    pub disable_startup_tasks: bool,
     /// TCP port range for librqbit peer connections.  Announced to trackers so
     /// they return us in peer lists.  Defaults to 6881.  Does not need to be
     /// forwarded/open for outbound-only operation, but must be a real port
@@ -744,6 +765,7 @@ impl Default for Config {
             slow_query_threshold_ms: default_slow_query_threshold_ms(),
             addon_stream_timeout_ms: default_addon_stream_timeout_ms(),
             disable_dht: false,
+            disable_startup_tasks: false,
             torrent_peer_port: default_torrent_peer_port(),
             bgutil_script_path: default_bgutil_script_path(),
             tmdb_base_url: default_tmdb_base_url(),

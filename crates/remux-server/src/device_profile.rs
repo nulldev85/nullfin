@@ -1,6 +1,6 @@
 pub(crate) use remux_sdks::remux::{AudioCodec, SubtitleCodec, VideoCodec};
 use remux_sdks::remux::{
-    CodecProfile, DeviceProfile, DirectPlayProfile, DlnaProfileType,
+    CodecProfile, CodecProfileType, DeviceProfile, DirectPlayProfile, DlnaProfileType,
     EmbeddedSubtitleHandling, MediaSourceInfo, MediaStream, MediaStreamType,
     ProfileCondition, ProfileConditionProperty, ProfileConditionType,
     SortMediaSourcesMode, SubtitleDeliveryMethod, TranscodeReason, TranscodeReasons,
@@ -38,6 +38,120 @@ pub(crate) fn subtitle_codec_matches_profile(
             .trim()
             .eq_ignore_ascii_case(profile_format.trim()),
     }
+}
+
+/// Whether `device_profile` declares `codec` in a `subtitle_profiles` entry
+/// (strict `SubtitleCodec` parse on both sides — no raw-string fallback),
+/// restricted to entries using `method` when given, or any method for
+/// `None`.
+pub(crate) fn profile_declares_subtitle_codec(
+    device_profile: Option<&DeviceProfile>,
+    codec: &SubtitleCodec,
+    method: Option<SubtitleDeliveryMethod>,
+) -> bool {
+    device_profile.is_some_and(|dp| {
+        dp.subtitle_profiles
+            .iter()
+            .filter(|p| method.is_none() || p.method == method)
+            .filter_map(|p| {
+                p.format
+                    .as_deref()
+            })
+            .any(|f| {
+                f.parse::<SubtitleCodec>()
+                    .ok()
+                    .as_ref()
+                    == Some(codec)
+            })
+    })
+}
+
+/// Whether `device_profile` embeds `codec` (an `Embed` entry for this exact
+/// codec). This is `apply_subtitle_delivery`'s actual embed decision, pulled
+/// out so other code that needs to predict it (e.g. deciding whether an
+/// unsupported-embedded subtitle can be dropped in favor of a matching
+/// external one) can't drift from what playback will really do.
+pub(crate) fn profile_embeds_subtitle_codec(
+    device_profile: Option<&DeviceProfile>,
+    codec: &SubtitleCodec,
+) -> bool {
+    profile_declares_subtitle_codec(
+        device_profile,
+        codec,
+        Some(SubtitleDeliveryMethod::Embed),
+    )
+}
+
+/// Whether an embedded subtitle stream with `codec` can actually be
+/// delivered to `device_profile`, given whether on-demand extraction is
+/// feasible for this source right now (`allow_extraction` — only ever true
+/// for a local source). This
+/// is the single source of truth for "is this embedded subtitle usable" —
+/// used to decide whether a burn-in transcode reason is needed
+/// (`subtitle_burn_reason`), whether Strip mode should drop the stream
+/// (`api/playback.rs`'s pre-`resolve_default_streams` filter), and mirrors
+/// what `apply_subtitle_delivery` actually offers. These three call sites
+/// drifted apart before by each reimplementing this check slightly
+/// differently — route them all through here instead.
+///
+/// - Text subtitles: deliverable via Embed, or via External whenever
+///   extraction is feasible (extraction always converts a text codec to
+///   vtt/srt/ass on demand — no profile format match required for that).
+/// - Image subtitles: only PGS has any external delivery path at all (raw
+///   passthrough into an HLS "sup" file; DVD/DVB subtitle bitstreams don't
+///   fit that container and have no conversion path either). So an image
+///   subtitle is deliverable via Embed, or via External only when it's PGS,
+///   extraction is feasible, AND the profile explicitly declares PGS
+///   support for External — there's no OCR/text fallback to rely on
+///   otherwise, so a "some subtitle_profiles entry merely mentions pgs"
+///   check (regardless of method) isn't enough.
+pub(crate) fn subtitle_codec_deliverable(
+    codec: &SubtitleCodec,
+    device_profile: Option<&DeviceProfile>,
+    allow_extraction: bool,
+) -> bool {
+    if profile_embeds_subtitle_codec(device_profile, codec) {
+        return true;
+    }
+    if !allow_extraction {
+        return false;
+    }
+    if codec.is_image() {
+        *codec == SubtitleCodec::Pgs
+            && profile_declares_subtitle_codec(
+                device_profile,
+                codec,
+                Some(SubtitleDeliveryMethod::External),
+            )
+    } else {
+        true
+    }
+}
+
+/// Whether PlaybackInfo keeps `stream` in a source's `media_streams`. Drops
+/// an embedded subtitle that can't be delivered (see
+/// `subtitle_codec_deliverable`) unless it's an image subtitle that Burn mode
+/// can still burn in. The subtitle endpoint numbers add-on externals after
+/// the streams this keeps, so both must use this same rule.
+pub(crate) fn keeps_embedded_subtitle(
+    stream: &MediaStream,
+    device_profile: Option<&DeviceProfile>,
+    allow_extraction: bool,
+    subtitle_mode: EmbeddedSubtitleHandling,
+) -> bool {
+    if !matches!(stream.type_, Some(MediaStreamType::Subtitle)) || stream.is_external {
+        return true;
+    }
+    let codec = SubtitleCodec::from_codec_name(
+        stream
+            .codec
+            .as_deref()
+            .unwrap_or_default(),
+    );
+    if subtitle_codec_deliverable(&codec, device_profile, allow_extraction) {
+        return true;
+    }
+    !stream.is_text_subtitle_stream() && subtitle_mode == EmbeddedSubtitleHandling::Burn
 }
 
 impl DeviceProfileExt for DeviceProfile {
@@ -119,12 +233,16 @@ impl DeviceProfileExt for DeviceProfile {
             best = Some(match best {
                 None => reasons,
                 Some(prev) => {
-                    if reasons
-                        .0
-                        .len()
-                        < prev
-                            .0
-                            .len()
+                    let reasons_cost = transcode_cost_tier(&reasons);
+                    let previous_cost = transcode_cost_tier(&prev);
+                    if reasons_cost > previous_cost
+                        || (reasons_cost == previous_cost
+                            && reasons
+                                .0
+                                .len()
+                                < prev
+                                    .0
+                                    .len())
                     {
                         reasons
                     } else {
@@ -167,10 +285,13 @@ impl DeviceProfileExt for DeviceProfile {
     /// hasn't ruled `hev1` out.
     fn hevc_copy_tag(&self, media_source: &MediaSourceInfo) -> &'static str {
         let client_rejects = |tag: &str| {
+            let Some(video_stream) = media_source.video_stream() else {
+                return false;
+            };
             self.codec_profiles
                 .iter()
-                .filter(|cp| matches!(cp.type_, Some(DlnaProfileType::Video)))
-                .filter(|cp| cp.applies_to_codec("hevc"))
+                .filter(|cp| matches!(cp.type_, None | Some(CodecProfileType::Video)))
+                .filter(|cp| cp.applies_to_media(media_source, video_stream, "hevc"))
                 .flat_map(|cp| &cp.conditions)
                 .filter(|cond| {
                     cond.property
@@ -213,41 +334,34 @@ fn check_codec_profiles(
     media_source: &MediaSourceInfo,
     reasons: &mut TranscodeReasons,
 ) {
+    let has_video = media_source
+        .video_stream()
+        .is_some();
     for cp in &profile.codec_profiles {
-        match cp.type_ {
-            Some(DlnaProfileType::Video) => {
-                if let Some(stream) = media_source.video_stream() {
-                    let codec = stream
-                        .codec
-                        .as_deref()
-                        .unwrap_or("");
-                    if cp.applies_to_codec(codec) {
-                        for r in cp
-                            .check_reasons(stream)
-                            .0
-                        {
-                            reasons.insert(r);
-                        }
-                    }
-                }
+        let stream = match &cp.type_ {
+            None | Some(CodecProfileType::Video) => media_source.video_stream(),
+            Some(CodecProfileType::VideoAudio) if has_video => {
+                selected_audio_stream(media_source)
             }
-            Some(DlnaProfileType::Audio) => {
-                if let Some(stream) = media_source.audio_stream() {
-                    let codec = stream
-                        .codec
-                        .as_deref()
-                        .unwrap_or("");
-                    if cp.applies_to_codec(codec) {
-                        for r in cp
-                            .check_reasons(stream)
-                            .0
-                        {
-                            reasons.insert(r);
-                        }
-                    }
-                }
+            Some(CodecProfileType::Audio) if !has_video => {
+                selected_audio_stream(media_source)
             }
-            _ => {}
+            _ => None,
+        };
+        let Some(stream) = stream else {
+            continue;
+        };
+        let codec = stream
+            .codec
+            .as_deref()
+            .unwrap_or("");
+        if cp.applies_to_media(media_source, stream, codec) {
+            for reason in cp
+                .check_reasons(media_source, stream)
+                .0
+            {
+                reasons.insert(reason);
+            }
         }
     }
 }
@@ -300,7 +414,7 @@ impl DirectPlayProfileExt for DirectPlayProfile {
             }
         }
 
-        if let Some(audio_stream) = media_source.audio_stream() {
+        if let Some(audio_stream) = selected_audio_stream(media_source) {
             if let Some(audio_codec) = &audio_stream.codec {
                 if !self.supports_audio_codec(audio_codec) {
                     reasons.insert(TranscodeReason::AudioCodecNotSupported(format!(
@@ -361,7 +475,17 @@ impl DirectPlayProfileExt for DirectPlayProfile {
 
 pub trait CodecProfileExt {
     fn applies_to_codec(&self, codec: &str) -> bool;
-    fn check_reasons(&self, stream: &MediaStream) -> TranscodeReasons;
+    fn applies_to_media(
+        &self,
+        media_source: &MediaSourceInfo,
+        stream: &MediaStream,
+        codec: &str,
+    ) -> bool;
+    fn check_reasons(
+        &self,
+        media_source: &MediaSourceInfo,
+        stream: &MediaStream,
+    ) -> TranscodeReasons;
 }
 
 impl CodecProfileExt for CodecProfile {
@@ -373,7 +497,51 @@ impl CodecProfileExt for CodecProfile {
             .any(|entry| any_codec_matches(entry, codec))
     }
 
-    fn check_reasons(&self, stream: &MediaStream) -> TranscodeReasons {
+    fn applies_to_media(
+        &self,
+        media_source: &MediaSourceInfo,
+        stream: &MediaStream,
+        codec: &str,
+    ) -> bool {
+        if !self.applies_to_codec(codec) {
+            return false;
+        }
+        if let Some(containers) = self
+            .container
+            .as_deref()
+            .filter(|value| {
+                !value
+                    .trim()
+                    .is_empty()
+            })
+        {
+            let Some(source_container) = media_source
+                .container
+                .as_ref()
+            else {
+                return false;
+            };
+            if !containers
+                .split(',')
+                .map(str::trim)
+                .any(|candidate| {
+                    candidate == "*"
+                        || container_name_matches(candidate, source_container)
+                })
+            {
+                return false;
+            }
+        }
+        self.apply_conditions
+            .iter()
+            .all(|condition| condition_satisfied(condition, media_source, stream))
+    }
+
+    fn check_reasons(
+        &self,
+        media_source: &MediaSourceInfo,
+        stream: &MediaStream,
+    ) -> TranscodeReasons {
         let mut reasons = TranscodeReasons::default();
         for cond in &self.conditions {
             let property = match cond
@@ -383,20 +551,8 @@ impl CodecProfileExt for CodecProfile {
                 Some(p) => p,
                 None => continue,
             };
-            let actual = stream_property_value(stream, property);
-
-            // HDR10Plus also satisfies HDR10 conditions.
-            if property == &ProfileConditionProperty::VideoRangeType {
-                if let Some(ref v) = actual {
-                    if v.eq_ignore_ascii_case("HDR10Plus")
-                        && cond.is_satisfied_opt(Some("HDR10"))
-                    {
-                        continue;
-                    }
-                }
-            }
-
-            if !cond.is_satisfied_opt(actual.as_deref()) {
+            let actual = condition_property_value(media_source, stream, property);
+            if !condition_satisfied_for_value(cond, property, &actual) {
                 let condition = cond
                     .condition
                     .as_ref()
@@ -408,33 +564,12 @@ impl CodecProfileExt for CodecProfile {
                     cond.value
                         .as_deref()
                         .unwrap_or(""),
-                    actual
-                        .as_deref()
-                        .unwrap_or("(unknown)"),
+                    actual.detail(),
                 );
-                let reason = match property {
-                    ProfileConditionProperty::VideoRangeType => {
-                        TranscodeReason::VideoRangeTypeNotSupported(detail)
-                    }
-                    ProfileConditionProperty::VideoCodecTag => {
-                        TranscodeReason::VideoCodecTagNotSupported(detail)
-                    }
-                    ProfileConditionProperty::VideoProfile
-                    | ProfileConditionProperty::Profile => {
-                        TranscodeReason::VideoProfileNotSupported(detail)
-                    }
-                    ProfileConditionProperty::BitDepth => {
-                        TranscodeReason::VideoBitDepthNotSupported(detail)
-                    }
-                    _ => {
-                        if matches!(stream.type_, Some(MediaStreamType::Audio)) {
-                            TranscodeReason::AudioCodecNotSupported(detail)
-                        } else {
-                            TranscodeReason::VideoCodecNotSupported(detail)
-                        }
-                    }
-                };
-                reasons.insert(reason);
+                if let Some(reason) = failed_condition_reason(property, stream, detail)
+                {
+                    reasons.insert(reason);
+                }
             }
         }
         reasons
@@ -469,79 +604,295 @@ fn any_codec_matches(entry: &str, source: &str) -> bool {
     }
 }
 
-fn stream_property_value(
+fn container_name_matches(candidate: &str, source: &VideoContainer) -> bool {
+    let parsed = candidate
+        .parse::<VideoContainer>()
+        .unwrap_or_else(|_| VideoContainer::Other(candidate.to_string()));
+    match (&parsed, source) {
+        (VideoContainer::Other(a), VideoContainer::Other(b)) => {
+            a.eq_ignore_ascii_case(b)
+        }
+        _ => &parsed == source,
+    }
+}
+
+fn condition_satisfied(
+    condition: &ProfileCondition,
+    media_source: &MediaSourceInfo,
+    stream: &MediaStream,
+) -> bool {
+    let Some(property) = condition
+        .property
+        .as_ref()
+    else {
+        return true;
+    };
+    let actual = condition_property_value(media_source, stream, property);
+    condition_satisfied_for_value(condition, property, &actual)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConditionValue {
+    Known(String),
+    Missing,
+    Unsupported,
+}
+
+impl ConditionValue {
+    fn as_deref(&self) -> Option<&str> {
+        match self {
+            Self::Known(value) => Some(value),
+            Self::Missing | Self::Unsupported => None,
+        }
+    }
+
+    fn detail(&self) -> &str {
+        match self {
+            Self::Known(value) => value,
+            Self::Missing => "(unknown)",
+            Self::Unsupported => "(unsupported)",
+        }
+    }
+}
+
+fn optional_condition_value<T: ToString>(value: Option<T>) -> ConditionValue {
+    value
+        .map(|value| ConditionValue::Known(value.to_string()))
+        .unwrap_or(ConditionValue::Missing)
+}
+
+fn condition_satisfied_for_value(
+    condition: &ProfileCondition,
+    property: &ProfileConditionProperty,
+    actual: &ConditionValue,
+) -> bool {
+    if matches!(actual, ConditionValue::Unsupported) {
+        return true;
+    }
+    let actual = actual.as_deref();
+    // Jellyfin treats HDR10+ as satisfying HDR10 compatibility constraints.
+    // Keep this rule shared by both Conditions and ApplyConditions.
+    if property == &ProfileConditionProperty::VideoRangeType
+        && actual.is_some_and(|value| value.eq_ignore_ascii_case("HDR10Plus"))
+        && condition.is_satisfied_opt(Some("HDR10"))
+    {
+        return true;
+    }
+    condition.is_satisfied_opt(actual)
+}
+
+fn condition_property_value(
+    media_source: &MediaSourceInfo,
     stream: &MediaStream,
     property: &ProfileConditionProperty,
-) -> Option<String> {
+) -> ConditionValue {
     match property {
-        ProfileConditionProperty::VideoRangeType => stream
-            .video_range_type
-            .as_ref()
-            .map(|v| {
-                v.as_str()
-                    .to_string()
-            }),
-        ProfileConditionProperty::VideoCodecTag => stream
-            .codec_tag
-            .clone(),
-        ProfileConditionProperty::IsAnamorphic => Some(
+        ProfileConditionProperty::VideoRangeType => optional_condition_value(
             stream
-                .is_anamorphic
-                .unwrap_or(false)
+                .video_range_type
+                .as_ref()
+                .map(|value| value.as_str()),
+        ),
+        ProfileConditionProperty::VideoCodecTag => optional_condition_value(
+            stream
+                .codec_tag
+                .as_deref(),
+        ),
+        ProfileConditionProperty::IsAnamorphic => {
+            optional_condition_value(stream.is_anamorphic)
+        }
+        ProfileConditionProperty::IsInterlaced => {
+            optional_condition_value(Some(stream.is_interlaced))
+        }
+        ProfileConditionProperty::IsAvc => optional_condition_value(stream.is_avc),
+        ProfileConditionProperty::VideoBitDepth
+        | ProfileConditionProperty::BitDepth
+        | ProfileConditionProperty::AudioBitDepth => {
+            optional_condition_value(stream.bit_depth)
+        }
+        ProfileConditionProperty::RefFrames => optional_condition_value(
+            stream
+                .ref_frames
+                .filter(|frames| *frames > 0),
+        ),
+        ProfileConditionProperty::NumStreams => ConditionValue::Known(
+            media_source
+                .media_streams
+                .len()
                 .to_string(),
         ),
-        ProfileConditionProperty::IsInterlaced => Some(
-            stream
-                .is_interlaced
+        ProfileConditionProperty::NumAudioStreams => ConditionValue::Known(
+            media_source
+                .media_streams
+                .iter()
+                .filter(|stream| matches!(stream.type_, Some(MediaStreamType::Audio)))
+                .count()
                 .to_string(),
         ),
-        ProfileConditionProperty::IsAvc => Some(
-            stream
-                .is_avc
-                .unwrap_or(false)
+        ProfileConditionProperty::NumVideoStreams => ConditionValue::Known(
+            media_source
+                .media_streams
+                .iter()
+                .filter(|stream| matches!(stream.type_, Some(MediaStreamType::Video)))
+                .count()
                 .to_string(),
         ),
-        ProfileConditionProperty::BitDepth => stream
-            .bit_depth
-            .map(|v| v.to_string()),
-        ProfileConditionProperty::RefFrames => stream
-            .ref_frames
-            .map(|v| v.to_string()),
-        ProfileConditionProperty::NumAudioStreams
-        | ProfileConditionProperty::NumVideoStreams => None,
         ProfileConditionProperty::VideoLevel | ProfileConditionProperty::Level => {
-            stream
-                .level
-                .map(|v| v.to_string())
+            optional_condition_value(stream.level)
         }
         ProfileConditionProperty::VideoProfile | ProfileConditionProperty::Profile => {
-            stream
-                .profile
-                .clone()
+            optional_condition_value(
+                stream
+                    .profile
+                    .as_deref(),
+            )
         }
-        ProfileConditionProperty::Height => stream
-            .height
-            .map(|v| v.to_string()),
-        ProfileConditionProperty::Width => stream
-            .width
-            .map(|v| v.to_string()),
+        ProfileConditionProperty::Height => optional_condition_value(stream.height),
+        ProfileConditionProperty::Width => optional_condition_value(stream.width),
         ProfileConditionProperty::VideoFramerate
-        | ProfileConditionProperty::Framerate => stream
-            .real_frame_rate
-            .map(|v| v.to_string()),
+        | ProfileConditionProperty::Framerate => {
+            optional_condition_value(stream.real_frame_rate)
+        }
+        ProfileConditionProperty::VideoRotation => {
+            optional_condition_value(stream.rotation)
+        }
         ProfileConditionProperty::VideoBitrate
         | ProfileConditionProperty::Bitrate
-        | ProfileConditionProperty::AudioBitrate => stream
-            .bit_rate
-            .map(|v| v.to_string()),
-        ProfileConditionProperty::AudioChannels => stream
-            .channels
-            .map(|v| v.to_string()),
-        ProfileConditionProperty::AudioSampleRate => stream
-            .sample_rate
-            .map(|v| v.to_string()),
-        _ => None,
+        | ProfileConditionProperty::AudioBitrate => {
+            optional_condition_value(stream.bit_rate)
+        }
+        ProfileConditionProperty::AudioChannels => {
+            optional_condition_value(stream.channels)
+        }
+        ProfileConditionProperty::AudioProfile => optional_condition_value(
+            stream
+                .profile
+                .as_deref(),
+        ),
+        ProfileConditionProperty::AudioSampleRate => {
+            optional_condition_value(stream.sample_rate)
+        }
+        ProfileConditionProperty::PacketLength => {
+            optional_condition_value(stream.packet_length)
+        }
+        ProfileConditionProperty::IsSecondaryAudio => {
+            optional_condition_value(is_secondary_audio(media_source, stream))
+        }
+        ProfileConditionProperty::Has64BitOffsets
+        | ProfileConditionProperty::VideoTimestamp
+        | ProfileConditionProperty::Other(_) => ConditionValue::Unsupported,
     }
+}
+
+fn failed_condition_reason(
+    property: &ProfileConditionProperty,
+    stream: &MediaStream,
+    detail: String,
+) -> Option<TranscodeReason> {
+    match property {
+        ProfileConditionProperty::VideoRangeType => {
+            Some(TranscodeReason::VideoRangeTypeNotSupported(detail))
+        }
+        ProfileConditionProperty::VideoCodecTag => {
+            Some(TranscodeReason::VideoCodecTagNotSupported(detail))
+        }
+        ProfileConditionProperty::VideoProfile | ProfileConditionProperty::Profile => {
+            Some(TranscodeReason::VideoProfileNotSupported(detail))
+        }
+        ProfileConditionProperty::VideoBitDepth
+        | ProfileConditionProperty::BitDepth => {
+            Some(TranscodeReason::VideoBitDepthNotSupported(detail))
+        }
+        ProfileConditionProperty::VideoLevel | ProfileConditionProperty::Level => {
+            Some(TranscodeReason::VideoLevelNotSupported(detail))
+        }
+        ProfileConditionProperty::Width | ProfileConditionProperty::Height => {
+            Some(TranscodeReason::VideoResolutionNotSupported(detail))
+        }
+        ProfileConditionProperty::VideoFramerate
+        | ProfileConditionProperty::Framerate => {
+            Some(TranscodeReason::VideoFramerateNotSupported(detail))
+        }
+        ProfileConditionProperty::VideoRotation => {
+            Some(TranscodeReason::VideoRotationNotSupported(detail))
+        }
+        ProfileConditionProperty::VideoBitrate => {
+            Some(TranscodeReason::VideoBitrateNotSupported(detail))
+        }
+        ProfileConditionProperty::RefFrames => {
+            Some(TranscodeReason::RefFramesNotSupported(detail))
+        }
+        ProfileConditionProperty::IsAnamorphic => {
+            Some(TranscodeReason::AnamorphicVideoNotSupported(detail))
+        }
+        ProfileConditionProperty::IsInterlaced => {
+            Some(TranscodeReason::InterlacedVideoNotSupported(detail))
+        }
+        ProfileConditionProperty::AudioChannels => {
+            Some(TranscodeReason::AudioChannelsNotSupported(detail))
+        }
+        ProfileConditionProperty::AudioProfile => {
+            Some(TranscodeReason::AudioProfileNotSupported(detail))
+        }
+        ProfileConditionProperty::AudioSampleRate => {
+            Some(TranscodeReason::AudioSampleRateNotSupported(detail))
+        }
+        ProfileConditionProperty::AudioBitDepth => {
+            Some(TranscodeReason::AudioBitDepthNotSupported(detail))
+        }
+        ProfileConditionProperty::AudioBitrate => {
+            Some(TranscodeReason::AudioBitrateNotSupported(detail))
+        }
+        ProfileConditionProperty::IsSecondaryAudio => {
+            Some(TranscodeReason::SecondaryAudioNotSupported(detail))
+        }
+        ProfileConditionProperty::NumStreams => {
+            Some(TranscodeReason::StreamCountExceedsLimit(detail))
+        }
+        ProfileConditionProperty::Bitrate => {
+            if matches!(stream.type_, Some(MediaStreamType::Audio)) {
+                Some(TranscodeReason::AudioBitrateNotSupported(detail))
+            } else {
+                Some(TranscodeReason::VideoBitrateNotSupported(detail))
+            }
+        }
+        ProfileConditionProperty::Has64BitOffsets
+        | ProfileConditionProperty::PacketLength
+        | ProfileConditionProperty::VideoTimestamp
+        | ProfileConditionProperty::IsAvc
+        | ProfileConditionProperty::NumAudioStreams
+        | ProfileConditionProperty::NumVideoStreams => None,
+        ProfileConditionProperty::Other(_) => None,
+    }
+}
+
+fn selected_audio_stream(source: &MediaSourceInfo) -> Option<&MediaStream> {
+    source
+        .default_audio_stream_index
+        .and_then(|index| {
+            source
+                .media_streams
+                .iter()
+                .find(|stream| {
+                    stream.index == index
+                        && matches!(stream.type_, Some(MediaStreamType::Audio))
+                })
+        })
+        .or_else(|| source.audio_stream())
+}
+
+fn is_secondary_audio(source: &MediaSourceInfo, stream: &MediaStream) -> Option<bool> {
+    if stream.is_external {
+        return Some(false);
+    }
+    source
+        .media_streams
+        .iter()
+        .find(|candidate| {
+            matches!(candidate.type_, Some(MediaStreamType::Audio))
+                && !candidate.is_external
+        })
+        .map(|primary| primary.index != stream.index)
 }
 
 pub trait ProfileConditionExt {
@@ -562,7 +913,7 @@ impl ProfileConditionExt for ProfileCondition {
             _ => {
                 return !self
                     .is_required
-                    .unwrap_or(true);
+                    .unwrap_or(false);
             }
         };
         let expected = self
@@ -581,7 +932,7 @@ impl ProfileConditionExt for ProfileCondition {
                 {
                     a <= e
                 } else {
-                    true
+                    false
                 }
             }
             ProfileConditionType::GreaterThanEqual => {
@@ -589,7 +940,7 @@ impl ProfileConditionExt for ProfileCondition {
                 {
                     a >= e
                 } else {
-                    true
+                    false
                 }
             }
             _ => true,
@@ -598,12 +949,16 @@ impl ProfileConditionExt for ProfileCondition {
 }
 
 /// Individual quality/compatibility signals for one `MediaSourceInfo`, from
-/// which a `SortMediaSourcesMode`-specific sort key is built via `.key()`.
+/// which a `SortMediaSourcesMode`-specific sort key is built via `.sort_key()`.
 /// Every field is "higher is better".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MediaSourceRank {
+    resolution_fit_tier: u8,
+    cached: bool,
+    bitrate_plausibility_tier: u8,
     transcode_cost_tier: u8,
     resolution_tier: u8,
+    hdr_class: u8,
     hdr_tier: u8,
     bit_depth: i64,
     quality_source_tier: u8,
@@ -612,15 +967,39 @@ pub struct MediaSourceRank {
     bitrate: i64,
 }
 
-/// All request-independent inputs used to rank sources. Bitrate limits are
-/// intentionally absent: they are live playback policy, not a durable device
-/// capability and therefore must never affect source ordering.
+/// Compared lexicographically. Best/Compatibility put resolution fit ahead
+/// of cache availability and playback cost. Quality ignores resolution fit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct MediaSourceSortKey {
+    resolution_fit: u8,
+    cached: bool,
+    plausibility_before_cost: u8,
+    cost: u8,
+    plausibility_after_cost: u8,
+    resolution: u8,
+    hdr_class: u8,
+    release_quality: u8,
+    bitrate: i64,
+    bit_depth: i64,
+    audio_tier: u8,
+    audio_channels: i64,
+    hdr_variant: u8,
+}
+
+/// All inputs used to rank sources for this request. `max_bitrate` is the
+/// same effective cap (request `MaxStreamingBitrate` combined with the
+/// device profile's own) the real transcode decision uses — a source that
+/// cap forces into a re-encode needs to rank the same as any other
+/// transcode-needing source, or the sort order disagrees with what playback
+/// is actually about to do.
 #[derive(Debug, Clone, Copy)]
 pub struct SourceRankingContext<'a> {
     pub mode: SortMediaSourcesMode,
     pub device_profile: Option<&'a DeviceProfile>,
+    pub is_4k_capable: bool,
     pub subtitle_mode: EmbeddedSubtitleHandling,
     pub explicit_subtitle_index: Option<i64>,
+    pub max_bitrate: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -630,6 +1009,8 @@ pub struct SourceAssessment {
 }
 
 impl SourceAssessment {
+    /// Legacy eight-element ranking tuple retained for callers using the
+    /// public API. Internal source ordering uses `sort_key` instead.
     pub fn key(
         &self,
         mode: SortMediaSourcesMode,
@@ -638,39 +1019,86 @@ impl SourceAssessment {
             .key(mode)
     }
 
+    pub fn sort_key(&self, mode: SortMediaSourcesMode) -> MediaSourceSortKey {
+        self.rank
+            .sort_key(mode)
+    }
+
     pub fn playback_label(&self) -> &'static str {
         playback_decision_label(&self.reasons)
     }
 }
 
 impl SourceRankingContext<'_> {
-    pub fn assess(&self, source: &MediaSourceInfo) -> SourceAssessment {
+    /// `allow_subtitle_extraction`: whether on-demand subtitle extraction is
+    /// feasible for this source (only ever true for a local one). It decides
+    /// whether an unsupported embedded image subtitle counts as a burn-in
+    /// transcode — it doesn't, if extraction will be used instead.
+    pub fn assess(
+        &self,
+        source: &MediaSourceInfo,
+        allow_subtitle_extraction: bool,
+    ) -> SourceAssessment {
         let reasons = compute_transcode_reasons(
             source,
             self.device_profile,
             self.subtitle_mode,
             self.explicit_subtitle_index,
-            None,
+            self.max_bitrate,
+            allow_subtitle_extraction,
         );
-        let rank = source.capability_rank(self.device_profile, &reasons);
+        let mut rank = source.capability_rank(self.device_profile, &reasons);
+        rank.resolution_fit_tier =
+            resolution_fit_tier(source, self.device_profile, self.is_4k_capable);
         SourceAssessment { reasons, rank }
     }
 
-    pub fn key(&self, source: &MediaSourceInfo) -> (u8, u8, u8, i64, u8, u8, i64, i64) {
-        self.assess(source)
-            .key(self.mode)
+    pub fn sort_key(
+        &self,
+        source: &MediaSourceInfo,
+        allow_subtitle_extraction: bool,
+    ) -> MediaSourceSortKey {
+        self.assess(source, allow_subtitle_extraction)
+            .sort_key(self.mode)
     }
 }
 
 impl MediaSourceRank {
+    /// Legacy public tuple key, preserving its shape and ordering semantics.
+    /// It projects the current sort key into the old eight-field shape, so
+    /// cache status and bitrate plausibility cannot be represented here.
+    /// New source sorting uses `sort_key` instead.
+    pub fn key(
+        &self,
+        mode: SortMediaSourcesMode,
+    ) -> (u8, u8, u8, i64, u8, u8, i64, i64) {
+        let key = self.sort_key(mode);
+        (
+            key.cost,
+            key.resolution,
+            key.hdr_variant,
+            key.bit_depth,
+            key.release_quality,
+            key.audio_tier,
+            key.audio_channels,
+            key.bitrate,
+        )
+    }
+
     /// Sort key for `mode` — a *greater* value is a *better* match. Compared
     /// lexicographically, most significant tier first.
     ///
-    /// `Compatibility` puts `transcode_cost_tier` first: a version that direct
+    /// Best/Compatibility favor a suitable resolution first. A confirmed
+    /// upstream cache hit wins among sources with the same fit tier. Then
+    /// `Compatibility` puts
+    /// `transcode_cost_tier` first: a version that direct
     /// plays (or only needs a cheap remux) always outranks one that needs a
-    /// real re-encode, no matter how much better it looks on paper.
+    /// real re-encode, no matter how much better it looks on paper. `Best`
+    /// and `Quality` first demote only severely under-bitrated video sources.
     /// `Quality` drops cost from the key entirely — best quality wins even if
     /// it means transcoding. `Disabled` has no key; callers must not sort.
+    /// All HDR formats share a primary tier; release quality and bitrate
+    /// outrank HDR subtype, which is only a late tie-breaker.
     ///
     /// There's no separate subtitle field: whether the resolved default
     /// subtitle needs burning in is already reflected in
@@ -679,10 +1107,7 @@ impl MediaSourceRank {
     /// will actually be used and to `EmbeddedSubtitleHandling::Burn` mode) —
     /// re-deriving it here from every embedded subtitle stream would ignore
     /// which one is actually selected and double-count the same fact.
-    pub fn key(
-        &self,
-        mode: SortMediaSourcesMode,
-    ) -> (u8, u8, u8, i64, u8, u8, i64, i64) {
+    pub fn sort_key(&self, mode: SortMediaSourcesMode) -> MediaSourceSortKey {
         let cost = match mode {
             SortMediaSourcesMode::Compatibility => self.transcode_cost_tier,
             // Collapse Direct Play (4) and Direct Stream (3) into one tier —
@@ -705,16 +1130,30 @@ impl MediaSourceRank {
                 0
             }
         };
-        (
+        let (plausibility_before_cost, plausibility_after_cost) = match mode {
+            SortMediaSourcesMode::Compatibility => (1, self.bitrate_plausibility_tier),
+            _ => (self.bitrate_plausibility_tier, 0),
+        };
+        MediaSourceSortKey {
+            resolution_fit: match mode {
+                SortMediaSourcesMode::Best | SortMediaSourcesMode::Compatibility => {
+                    self.resolution_fit_tier
+                }
+                _ => 0,
+            },
+            cached: self.cached,
+            plausibility_before_cost,
             cost,
-            self.resolution_tier,
-            self.hdr_tier,
-            self.bit_depth,
-            self.quality_source_tier,
-            self.audio_tier,
-            self.audio_channels,
-            self.bitrate,
-        )
+            plausibility_after_cost,
+            resolution: self.resolution_tier,
+            hdr_class: self.hdr_class,
+            release_quality: self.quality_source_tier,
+            bitrate: self.bitrate,
+            bit_depth: self.bit_depth,
+            audio_tier: self.audio_tier,
+            audio_channels: self.audio_channels,
+            hdr_variant: self.hdr_tier,
+        }
     }
 }
 
@@ -738,24 +1177,24 @@ fn transcode_cost_tier(reasons: &TranscodeReasons) -> u8 {
     let needs_video_reencode = reasons
         .0
         .iter()
-        .any(|r| {
-            matches!(
-                r,
-                TranscodeReason::VideoCodecNotSupported(_)
-                    | TranscodeReason::VideoRangeTypeNotSupported(_)
-                    | TranscodeReason::VideoProfileNotSupported(_)
-                    | TranscodeReason::VideoBitDepthNotSupported(_)
-                    | TranscodeReason::SubtitleCodecNotSupported(_)
-                    | TranscodeReason::ContainerBitrateExceedsLimit
-            )
-        });
+        .any(TranscodeReason::is_video)
+        || reasons
+            .0
+            .iter()
+            .any(|reason| {
+                matches!(
+                    reason,
+                    TranscodeReason::SubtitleCodecNotSupported(_)
+                        | TranscodeReason::ContainerBitrateExceedsLimit
+                )
+            });
     if needs_video_reencode {
         return 1;
     }
     let needs_audio_reencode = reasons
         .0
         .iter()
-        .any(|r| matches!(r, TranscodeReason::AudioCodecNotSupported(_)));
+        .any(TranscodeReason::is_audio);
     if needs_audio_reencode {
         return 2;
     }
@@ -780,6 +1219,7 @@ pub fn subtitle_burn_reason(
     device_profile: Option<&DeviceProfile>,
     subtitle_mode: EmbeddedSubtitleHandling,
     explicit_subtitle_index: Option<i64>,
+    allow_extraction: bool,
 ) -> Option<TranscodeReason> {
     if subtitle_mode != EmbeddedSubtitleHandling::Burn {
         return None;
@@ -797,18 +1237,12 @@ pub fn subtitle_burn_reason(
     let codec = stream
         .codec
         .as_deref()?;
-    let supported = device_profile
-        .map(|dp| {
-            dp.subtitle_profiles
-                .iter()
-                .filter_map(|p| {
-                    p.format
-                        .as_deref()
-                })
-                .any(|f| subtitle_codec_matches_profile(codec, f))
-        })
-        .unwrap_or(false);
-    if supported {
+    // Deliverable (Embed, or External when extraction is feasible) means no
+    // burn-in transcode is actually needed — apply_subtitle_delivery prefers
+    // extraction over burning in even in Burn mode, so a burn-in reason here
+    // would be wrong whenever extraction is what will really happen.
+    let parsed = SubtitleCodec::from_codec_name(codec);
+    if subtitle_codec_deliverable(&parsed, device_profile, allow_extraction) {
         None
     } else {
         Some(TranscodeReason::SubtitleCodecNotSupported(
@@ -835,6 +1269,7 @@ pub fn compute_transcode_reasons(
     subtitle_mode: EmbeddedSubtitleHandling,
     explicit_subtitle_index: Option<i64>,
     max_bitrate: Option<i64>,
+    allow_subtitle_extraction: bool,
 ) -> TranscodeReasons {
     let mut reasons = device_profile
         .map(|profile| profile.check_direct_play(source))
@@ -856,6 +1291,7 @@ pub fn compute_transcode_reasons(
         device_profile,
         subtitle_mode,
         explicit_subtitle_index,
+        allow_subtitle_extraction,
     ) {
         reasons.insert(reason);
     }
@@ -897,67 +1333,97 @@ pub fn annotate_video_display_title(
     *title = format!("{title} {bitrate_str}({label})");
 }
 
-/// True only when the profile gives an explicit, numeric signal that the
-/// device can handle 4K — an HEVC/AV1 `VideoLevel` condition at or above the
-/// 4K tier, or a `Width`/`Height` condition capping at/above 3840x2160.
-/// Absence of such a condition means "unknown", not "no" — callers must not
-/// treat that as a reason to rank a source lower, only as a reason not to
-/// let resolution drive ranking at all.
-fn confident_4k_capable(profile: &DeviceProfile) -> bool {
-    const HEVC_4K_LEVEL: i64 = 150; // HEVC Level 5.0
-    const AV1_4K_LEVEL: i64 = 13; // AV1 Level 5.0
-
-    for cp in &profile.codec_profiles {
-        if !matches!(cp.type_, None | Some(DlnaProfileType::Video)) {
+/// Explicit width/height ceilings for this source's codec take precedence
+/// over the device-wide observation. An absent ceiling or a VideoLevel alone
+/// says nothing about the device's usable display resolution.
+fn explicit_4k_resolution_support(
+    profile: &DeviceProfile,
+    source: &MediaSourceInfo,
+    video: &MediaStream,
+) -> Option<bool> {
+    let (width, height) = (video.width, video.height);
+    let mut width_cap = None::<i64>;
+    let mut height_cap = None::<i64>;
+    for codec_profile in &profile.codec_profiles {
+        if !matches!(codec_profile.type_, None | Some(CodecProfileType::Video))
+            || !codec_profile.applies_to_media(
+                source,
+                video,
+                video
+                    .codec
+                    .as_deref()
+                    .unwrap_or(""),
+            )
+        {
             continue;
         }
-        let is_hevc = codec_list_contains(&cp.codec, &["hevc", "h265"]);
-        let is_av1 = codec_list_contains(&cp.codec, &["av1"]);
-        for cond in &cp.conditions {
-            let Some(property) = cond
-                .property
-                .as_ref()
-            else {
+        for condition in &codec_profile.conditions {
+            if condition.condition != Some(ProfileConditionType::LessThanEqual) {
                 continue;
-            };
-            let Some(value) = cond
+            }
+            let Some(cap) = condition
                 .value
                 .as_deref()
-                .and_then(|v| {
-                    v.parse::<i64>()
+                .and_then(|value| {
+                    value
+                        .parse::<i64>()
                         .ok()
                 })
+                .filter(|value| *value > 0)
             else {
                 continue;
             };
-            let confident = match property {
-                ProfileConditionProperty::Width => value >= 3840,
-                ProfileConditionProperty::Height => value >= 2160,
-                ProfileConditionProperty::VideoLevel
-                | ProfileConditionProperty::Level => {
-                    (is_hevc && value >= HEVC_4K_LEVEL)
-                        || (is_av1 && value >= AV1_4K_LEVEL)
-                }
-                _ => false,
+            let limit = match condition
+                .property
+                .as_ref()
+            {
+                Some(ProfileConditionProperty::Width) => &mut width_cap,
+                Some(ProfileConditionProperty::Height) => &mut height_cap,
+                _ => continue,
             };
-            if confident {
-                return true;
-            }
+            *limit = Some(limit.map_or(cap, |previous| previous.min(cap)));
         }
     }
-    false
+    if width.is_some_and(|width| width_cap.is_some_and(|cap| width > cap))
+        || height.is_some_and(|height| height_cap.is_some_and(|cap| height > cap))
+    {
+        Some(false)
+    } else if width.is_some()
+        && height.is_some()
+        && width_cap.is_some()
+        && height_cap.is_some()
+    {
+        Some(true)
+    } else {
+        None
+    }
 }
 
-fn codec_list_contains(list: &Option<Vec<String>>, wanted: &[&str]) -> bool {
-    let Some(list) = list else {
-        return false;
+fn resolution_fit_tier(
+    source: &MediaSourceInfo,
+    profile: Option<&DeviceProfile>,
+    is_4k_capable: bool,
+) -> u8 {
+    let Some(video) = primary_video_stream(source) else {
+        return 1;
     };
-    list.iter()
-        .any(|c| {
-            wanted
-                .iter()
-                .any(|w| c.eq_ignore_ascii_case(w))
-        })
+    let long_side = video
+        .width
+        .unwrap_or(0)
+        .max(
+            video
+                .height
+                .unwrap_or(0),
+        );
+    if long_side < 3200 {
+        return 1;
+    }
+    // Until 4K is supported by explicit dimensions or observed playback,
+    // prefer a known smaller source even if the 4K source is cached.
+    let capable = profile
+        .and_then(|profile| explicit_4k_resolution_support(profile, source, video))
+        .unwrap_or(is_4k_capable);
+    u8::from(capable)
 }
 
 fn primary_video_stream(source: &MediaSourceInfo) -> Option<&MediaStream> {
@@ -965,22 +1431,6 @@ fn primary_video_stream(source: &MediaSourceInfo) -> Option<&MediaStream> {
         .media_streams
         .iter()
         .find(|s| matches!(s.type_, Some(MediaStreamType::Video)))
-}
-
-fn default_audio_stream(source: &MediaSourceInfo) -> Option<&MediaStream> {
-    if let Some(idx) = source.default_audio_stream_index {
-        if let Some(s) = source
-            .media_streams
-            .iter()
-            .find(|s| s.index == idx)
-        {
-            return Some(s);
-        }
-    }
-    source
-        .media_streams
-        .iter()
-        .find(|s| matches!(s.type_, Some(MediaStreamType::Audio)))
 }
 
 fn hdr_tier(stream: Option<&MediaStream>) -> u8 {
@@ -1016,7 +1466,7 @@ fn audio_codec_tier(stream: Option<&MediaStream>) -> u8 {
 
 /// Rank a `MediaSourceInfo` against a device's capabilities — call as
 /// `source.capability_rank(profile, reasons)` and sort with
-/// `sort_by_key(|s| Reverse(s.capability_rank(profile, reasons).key(mode)))`,
+/// `sort_by_key(|s| Reverse(s.capability_rank(profile, reasons).sort_key(mode)))`,
 /// higher is better.
 ///
 /// `reasons` is taken as a parameter rather than read from
@@ -1040,16 +1490,47 @@ pub trait MediaSourceCapabilityExt {
 /// `conversions.rs` always stamps the original `StreamInfo` (as JSON) into
 /// `remux.provider_info`, so that's recovered here instead of threading a
 /// second parameter through every call site.
-fn quality_source_tier(source: &MediaSourceInfo) -> u8 {
-    let stream_info: Option<crate::stream::StreamInfo> = source
+fn source_stream_info(source: &MediaSourceInfo) -> Option<crate::stream::StreamInfo> {
+    source
         .remux
         .as_ref()
         .and_then(|r| {
             r.provider_info
                 .as_ref()
         })
-        .and_then(|v| serde_json::from_value(v.clone()).ok());
-    crate::db::detect_source_quality_weight(stream_info.as_ref())
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+}
+
+/// Only demote extreme bitrate/resolution mismatches. One bit per four pixels
+/// per second corresponds to about 0.5 Mbps at 1080p or 2 Mbps at 4K; this
+/// is a plausibility check, not an estimate of visual quality. Below 100 Kbps
+/// is suspect even without dimensions; otherwise missing facts stay neutral.
+fn bitrate_plausibility_tier(
+    source: &MediaSourceInfo,
+    video: Option<&MediaStream>,
+) -> u8 {
+    let Some(bitrate) = source
+        .bitrate
+        .filter(|bps| *bps > 0)
+    else {
+        return 1;
+    };
+    if bitrate < 100_000 {
+        return 0;
+    }
+    let Some((width, height)) = video.and_then(|stream| {
+        Some((
+            stream
+                .width
+                .filter(|v| *v > 0)?,
+            stream
+                .height
+                .filter(|v| *v > 0)?,
+        ))
+    }) else {
+        return 1;
+    };
+    u8::from((bitrate as i128) * 4 >= (width as i128) * (height as i128))
 }
 
 impl MediaSourceCapabilityExt for MediaSourceInfo {
@@ -1061,7 +1542,8 @@ impl MediaSourceCapabilityExt for MediaSourceInfo {
         reasons: &TranscodeReasons,
     ) -> MediaSourceRank {
         let video = primary_video_stream(self);
-        let audio = default_audio_stream(self);
+        let audio = selected_audio_stream(self);
+        let stream_info = source_stream_info(self);
 
         let (width, height) = video
             .map(|stream| {
@@ -1075,31 +1557,41 @@ impl MediaSourceCapabilityExt for MediaSourceInfo {
                 )
             })
             .unwrap_or_default();
-        let raw_resolution_tier = if width >= 3840 || height >= 2160 {
-            4
-        } else if width >= 1920 || height >= 1080 {
-            3
-        } else if width >= 1280 || height >= 720 {
+        // Release dimensions are often cropped (e.g. 3836x2072 or
+        // 1920x800). Bucket by the longer side instead of exact display
+        // dimensions so these remain 4K and 1080p respectively.
+        let long_side = width.max(height);
+        let raw_resolution_tier = if long_side >= 3200 {
+            5 // 4K
+        } else if long_side >= 2300 {
+            4 // 1440p
+        } else if long_side >= 1600 {
+            3 // 1080p
+        } else if long_side >= 1100 {
             2
-        } else if width > 0 || height > 0 {
+        } else if long_side > 0 {
             1
         } else {
             0
         };
-        // Without an explicit 4K signal, treat 4K as tied with 1080p rather
-        // than promoting it. Lower resolution tiers remain distinct so a
-        // 720p source cannot beat 1080p merely because of a later tie-breaker.
-        let resolution_tier =
-            if raw_resolution_tier == 4 && !profile.is_some_and(confident_4k_capable) {
-                3
-            } else {
-                raw_resolution_tier
-            };
+        // An absent video-range tag is not evidence of quality below SDR.
+        // Treat it as the SDR baseline for ordering, without claiming the
+        // source was actually probed as SDR.
+        let hdr_tier = hdr_tier(video).max(1);
 
         MediaSourceRank {
+            resolution_fit_tier: resolution_fit_tier(self, profile, false),
+            cached: stream_info
+                .as_ref()
+                .and_then(|info| info.service_cached)
+                == Some(true),
+            bitrate_plausibility_tier: bitrate_plausibility_tier(self, video),
             transcode_cost_tier: transcode_cost_tier(reasons),
-            resolution_tier,
-            hdr_tier: hdr_tier(video),
+            resolution_tier: raw_resolution_tier,
+            // HDR vs SDR matters; Dolby Vision vs HDR10 only breaks otherwise
+            // equal ranks after release quality, bitrate, bit depth and audio.
+            hdr_class: if hdr_tier > 1 { 2 } else { 1 },
+            hdr_tier,
             // A missing BitDepth is common for remote (RemuxDB-sourced)
             // probe data that never explicitly set it — fall back to
             // deriving it from PixelFormat (e.g. "yuv420p10le" -> 10), the
@@ -1120,7 +1612,9 @@ impl MediaSourceCapabilityExt for MediaSourceInfo {
                         })
                 })
                 .unwrap_or(8),
-            quality_source_tier: quality_source_tier(self),
+            quality_source_tier: crate::db::detect_source_quality_weight(
+                stream_info.as_ref(),
+            ),
             audio_tier: audio_codec_tier(audio),
             audio_channels: audio
                 .and_then(|s| s.channels)
@@ -1135,16 +1629,20 @@ impl MediaSourceCapabilityExt for MediaSourceInfo {
 #[cfg(test)]
 mod tests {
     use super::{
-        DeviceProfileExt, MediaSourceCapabilityExt, MediaSourceRank,
-        default_audio_stream, playback_decision_label, primary_video_stream,
-        subtitle_burn_reason, transcode_cost_tier,
+        CodecProfileExt, DeviceProfileExt, MediaSourceCapabilityExt, MediaSourceRank,
+        MediaSourceSortKey, SourceRankingContext, SubtitleCodec,
+        explicit_4k_resolution_support, failed_condition_reason,
+        keeps_embedded_subtitle, playback_decision_label, primary_video_stream,
+        resolution_fit_tier, subtitle_burn_reason, subtitle_codec_deliverable,
+        transcode_cost_tier,
     };
     use remux_sdks::remux::{
-        AudioCodec, CodecProfile, DeviceProfile, DirectPlayProfile, DlnaProfileType,
-        EmbeddedSubtitleHandling, MediaSourceInfo, MediaStream, MediaStreamType,
-        ProfileCondition, ProfileConditionProperty, ProfileConditionType,
-        SortMediaSourcesMode, SubtitleDeliveryMethod, SubtitleProfile, TranscodeReason,
-        TranscodeReasons, VideoCodec, VideoContainer, VideoRangeType,
+        AudioCodec, CodecProfile, CodecProfileType, DeviceProfile, DirectPlayProfile,
+        DlnaProfileType, EmbeddedSubtitleHandling, MediaSourceInfo, MediaStream,
+        MediaStreamType, ProfileCondition, ProfileConditionProperty,
+        ProfileConditionType, SortMediaSourcesMode, SubtitleDeliveryMethod,
+        SubtitleProfile, TranscodeReason, TranscodeReasons, VideoCodec, VideoContainer,
+        VideoRangeType,
     };
 
     #[test]
@@ -1160,6 +1658,119 @@ mod tests {
         assert_eq!(
             profile.subtitle_delivery_method("hdmv_pgs_subtitle"),
             Some(SubtitleDeliveryMethod::External)
+        );
+    }
+
+    /// A codec profile without dimensions says nothing about 4K playback.
+    #[test]
+    fn codec_profile_without_resolution_ceiling_does_not_prove_4k() {
+        let profile = DeviceProfile {
+            codec_profiles: vec![CodecProfile {
+                type_: Some(CodecProfileType::Video),
+                codec: Some(vec!["hevc".to_string()]),
+                conditions: vec![ProfileCondition {
+                    condition: Some(ProfileConditionType::EqualsAny),
+                    property: Some(ProfileConditionProperty::VideoProfile),
+                    value: Some("main|main 10".to_string()),
+                    is_required: Some(false),
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut video = video_stream(3840, Some(VideoRangeType::Sdr));
+        video.height = Some(2160);
+        video.codec = Some("hevc".to_string());
+        let source = source_with(video, audio_stream("aac", 2), true);
+        assert_eq!(resolution_fit_tier(&source, Some(&profile), false), 0);
+    }
+
+    #[test]
+    fn codec_video_level_does_not_prove_4k() {
+        let profile = DeviceProfile {
+            codec_profiles: vec![CodecProfile {
+                type_: Some(CodecProfileType::Video),
+                codec: Some(vec!["hevc".to_string()]),
+                conditions: vec![ProfileCondition {
+                    condition: Some(ProfileConditionType::LessThanEqual),
+                    property: Some(ProfileConditionProperty::VideoLevel),
+                    value: Some("153".to_string()),
+                    is_required: Some(true),
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut video = video_stream(3840, Some(VideoRangeType::Sdr));
+        video.height = Some(2160);
+        video.codec = Some("hevc".to_string());
+        let source = source_with(video, audio_stream("aac", 2), true);
+        assert_eq!(resolution_fit_tier(&source, Some(&profile), false), 0);
+    }
+
+    #[test]
+    fn explicit_resolution_ceiling_overrides_learned_4k() {
+        let profile = DeviceProfile {
+            codec_profiles: vec![CodecProfile {
+                type_: Some(CodecProfileType::Video),
+                codec: Some(vec!["hevc".to_string()]),
+                conditions: vec![
+                    ProfileCondition {
+                        condition: Some(ProfileConditionType::LessThanEqual),
+                        property: Some(ProfileConditionProperty::Width),
+                        value: Some("1920".to_string()),
+                        is_required: Some(true),
+                    },
+                    ProfileCondition {
+                        condition: Some(ProfileConditionType::LessThanEqual),
+                        property: Some(ProfileConditionProperty::Height),
+                        value: Some("1080".to_string()),
+                        is_required: Some(true),
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut video = video_stream(3840, Some(VideoRangeType::Sdr));
+        video.height = Some(2160);
+        video.codec = Some("hevc".to_string());
+        let source = source_with(video, audio_stream("aac", 2), true);
+        assert_eq!(resolution_fit_tier(&source, Some(&profile), true), 0);
+    }
+
+    #[test]
+    fn explicit_4k_resolution_ceiling_proves_4k_for_matching_codec() {
+        let profile = DeviceProfile {
+            codec_profiles: vec![CodecProfile {
+                type_: Some(CodecProfileType::Video),
+                codec: Some(vec!["hevc".to_string()]),
+                conditions: vec![
+                    ProfileCondition {
+                        condition: Some(ProfileConditionType::LessThanEqual),
+                        property: Some(ProfileConditionProperty::Width),
+                        value: Some("3840".to_string()),
+                        is_required: Some(true),
+                    },
+                    ProfileCondition {
+                        condition: Some(ProfileConditionType::LessThanEqual),
+                        property: Some(ProfileConditionProperty::Height),
+                        value: Some("2160".to_string()),
+                        is_required: Some(true),
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut video = video_stream(3840, Some(VideoRangeType::Sdr));
+        video.height = Some(2160);
+        video.codec = Some("hevc".to_string());
+        let source = source_with(video, audio_stream("aac", 2), true);
+        assert_eq!(resolution_fit_tier(&source, Some(&profile), false), 1);
+        assert_eq!(
+            explicit_4k_resolution_support(&profile, &source, &source.media_streams[0]),
+            Some(true)
         );
     }
 
@@ -1275,7 +1886,7 @@ mod tests {
                 type_: Some(DlnaProfileType::Video),
             }],
             codec_profiles: vec![CodecProfile {
-                type_: Some(DlnaProfileType::Video),
+                type_: Some(CodecProfileType::Video),
                 codec: Some(vec!["h264".to_string()]),
                 conditions: vec![ProfileCondition {
                     condition: Some(ProfileConditionType::EqualsAny),
@@ -1283,6 +1894,7 @@ mod tests {
                     value: Some("high|main|baseline|constrained baseline".to_string()),
                     is_required: Some(false),
                 }],
+                ..Default::default()
             }],
             ..Default::default()
         }
@@ -1332,10 +1944,441 @@ mod tests {
         );
     }
 
+    fn moonfin_ref_frames_profile() -> DeviceProfile {
+        let codec_profiles: Vec<CodecProfile> =
+            serde_json::from_value(serde_json::json!([
+                {
+                    "Type": "Video",
+                    "Codec": "h264",
+                    "Container": "mkv",
+                    "Conditions": [{
+                        "Condition": "LessThanEqual",
+                        "Property": "RefFrames",
+                        "Value": "12",
+                        "IsRequired": true
+                    }],
+                    "ApplyConditions": [{
+                        "Condition": "GreaterThanEqual",
+                        "Property": "Width",
+                        "Value": "1200",
+                        "IsRequired": true
+                    }]
+                },
+                {
+                    "Type": "Video",
+                    "Codec": "h264",
+                    "Container": "mkv",
+                    "Conditions": [{
+                        "Condition": "LessThanEqual",
+                        "Property": "RefFrames",
+                        "Value": "4",
+                        "IsRequired": true
+                    }],
+                    "ApplyConditions": [{
+                        "Condition": "GreaterThanEqual",
+                        "Property": "Width",
+                        "Value": "1900",
+                        "IsRequired": true
+                    }]
+                }
+            ]))
+            .expect("Moonfin codec profiles deserialize");
+        DeviceProfile {
+            direct_play_profiles: vec![DirectPlayProfile {
+                container: Some(vec![VideoContainer::Mkv]),
+                video_codec: Some(vec![VideoCodec::H264]),
+                audio_codec: Some(vec![AudioCodec::Aac]),
+                type_: Some(DlnaProfileType::Video),
+            }],
+            codec_profiles,
+            ..Default::default()
+        }
+    }
+
+    fn h264_ref_frames_source(width: i64, ref_frames: Option<i64>) -> MediaSourceInfo {
+        let mut source = h264_source("High");
+        let video = source
+            .media_streams
+            .iter_mut()
+            .find(|stream| matches!(stream.type_, Some(MediaStreamType::Video)))
+            .expect("video stream");
+        video.width = Some(width);
+        video.ref_frames = ref_frames;
+        source
+    }
+
+    #[test]
+    fn moonfin_apply_conditions_scope_ref_frame_limits() {
+        let profile = moonfin_ref_frames_profile();
+
+        let reasons = profile.check_direct_play(&h264_ref_frames_source(1280, Some(5)));
+        assert!(
+            reasons.is_empty(),
+            "the <=4 rule is only applicable at widths >=1900: {reasons:?}"
+        );
+
+        let reasons = profile.check_direct_play(&h264_ref_frames_source(1920, Some(5)));
+        assert!(
+            reasons.contains(&TranscodeReason::RefFramesNotSupported(String::new())),
+            "a 1920-wide stream with five refs must fail with the precise reason: {reasons:?}"
+        );
+        assert!(
+            !reasons.contains(&TranscodeReason::VideoCodecNotSupported(String::new()))
+        );
+    }
+
+    #[test]
+    fn required_missing_ref_frames_has_precise_reason() {
+        let reasons = moonfin_ref_frames_profile()
+            .check_direct_play(&h264_ref_frames_source(1920, None));
+        assert!(
+            reasons.contains(&TranscodeReason::RefFramesNotSupported(String::new()))
+        );
+    }
+
+    #[test]
+    fn required_zero_ref_frames_has_precise_reason() {
+        let reasons = moonfin_ref_frames_profile()
+            .check_direct_play(&h264_ref_frames_source(1920, Some(0)));
+        assert!(
+            reasons.contains(&TranscodeReason::RefFramesNotSupported(String::new()))
+        );
+    }
+
+    #[test]
+    fn codec_profile_container_limits_are_honoured() {
+        let mut profile = moonfin_ref_frames_profile();
+        for codec_profile in &mut profile.codec_profiles {
+            codec_profile.container = Some("mp4".to_string());
+        }
+        let reasons =
+            profile.check_direct_play(&h264_ref_frames_source(1920, Some(99)));
+        assert!(
+            reasons.is_empty(),
+            "MP4-only codec restrictions must not apply to MKV: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn jellyfin_video_bit_depth_property_deserializes() {
+        let condition: ProfileCondition = serde_json::from_value(serde_json::json!({
+            "Condition": "LessThanEqual",
+            "Property": "VideoBitDepth",
+            "Value": "10"
+        }))
+        .expect("VideoBitDepth condition");
+        assert_eq!(
+            condition.property,
+            Some(ProfileConditionProperty::VideoBitDepth)
+        );
+    }
+
+    #[test]
+    fn total_stream_count_conditions_use_media_source_context() {
+        let profile = DeviceProfile {
+            direct_play_profiles: moonfin_ref_frames_profile().direct_play_profiles,
+            codec_profiles: vec![CodecProfile {
+                type_: Some(CodecProfileType::Video),
+                codec: Some(vec!["h264".to_string()]),
+                conditions: vec![ProfileCondition {
+                    condition: Some(ProfileConditionType::LessThanEqual),
+                    property: Some(ProfileConditionProperty::NumStreams),
+                    value: Some("2".to_string()),
+                    is_required: Some(true),
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut source = h264_ref_frames_source(1920, Some(1));
+        source
+            .media_streams
+            .push(MediaStream {
+                codec: Some("aac".to_string()),
+                type_: Some(MediaStreamType::Audio),
+                index: 2,
+                ..Default::default()
+            });
+        let reasons = profile.check_direct_play(&source);
+        assert!(
+            reasons.contains(&TranscodeReason::StreamCountExceedsLimit(String::new()))
+        );
+    }
+
+    #[test]
+    fn absent_is_required_defaults_to_jellyfin_false() {
+        let profile = DeviceProfile {
+            direct_play_profiles: moonfin_ref_frames_profile().direct_play_profiles,
+            codec_profiles: vec![CodecProfile {
+                type_: Some(CodecProfileType::Video),
+                codec: Some(vec!["h264".to_string()]),
+                conditions: vec![ProfileCondition {
+                    condition: Some(ProfileConditionType::LessThanEqual),
+                    property: Some(ProfileConditionProperty::RefFrames),
+                    value: Some("4".to_string()),
+                    is_required: None,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(
+            profile
+                .check_direct_play(&h264_ref_frames_source(1920, None))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn hdr10_plus_satisfies_hdr10_apply_condition() {
+        let source = MediaSourceInfo {
+            media_streams: vec![MediaStream {
+                codec: Some("hevc".to_string()),
+                type_: Some(MediaStreamType::Video),
+                video_range_type: Some(VideoRangeType::Hdr10Plus),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let profile = CodecProfile {
+            type_: Some(CodecProfileType::Video),
+            codec: Some(vec!["hevc".to_string()]),
+            apply_conditions: vec![ProfileCondition {
+                condition: Some(ProfileConditionType::Equals),
+                property: Some(ProfileConditionProperty::VideoRangeType),
+                value: Some("HDR10".to_string()),
+                is_required: Some(true),
+            }],
+            ..Default::default()
+        };
+        let stream = source
+            .video_stream()
+            .expect("video stream");
+
+        assert!(profile.applies_to_media(&source, stream, "hevc"));
+    }
+
+    #[test]
+    fn failed_conditions_map_to_precise_transcode_reasons() {
+        let video = MediaStream {
+            type_: Some(MediaStreamType::Video),
+            ..Default::default()
+        };
+        let audio = MediaStream {
+            type_: Some(MediaStreamType::Audio),
+            ..Default::default()
+        };
+        let cases = [
+            (
+                ProfileConditionProperty::VideoLevel,
+                &video,
+                "VideoLevelNotSupported",
+            ),
+            (
+                ProfileConditionProperty::Width,
+                &video,
+                "VideoResolutionNotSupported",
+            ),
+            (
+                ProfileConditionProperty::VideoFramerate,
+                &video,
+                "VideoFramerateNotSupported",
+            ),
+            (
+                ProfileConditionProperty::VideoRotation,
+                &video,
+                "VideoRotationNotSupported",
+            ),
+            (
+                ProfileConditionProperty::VideoBitrate,
+                &video,
+                "VideoBitrateNotSupported",
+            ),
+            (
+                ProfileConditionProperty::RefFrames,
+                &video,
+                "RefFramesNotSupported",
+            ),
+            (
+                ProfileConditionProperty::IsAnamorphic,
+                &video,
+                "AnamorphicVideoNotSupported",
+            ),
+            (
+                ProfileConditionProperty::IsInterlaced,
+                &video,
+                "InterlacedVideoNotSupported",
+            ),
+            (
+                ProfileConditionProperty::AudioChannels,
+                &audio,
+                "AudioChannelsNotSupported",
+            ),
+            (
+                ProfileConditionProperty::AudioProfile,
+                &audio,
+                "AudioProfileNotSupported",
+            ),
+            (
+                ProfileConditionProperty::AudioSampleRate,
+                &audio,
+                "AudioSampleRateNotSupported",
+            ),
+            (
+                ProfileConditionProperty::AudioBitDepth,
+                &audio,
+                "AudioBitDepthNotSupported",
+            ),
+            (
+                ProfileConditionProperty::AudioBitrate,
+                &audio,
+                "AudioBitrateNotSupported",
+            ),
+            (
+                ProfileConditionProperty::IsSecondaryAudio,
+                &audio,
+                "SecondaryAudioNotSupported",
+            ),
+            (
+                ProfileConditionProperty::NumStreams,
+                &video,
+                "StreamCountExceedsLimit",
+            ),
+        ];
+
+        for (property, stream, expected) in cases {
+            let reason = failed_condition_reason(&property, stream, "test".to_string())
+                .expect("known condition must have a reason");
+            assert_eq!(reason.name(), expected, "property {property}");
+        }
+        for property in [
+            ProfileConditionProperty::NumAudioStreams,
+            ProfileConditionProperty::NumVideoStreams,
+            ProfileConditionProperty::IsAvc,
+            ProfileConditionProperty::PacketLength,
+            ProfileConditionProperty::Has64BitOffsets,
+            ProfileConditionProperty::VideoTimestamp,
+            ProfileConditionProperty::Other("FutureProperty".to_string()),
+        ] {
+            assert!(
+                failed_condition_reason(&property, &video, "test".to_string())
+                    .is_none(),
+                "property {property} must match Jellyfin's no-reason behavior"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_conditions_do_not_scope_or_reject_codec_profiles() {
+        let profile = DeviceProfile {
+            direct_play_profiles: moonfin_ref_frames_profile().direct_play_profiles,
+            codec_profiles: vec![CodecProfile {
+                type_: Some(CodecProfileType::Video),
+                codec: Some(vec!["h264".to_string()]),
+                apply_conditions: vec![ProfileCondition {
+                    condition: Some(ProfileConditionType::Equals),
+                    property: Some(ProfileConditionProperty::Has64BitOffsets),
+                    value: Some("true".to_string()),
+                    is_required: Some(true),
+                }],
+                conditions: vec![ProfileCondition {
+                    condition: Some(ProfileConditionType::LessThanEqual),
+                    property: Some(ProfileConditionProperty::RefFrames),
+                    value: Some("4".to_string()),
+                    is_required: Some(true),
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let reasons = profile.check_direct_play(&h264_ref_frames_source(1920, Some(5)));
+        assert!(
+            reasons.contains(&TranscodeReason::RefFramesNotSupported(String::new())),
+            "the unsupported apply condition must not hide supported conditions: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn direct_play_profile_uses_selected_audio_stream() {
+        let profile = DeviceProfile {
+            direct_play_profiles: vec![DirectPlayProfile {
+                container: Some(vec![VideoContainer::Mkv]),
+                video_codec: Some(vec![VideoCodec::H264]),
+                audio_codec: Some(vec![AudioCodec::Aac]),
+                type_: Some(DlnaProfileType::Video),
+            }],
+            ..Default::default()
+        };
+        let mut source = h264_source("High");
+        source.media_streams[1].codec = Some("ac3".to_string());
+        source
+            .media_streams
+            .push(MediaStream {
+                codec: Some("aac".to_string()),
+                type_: Some(MediaStreamType::Audio),
+                index: 2,
+                ..Default::default()
+            });
+        source.default_audio_stream_index = Some(2);
+
+        assert!(
+            profile
+                .check_direct_play(&source)
+                .is_empty()
+        );
+
+        source.default_audio_stream_index = Some(1);
+        assert!(
+            profile
+                .check_direct_play(&source)
+                .contains(&TranscodeReason::AudioCodecNotSupported(String::new()))
+        );
+    }
+
+    #[test]
+    fn video_audio_profile_uses_selected_secondary_audio_stream() {
+        let profile: CodecProfile = serde_json::from_value(serde_json::json!({
+            "Type": "VideoAudio",
+            "Codec": "aac",
+            "Conditions": [{
+                "Condition": "Equals",
+                "Property": "IsSecondaryAudio",
+                "Value": "false",
+                "IsRequired": true
+            }]
+        }))
+        .expect("VideoAudio codec profile");
+        assert_eq!(profile.type_, Some(CodecProfileType::VideoAudio));
+
+        let device_profile = DeviceProfile {
+            direct_play_profiles: moonfin_ref_frames_profile().direct_play_profiles,
+            codec_profiles: vec![profile],
+            ..Default::default()
+        };
+        let mut source = h264_ref_frames_source(1920, Some(1));
+        source
+            .media_streams
+            .push(MediaStream {
+                codec: Some("aac".to_string()),
+                type_: Some(MediaStreamType::Audio),
+                index: 2,
+                ..Default::default()
+            });
+        source.default_audio_stream_index = Some(2);
+
+        let reasons = device_profile.check_direct_play(&source);
+        assert!(
+            reasons
+                .contains(&TranscodeReason::SecondaryAudioNotSupported(String::new())),
+            "selected second internal track must be secondary: {reasons:?}"
+        );
+    }
+
     #[test]
     fn audio_channel_limit_does_not_force_video_reencode() {
         // A device that only supports 2-channel audio should trigger an audio
-        // transcode (AudioCodecNotSupported), not a video re-encode. Before the
+        // transcode (AudioChannelsNotSupported), not a video re-encode. Before the
         // fix, the catch-all `_ => VideoCodecNotSupported` in check_reasons was
         // reached for "AudioChannels", causing a full h264 re-encode on 5.1 files.
         let profile = DeviceProfile {
@@ -1346,7 +2389,7 @@ mod tests {
                 type_: Some(DlnaProfileType::Video),
             }],
             codec_profiles: vec![CodecProfile {
-                type_: Some(DlnaProfileType::Audio),
+                type_: Some(CodecProfileType::VideoAudio),
                 codec: Some(vec!["aac".to_string()]),
                 conditions: vec![ProfileCondition {
                     condition: Some(ProfileConditionType::LessThanEqual),
@@ -1354,6 +2397,7 @@ mod tests {
                     value: Some("2".to_string()),
                     is_required: Some(false),
                 }],
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -1379,8 +2423,9 @@ mod tests {
         };
         let reasons = profile.check_direct_play(&source);
         assert!(
-            reasons.contains(&TranscodeReason::AudioCodecNotSupported(String::new())),
-            "a 5.1 channel limit violation should produce AudioCodecNotSupported: {reasons:?}"
+            reasons
+                .contains(&TranscodeReason::AudioChannelsNotSupported(String::new())),
+            "a 5.1 channel limit violation should produce AudioChannelsNotSupported: {reasons:?}"
         );
         assert!(
             !reasons.contains(&TranscodeReason::VideoCodecNotSupported(String::new())),
@@ -1391,7 +2436,7 @@ mod tests {
     fn hevc_tag_condition(condition: &str, value: &str) -> DeviceProfile {
         DeviceProfile {
             codec_profiles: vec![CodecProfile {
-                type_: Some(DlnaProfileType::Video),
+                type_: Some(CodecProfileType::Video),
                 codec: Some(vec!["hevc".to_string()]),
                 conditions: vec![ProfileCondition {
                     condition: Some(
@@ -1403,6 +2448,7 @@ mod tests {
                     value: Some(value.to_string()),
                     is_required: Some(true),
                 }],
+                ..Default::default()
             }],
             ..Default::default()
         }
@@ -1435,6 +2481,13 @@ mod tests {
     }
 
     #[test]
+    fn hevc_copy_tag_honours_type_omitted_codec_profiles() {
+        let mut profile = hevc_tag_condition("EqualsAny", "hvc1|dvh1");
+        profile.codec_profiles[0].type_ = None;
+        assert_eq!(profile.hevc_copy_tag(&hevc_source(Some("hev1"))), "hvc1");
+    }
+
+    #[test]
     fn hevc_copy_tag_honours_not_equals_conditions() {
         // NotEquals hev1 means the client refuses hev1 -> must send hvc1.
         let profile = hevc_tag_condition("NotEquals", "hev1");
@@ -1453,7 +2506,7 @@ mod tests {
         // because its parameter sets are in-band and hvc1 would be a lie.
         let silent = DeviceProfile {
             codec_profiles: vec![CodecProfile {
-                type_: Some(DlnaProfileType::Video),
+                type_: Some(CodecProfileType::Video),
                 codec: Some(vec!["hevc".to_string()]),
                 conditions: vec![ProfileCondition {
                     condition: Some(ProfileConditionType::EqualsAny),
@@ -1461,6 +2514,7 @@ mod tests {
                     value: Some("main|main 10".to_string()),
                     is_required: Some(false),
                 }],
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -1486,7 +2540,7 @@ mod tests {
     fn hevc_copy_tag_ignores_tag_conditions_scoped_to_other_codecs() {
         let profile = DeviceProfile {
             codec_profiles: vec![CodecProfile {
-                type_: Some(DlnaProfileType::Video),
+                type_: Some(CodecProfileType::Video),
                 codec: Some(vec!["h264".to_string()]),
                 conditions: vec![ProfileCondition {
                     condition: Some(ProfileConditionType::EqualsAny),
@@ -1494,6 +2548,7 @@ mod tests {
                     value: Some("avc1".to_string()),
                     is_required: Some(true),
                 }],
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -1558,7 +2613,7 @@ mod tests {
     fn streamyfin_mpv_profile() -> DeviceProfile {
         DeviceProfile {
             codec_profiles: vec![CodecProfile {
-                type_: Some(DlnaProfileType::Video),
+                type_: Some(CodecProfileType::Video),
                 codec: Some(vec!["hevc".to_string(), "h265".to_string()]),
                 conditions: vec![
                     ProfileCondition {
@@ -1574,21 +2629,22 @@ mod tests {
                         is_required: Some(true),
                     },
                 ],
+                ..Default::default()
             }],
             ..Default::default()
         }
     }
 
-    fn compat(rank: MediaSourceRank) -> (u8, u8, u8, i64, u8, u8, i64, i64) {
-        rank.key(SortMediaSourcesMode::Compatibility)
+    fn compat(rank: MediaSourceRank) -> MediaSourceSortKey {
+        rank.sort_key(SortMediaSourcesMode::Compatibility)
     }
 
-    fn quality(rank: MediaSourceRank) -> (u8, u8, u8, i64, u8, u8, i64, i64) {
-        rank.key(SortMediaSourcesMode::Quality)
+    fn quality(rank: MediaSourceRank) -> MediaSourceSortKey {
+        rank.sort_key(SortMediaSourcesMode::Quality)
     }
 
-    fn best(rank: MediaSourceRank) -> (u8, u8, u8, i64, u8, u8, i64, i64) {
-        rank.key(SortMediaSourcesMode::Best)
+    fn best(rank: MediaSourceRank) -> MediaSourceSortKey {
+        rank.sort_key(SortMediaSourcesMode::Best)
     }
 
     fn source_with_reasons(
@@ -1751,7 +2807,40 @@ mod tests {
     }
 
     #[test]
-    fn confident_4k_profile_prefers_4k_when_both_direct_playable() {
+    fn direct_play_profile_selection_prefers_cheaper_work_over_fewer_reasons() {
+        let profile = DeviceProfile {
+            direct_play_profiles: vec![
+                DirectPlayProfile {
+                    container: Some(vec![VideoContainer::Mkv]),
+                    video_codec: Some(vec![VideoCodec::Hevc]),
+                    audio_codec: Some(vec![AudioCodec::Aac]),
+                    type_: Some(DlnaProfileType::Video),
+                },
+                DirectPlayProfile {
+                    container: Some(vec![VideoContainer::Mp4]),
+                    video_codec: Some(vec![VideoCodec::H264]),
+                    audio_codec: Some(vec![AudioCodec::Ac3]),
+                    type_: Some(DlnaProfileType::Video),
+                },
+            ],
+            ..Default::default()
+        };
+
+        let reasons = profile.check_direct_play(&h264_source("High"));
+        assert_eq!(transcode_cost_tier(&reasons), 2);
+        assert!(
+            reasons.contains(&TranscodeReason::ContainerNotSupported(String::new()))
+        );
+        assert!(
+            reasons.contains(&TranscodeReason::AudioCodecNotSupported(String::new()))
+        );
+        assert!(
+            !reasons.contains(&TranscodeReason::VideoCodecNotSupported(String::new()))
+        );
+    }
+
+    #[test]
+    fn learned_4k_capability_prefers_4k_when_both_direct_playable() {
         let source_1080p = source_with(
             video_stream(1920, Some(VideoRangeType::Sdr)),
             audio_stream("aac", 2),
@@ -1763,20 +2852,22 @@ mod tests {
             true,
         );
         let profile = streamyfin_mpv_profile();
+        let ranking = SourceRankingContext {
+            mode: SortMediaSourcesMode::Compatibility,
+            device_profile: Some(&profile),
+            is_4k_capable: true,
+            subtitle_mode: EmbeddedSubtitleHandling::default(),
+            explicit_subtitle_index: None,
+            max_bitrate: None,
+        };
         assert!(
-            compat(
-                source_4k
-                    .capability_rank(Some(&profile), &source_4k.transcoding_reasons)
-            ) > compat(
-                source_1080p
-                    .capability_rank(Some(&profile), &source_1080p.transcoding_reasons)
-            ),
-            "profile has an HEVC Level 153 (4K-tier) condition, so 4K should outrank 1080p"
+            ranking.sort_key(&source_4k, false)
+                > ranking.sort_key(&source_1080p, false)
         );
     }
 
     #[test]
-    fn unknown_4k_capability_does_not_favor_resolution() {
+    fn unknown_4k_capability_favors_1080p() {
         // No codec profiles at all — no numeric signal to be confident about.
         let profile = DeviceProfile::default();
         let source_1080p = source_with(
@@ -1789,11 +2880,14 @@ mod tests {
             audio_stream("aac", 2),
             true,
         );
-        assert_eq!(
-            source_4k.capability_rank(Some(&profile), &source_4k.transcoding_reasons),
-            source_1080p
-                .capability_rank(Some(&profile), &source_1080p.transcoding_reasons),
-            "without a confident 4K signal, resolution must not affect ranking"
+        assert!(
+            best(
+                source_1080p
+                    .capability_rank(Some(&profile), &source_1080p.transcoding_reasons)
+            ) > best(
+                source_4k
+                    .capability_rank(Some(&profile), &source_4k.transcoding_reasons)
+            )
         );
     }
 
@@ -1818,7 +2912,162 @@ mod tests {
     }
 
     #[test]
-    fn ranking_context_ignores_profile_bitrate_limits() {
+    fn cropped_dimensions_use_coarse_resolution_buckets() {
+        let profile = streamyfin_mpv_profile();
+        let tier = |width, height| {
+            let mut video = video_stream(width, Some(VideoRangeType::Sdr));
+            video.height = Some(height);
+            source_with(video, audio_stream("aac", 2), true)
+                .capability_rank(Some(&profile), &TranscodeReasons::default())
+                .resolution_tier
+        };
+
+        assert_eq!(tier(3840, 2160), tier(3836, 2072));
+        assert_eq!(tier(3840, 1600), 5);
+        assert_eq!(tier(2560, 1440), 4);
+        assert_eq!(tier(1920, 800), 3);
+        assert_eq!(tier(1280, 536), 2);
+        assert_eq!(tier(1024, 554), 1);
+    }
+
+    #[test]
+    fn hdr_variant_only_breaks_ties_after_bitrate() {
+        let hdr10_high_bitrate = with_release(
+            source_with(
+                video_stream(3840, Some(VideoRangeType::Hdr10)),
+                audio_stream("aac", 2),
+                true,
+            ),
+            "Movie.2024.2160p.WEB-DL.mkv",
+            90_000_000,
+        );
+        let dovi_low_bitrate = with_release(
+            source_with(
+                video_stream(3840, Some(VideoRangeType::Dovi)),
+                audio_stream("aac", 2),
+                true,
+            ),
+            "Movie.2024.2160p.WEB-DL.mkv",
+            30_000_000,
+        );
+        assert!(
+            best(
+                hdr10_high_bitrate.capability_rank(None, &TranscodeReasons::default())
+            ) > best(
+                dovi_low_bitrate.capability_rank(None, &TranscodeReasons::default())
+            )
+        );
+
+        let mut dovi_equal_bitrate = dovi_low_bitrate;
+        dovi_equal_bitrate.bitrate = Some(90_000_000);
+        assert!(
+            best(
+                dovi_equal_bitrate.capability_rank(None, &TranscodeReasons::default())
+            ) > best(
+                hdr10_high_bitrate.capability_rank(None, &TranscodeReasons::default())
+            )
+        );
+    }
+
+    #[test]
+    fn unknown_video_range_uses_sdr_baseline_for_ranking() {
+        let rank_for = |range| {
+            best(
+                source_with(video_stream(1920, range), audio_stream("aac", 2), true)
+                    .capability_rank(None, &TranscodeReasons::default()),
+            )
+        };
+        assert_eq!(rank_for(None), rank_for(Some(VideoRangeType::Sdr)));
+        assert!(rank_for(Some(VideoRangeType::Hdr10)) > rank_for(None));
+    }
+
+    #[test]
+    fn severe_bitrate_mismatch_loses_in_best_but_not_compatibility() {
+        let mut tiny_4k_video = video_stream(3840, Some(VideoRangeType::Dovi));
+        tiny_4k_video.height = Some(2160);
+        let tiny_4k = with_release(
+            source_with(tiny_4k_video, audio_stream("aac", 2), true),
+            "Movie.2024.2160p.WEB-DL.mkv",
+            798_266,
+        );
+        let mut healthy_4k_video = video_stream(3840, Some(VideoRangeType::Sdr));
+        healthy_4k_video.height = Some(2160);
+        let healthy_4k = with_release(
+            source_with_reasons(
+                healthy_4k_video,
+                audio_stream("aac", 2),
+                &[TranscodeReason::VideoCodecNotSupported("test".to_string())],
+            ),
+            "Movie.2024.2160p.WEB-DL.mkv",
+            3_000_000,
+        );
+        let tiny_rank = tiny_4k.capability_rank(None, &tiny_4k.transcoding_reasons);
+        let healthy_rank =
+            healthy_4k.capability_rank(None, &healthy_4k.transcoding_reasons);
+
+        assert_eq!(tiny_rank.bitrate_plausibility_tier, 0);
+        assert_eq!(healthy_rank.bitrate_plausibility_tier, 1);
+        assert!(best(healthy_rank) > best(tiny_rank));
+        assert!(quality(healthy_rank) > quality(tiny_rank));
+        assert!(compat(tiny_rank) > compat(healthy_rank));
+    }
+
+    #[test]
+    fn bitrate_plausibility_uses_pixel_count_and_ignores_unknowns() {
+        let mut video_4k = video_stream(3840, Some(VideoRangeType::Hdr10));
+        video_4k.height = Some(2160);
+        let mut plausible_4k =
+            source_with(video_4k.clone(), audio_stream("aac", 2), true);
+        plausible_4k.bitrate = Some(30_000_000);
+        assert_eq!(
+            plausible_4k
+                .capability_rank(None, &TranscodeReasons::default())
+                .bitrate_plausibility_tier,
+            1
+        );
+
+        let mut tiny_4k = plausible_4k.clone();
+        tiny_4k.bitrate = Some(798_266);
+        assert_eq!(
+            tiny_4k
+                .capability_rank(None, &TranscodeReasons::default())
+                .bitrate_plausibility_tier,
+            0
+        );
+
+        let mut unknown_bitrate = plausible_4k;
+        unknown_bitrate.bitrate = None;
+        assert_eq!(
+            unknown_bitrate
+                .capability_rank(None, &TranscodeReasons::default())
+                .bitrate_plausibility_tier,
+            1
+        );
+        let mut unknown_height = tiny_4k;
+        unknown_height.media_streams[0].height = None;
+        assert_eq!(
+            unknown_height
+                .capability_rank(None, &TranscodeReasons::default())
+                .bitrate_plausibility_tier,
+            1
+        );
+        unknown_height.bitrate = Some(34_000);
+        assert_eq!(
+            unknown_height
+                .capability_rank(None, &TranscodeReasons::default())
+                .bitrate_plausibility_tier,
+            0
+        );
+    }
+
+    /// A source the effective bitrate cap forces into a re-encode must rank
+    /// (and label) the same as any other transcode-needing source — the sort
+    /// order has to agree with what playback is actually about to do.
+    /// `SourceRankingContext.max_bitrate` is the caller's job to combine
+    /// (request cap + profile cap, same as the real transcode decision);
+    /// this test passes the profile's own limit directly, as a caller would.
+    #[test]
+    fn ranking_context_honors_the_bitrate_cap_it_is_given() {
         let profile = DeviceProfile {
             max_streaming_bitrate: Some(1),
             direct_play_profiles: vec![DirectPlayProfile {
@@ -1839,10 +3088,52 @@ mod tests {
         let assessment = super::SourceRankingContext {
             mode: SortMediaSourcesMode::Best,
             device_profile: Some(&profile),
+            is_4k_capable: false,
             subtitle_mode: EmbeddedSubtitleHandling::default(),
             explicit_subtitle_index: None,
+            max_bitrate: profile.max_streaming_bitrate,
         }
-        .assess(&source);
+        .assess(&source, false);
+
+        assert!(
+            assessment
+                .reasons
+                .contains(&TranscodeReason::ContainerBitrateExceedsLimit),
+            "a source far over the effective bitrate cap must be flagged during ranking, \
+             not just when the real transcode decision runs"
+        );
+        assert_eq!(assessment.playback_label(), "Transcode");
+    }
+
+    /// Without an explicit cap for this ranking pass, a huge bitrate alone
+    /// is not a transcode reason — nothing to compare it against.
+    #[test]
+    fn ranking_context_without_a_bitrate_cap_does_not_flag_high_bitrate() {
+        let profile = DeviceProfile {
+            direct_play_profiles: vec![DirectPlayProfile {
+                container: None,
+                video_codec: None,
+                audio_codec: None,
+                type_: Some(DlnaProfileType::Video),
+            }],
+            ..Default::default()
+        };
+        let mut source = source_with(
+            video_stream(1920, Some(VideoRangeType::Sdr)),
+            audio_stream("aac", 2),
+            true,
+        );
+        source.bitrate = Some(50_000_000);
+
+        let assessment = super::SourceRankingContext {
+            mode: SortMediaSourcesMode::Best,
+            device_profile: Some(&profile),
+            is_4k_capable: false,
+            subtitle_mode: EmbeddedSubtitleHandling::default(),
+            explicit_subtitle_index: None,
+            max_bitrate: None,
+        }
+        .assess(&source, false);
 
         assert!(
             !assessment
@@ -1935,18 +3226,26 @@ mod tests {
     #[test]
     fn subtitle_burn_reason_only_fires_in_burn_mode() {
         let source = source_with_subtitle("pgssub", false, 0);
-        for mode in [
-            EmbeddedSubtitleHandling::Strip,
-            EmbeddedSubtitleHandling::Extract,
-        ] {
-            assert!(
-                subtitle_burn_reason(&source, None, mode, None).is_none(),
-                "{mode:?} must never force a transcode for subtitles"
-            );
-        }
         assert!(
-            subtitle_burn_reason(&source, None, EmbeddedSubtitleHandling::Burn, None)
-                .is_some()
+            subtitle_burn_reason(
+                &source,
+                None,
+                EmbeddedSubtitleHandling::Strip,
+                None,
+                false
+            )
+            .is_none(),
+            "Strip must never force a transcode for subtitles"
+        );
+        assert!(
+            subtitle_burn_reason(
+                &source,
+                None,
+                EmbeddedSubtitleHandling::Burn,
+                None,
+                false
+            )
+            .is_some()
         );
     }
 
@@ -1954,8 +3253,14 @@ mod tests {
     fn subtitle_burn_reason_ignores_text_and_external_subtitles() {
         let text = source_with_subtitle("subrip", false, 0);
         assert!(
-            subtitle_burn_reason(&text, None, EmbeddedSubtitleHandling::Burn, None)
-                .is_none(),
+            subtitle_burn_reason(
+                &text,
+                None,
+                EmbeddedSubtitleHandling::Burn,
+                None,
+                false
+            )
+            .is_none(),
             "a text subtitle never needs burning in"
         );
 
@@ -1965,11 +3270,70 @@ mod tests {
                 &external_image,
                 None,
                 EmbeddedSubtitleHandling::Burn,
-                None
+                None,
+                false
             )
             .is_none(),
             "an external subtitle is delivered separately, never burned in"
         );
+    }
+
+    #[test]
+    fn keeps_embedded_subtitle_drops_text_subs_on_remote_sources_without_extraction() {
+        let srt = MediaStream {
+            index: 2,
+            type_: Some(MediaStreamType::Subtitle),
+            codec: Some("subrip".to_string()),
+            ..Default::default()
+        };
+        assert!(!keeps_embedded_subtitle(
+            &srt,
+            None,
+            false,
+            EmbeddedSubtitleHandling::Burn
+        ));
+        assert!(keeps_embedded_subtitle(
+            &srt,
+            None,
+            true,
+            EmbeddedSubtitleHandling::Burn
+        ));
+    }
+
+    #[test]
+    fn keeps_embedded_subtitle_needs_external_pgs_to_deliver_pgs() {
+        // A profile mentioning PGS with a non-External method can't take a
+        // `.sup` file: Burn keeps the track to burn it in, Strip drops it.
+        let pgs = MediaStream {
+            index: 2,
+            type_: Some(MediaStreamType::Subtitle),
+            codec: Some("pgssub".to_string()),
+            ..Default::default()
+        };
+        let profile = DeviceProfile {
+            subtitle_profiles: vec![SubtitleProfile {
+                format: Some("pgssub".to_string()),
+                method: Some(SubtitleDeliveryMethod::Hls),
+            }],
+            ..Default::default()
+        };
+        assert!(!subtitle_codec_deliverable(
+            &SubtitleCodec::Pgs,
+            Some(&profile),
+            true
+        ));
+        assert!(keeps_embedded_subtitle(
+            &pgs,
+            Some(&profile),
+            true,
+            EmbeddedSubtitleHandling::Burn
+        ));
+        assert!(!keeps_embedded_subtitle(
+            &pgs,
+            Some(&profile),
+            true,
+            EmbeddedSubtitleHandling::Strip
+        ));
     }
 
     #[test]
@@ -1987,10 +3351,56 @@ mod tests {
                 &source,
                 Some(&profile),
                 EmbeddedSubtitleHandling::Burn,
-                None
+                None,
+                false
             )
             .is_none(),
-            "a profile that lists the image format at all needs no burn-in"
+            "a profile that embeds the image format needs no burn-in"
+        );
+    }
+
+    #[test]
+    fn subtitle_burn_reason_accounts_for_extraction_feasibility_not_just_format_match()
+    {
+        // Regression test: a profile declaring PGS support via External
+        // (not Embed) means apply_subtitle_delivery will actually extract
+        // it instead of burning it in -- but only when extraction is
+        // feasible. Checking "does any subtitle_profiles entry mention this
+        // format" without looking at the method or at feasibility produces
+        // the wrong answer in both directions.
+        let source = source_with_subtitle("pgssub", false, 0);
+        let profile = DeviceProfile {
+            subtitle_profiles: vec![SubtitleProfile {
+                format: Some("pgssub".to_string()),
+                method: Some(SubtitleDeliveryMethod::External),
+            }],
+            ..Default::default()
+        };
+        assert!(
+            subtitle_burn_reason(
+                &source,
+                Some(&profile),
+                EmbeddedSubtitleHandling::Burn,
+                None,
+                true
+            )
+            .is_none(),
+            "extraction is feasible and the client can consume the result \
+             externally -- no burn-in needed, it'll be extracted instead"
+        );
+        assert!(
+            subtitle_burn_reason(
+                &source,
+                Some(&profile),
+                EmbeddedSubtitleHandling::Burn,
+                None,
+                false
+            )
+            .is_some(),
+            "extraction is infeasible (e.g. remote source, setting off) -- \
+             the profile only supports External, which won't happen, so \
+             this must still burn in rather than silently direct-playing \
+             an undeliverable subtitle"
         );
     }
 
@@ -2012,7 +3422,8 @@ mod tests {
                 &source,
                 None,
                 EmbeddedSubtitleHandling::Burn,
-                Some(1)
+                Some(1),
+                false
             )
             .is_some()
         );
@@ -2052,8 +3463,96 @@ mod tests {
             })
             .ok(),
             source: None,
+            ..Default::default()
         });
         source
+    }
+
+    #[test]
+    fn legacy_tuple_is_a_projection_of_the_current_sort_key() {
+        let source = with_release(
+            source_with(
+                video_stream(1920, Some(VideoRangeType::Sdr)),
+                audio_stream("ac3", 6),
+                true,
+            ),
+            "Movie.1080p.WEB-DL.mkv",
+            8_000_000,
+        );
+        let rank = source.capability_rank(None, &source.transcoding_reasons);
+        for mode in [
+            SortMediaSourcesMode::Best,
+            SortMediaSourcesMode::Quality,
+            SortMediaSourcesMode::Compatibility,
+        ] {
+            let key = rank.sort_key(mode);
+            let legacy: (u8, u8, u8, i64, u8, u8, i64, i64) = rank.key(mode);
+            assert_eq!(
+                legacy,
+                (
+                    key.cost,
+                    key.resolution,
+                    key.hdr_variant,
+                    key.bit_depth,
+                    key.release_quality,
+                    key.audio_tier,
+                    key.audio_channels,
+                    key.bitrate,
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn confirmed_cache_hit_precedes_quality_and_compatibility_in_every_sort_mode() {
+        let source = || {
+            source_with(
+                video_stream(1920, Some(VideoRangeType::Sdr)),
+                audio_stream("ac3", 6),
+                true,
+            )
+        };
+        let mut cached = with_release(source(), "Movie.1080p.WEBRip.mkv", 1_000_000);
+        cached
+            .remux
+            .as_mut()
+            .unwrap()
+            .provider_info = serde_json::to_value(crate::stream::StreamInfo {
+            filename: Some("Movie.1080p.WEBRip.mkv".to_string()),
+            service_cached: Some(true),
+            ..Default::default()
+        })
+        .ok();
+        cached
+            .transcoding_reasons
+            .insert(TranscodeReason::VideoCodecNotSupported("test".to_string()));
+        let uncached = with_release(source(), "Movie.2160p.BDRemux.mkv", 90_000_000);
+        let mut explicitly_uncached = uncached.clone();
+        explicitly_uncached
+            .remux
+            .as_mut()
+            .unwrap()
+            .provider_info = serde_json::to_value(crate::stream::StreamInfo {
+            filename: Some("Movie.2160p.BDRemux.mkv".to_string()),
+            service_cached: Some(false),
+            ..Default::default()
+        })
+        .ok();
+
+        let cached_rank = cached.capability_rank(None, &cached.transcoding_reasons);
+        for other in [&uncached, &explicitly_uncached] {
+            let other_rank = other.capability_rank(None, &other.transcoding_reasons);
+            for mode in [
+                SortMediaSourcesMode::Best,
+                SortMediaSourcesMode::Quality,
+                SortMediaSourcesMode::Compatibility,
+            ] {
+                assert!(
+                    cached_rank.sort_key(mode) > other_rank.sort_key(mode),
+                    "mode={mode:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2090,7 +3589,7 @@ mod tests {
     }
 
     #[test]
-    fn bitrate_is_the_final_tiebreaker_at_equal_everything_else() {
+    fn bitrate_breaks_ties_at_equal_release_quality() {
         let base = || {
             source_with(
                 video_stream(1920, Some(VideoRangeType::Sdr)),
@@ -2142,6 +3641,150 @@ mod tests {
     fn jellyfin_web_real_profile() -> DeviceProfile {
         serde_json::from_str(include_str!("testdata/jellyfin_web_device_profile.json"))
             .expect("fixture must deserialize")
+    }
+
+    #[derive(serde::Deserialize)]
+    struct BackroomsSourceFixture {
+        name: String,
+        filename: String,
+        #[serde(default)]
+        service_cached: Option<bool>,
+        probe_data: MediaSourceInfo,
+    }
+
+    /// The saved Backrooms probes exercise the real client ranking path. The
+    /// expected order is a separate JSON fixture so changes to any position
+    /// show up as a reviewable test failure, not just changed console output.
+    #[test]
+    fn backrooms_web_best_mode_ranking() {
+        let fixtures: Vec<BackroomsSourceFixture> =
+            serde_json::from_str(include_str!("testdata/backrooms_web_sources.json"))
+                .expect("Backrooms fixture must deserialize");
+        assert_eq!(fixtures.len(), 28);
+        let expected_order: Vec<String> = serde_json::from_str(include_str!(
+            "testdata/backrooms_web_best_order.json"
+        ))
+        .expect("Backrooms expected order must deserialize");
+        assert_eq!(expected_order.len(), fixtures.len());
+
+        let profile = jellyfin_web_real_profile();
+        let ranking = SourceRankingContext {
+            mode: SortMediaSourcesMode::Best,
+            device_profile: Some(&profile),
+            is_4k_capable: true,
+            subtitle_mode: EmbeddedSubtitleHandling::default(),
+            explicit_subtitle_index: None,
+            max_bitrate: None,
+        };
+        let mut ranked: Vec<_> = fixtures
+            .into_iter()
+            .map(|fixture| {
+                let media = crate::db::Media {
+                    title: fixture
+                        .name
+                        .clone(),
+                    stream_info: Some(crate::stream::StreamInfo {
+                        filename: Some(
+                            fixture
+                                .filename
+                                .clone(),
+                        ),
+                        service_cached: fixture.service_cached,
+                        ..Default::default()
+                    }),
+                    probe_data: Some(fixture.probe_data),
+                    ..Default::default()
+                };
+                let mut source = crate::api::MediaSourceInfo::from(media.clone());
+                crate::conversions::apply_filename_guess(&mut source, &media);
+                source.resolve_default_streams(
+                    &crate::api::UserConfiguration::default(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                );
+                let assessment = ranking.assess(&source, false);
+                (fixture.filename, fixture.name, source, assessment)
+            })
+            .collect();
+        ranked.sort_by_cached_key(|(_, _, _, assessment)| {
+            std::cmp::Reverse(assessment.sort_key(SortMediaSourcesMode::Best))
+        });
+
+        let actual_order: Vec<&str> = ranked
+            .iter()
+            .map(|(filename, _, _, _)| filename.as_str())
+            .collect();
+        let expected_order: Vec<&str> = expected_order
+            .iter()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(actual_order, expected_order);
+
+        assert!(
+            ranked[0]
+                .1
+                .contains("3.2 Mbps"),
+            "the confirmed cached source must rank before better uncached sources"
+        );
+        let position_of = |needle: &str| {
+            ranked
+                .iter()
+                .position(|(_, name, _, _)| name.contains(needle))
+                .expect("source must be in the Backrooms fixture")
+        };
+        assert!(
+            position_of("34.2 Mbps") < position_of("4.38 Mbps"),
+            "unknown video range must not rank below SDR before bitrate is considered"
+        );
+        assert!(
+            position_of("798 Kbps") > position_of("3.34 Mbps"),
+            "the severely under-bitrated 4K source should lose to a credible transcoding source"
+        );
+        assert!(
+            position_of("43.2 Kbps") > position_of("3.34 Mbps"),
+            "the severely under-bitrated 1080p source should lose to a credible transcoding source"
+        );
+        assert!(
+            position_of("34 Kbps") > position_of("3.34 Mbps"),
+            "missing dimensions must not exempt an extremely low bitrate"
+        );
+
+        println!("\n--- Backrooms / Jellyfin Web / Best mode ---");
+        for (position, (_, name, source, assessment)) in ranked
+            .iter()
+            .enumerate()
+        {
+            let video = source
+                .media_streams
+                .iter()
+                .find(|stream| stream.type_ == Some(MediaStreamType::Video));
+            println!(
+                "#{:02} key={:?} decision={} video={:?} {}x{} bitrate={:?} reasons={:?} name={name}",
+                position + 1,
+                assessment.sort_key(SortMediaSourcesMode::Best),
+                assessment.playback_label(),
+                video.and_then(|v| v
+                    .codec
+                    .as_deref()),
+                video
+                    .and_then(|v| v.width)
+                    .unwrap_or(0),
+                video
+                    .and_then(|v| v.height)
+                    .unwrap_or(0),
+                source.bitrate,
+                assessment
+                    .reasons
+                    .0
+                    .iter()
+                    .map(TranscodeReason::name)
+                    .collect::<Vec<_>>(),
+            );
+        }
     }
 
     #[test]
