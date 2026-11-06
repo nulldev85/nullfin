@@ -43,6 +43,7 @@ use crate::{
 use crate::{
     IntoApiError, OptionExt, ResultExt,
     device_profile::{DeviceProfileExt, SourceRankingContext, SubtitleCodec},
+    errors::LogErr,
     playback::{
         decision::{
             PlaybackConfig, PlaybackPermissions, TranscodeDecision,
@@ -203,15 +204,10 @@ fn apply_item_runtime_fallback(
 }
 
 fn playback_original_language(
-    item: Option<&db::Media>,
+    item_language: Option<String>,
     selected_source_language: Option<String>,
 ) -> Option<String> {
-    item.and_then(|media| {
-        media
-            .original_language
-            .clone()
-    })
-    .or(selected_source_language)
+    item_language.or(selected_source_language)
 }
 
 async fn items_playbackinfo_inner(
@@ -323,6 +319,28 @@ async fn items_playbackinfo_inner(
         MediaResolveService::resolve_item(media_source_id.unwrap_or(id), &state.ctx)
             .await?
             .context_not_found("not found")?;
+    // The source that will play must be allowed, and so must the title in the
+    // URL when a MediaSourceId names something else (another title or one of
+    // its streams).
+    let title = match media_source_id {
+        Some(source_id) if source_id != id => {
+            MediaResolveService::resolve_item(id, &state.ctx).await?
+        }
+        _ => None,
+    };
+    for checked in std::iter::once(&media).chain(&title) {
+        if checked
+            .is_hidden_by_policy(
+                &state
+                    .ctx
+                    .db,
+                &session.user,
+            )
+            .await?
+        {
+            return Err(anyhow!("not found").context_not_found("not found"));
+        }
+    }
 
     let mut service = StreamService::new(StreamServiceConfig {
         ctx: state
@@ -360,8 +378,15 @@ async fn items_playbackinfo_inner(
     }
     let is_track_item = media.is_track();
     let selected_source_language = media
-        .original_language
-        .clone();
+        .inherited_original_language(
+            &state
+                .ctx
+                .db,
+        )
+        .await
+        .log_err("failed to load inherited original language")
+        .ok()
+        .flatten();
 
     let max_bitrate: Option<i64> = match (
         q.max_streaming_bitrate,
@@ -509,8 +534,23 @@ async fn items_playbackinfo_inner(
     let item_runtime_seconds = subtitle_media
         .as_ref()
         .and_then(|item| item.runtime);
+    // Without a media_source_id, `subtitle_media` is `media`, whose language
+    // is already in `selected_source_language`.
+    let item_language = match &subtitle_media {
+        Some(item) if media_source_id.is_some() => item
+            .inherited_original_language(
+                &state
+                    .ctx
+                    .db,
+            )
+            .await
+            .log_err("failed to load inherited original language")
+            .ok()
+            .flatten(),
+        _ => None,
+    };
     let original_language =
-        playback_original_language(subtitle_media.as_ref(), selected_source_language);
+        playback_original_language(item_language, selected_source_language);
     let is_track = is_track_item
         || subtitle_media
             .as_ref()
@@ -1387,6 +1427,21 @@ async fn videos_stream_inner(
             return Ok(no_streams_response().into_response());
         }
     };
+    // Refuse streams of a title the user's policy hides. A request without a
+    // token has no known user, so there is nothing to check it against.
+    if let Some(user) = &user {
+        if media
+            .is_hidden_by_policy(
+                &state
+                    .ctx
+                    .db,
+                user,
+            )
+            .await?
+        {
+            return Err(anyhow!("not found").context_not_found("not found"));
+        }
+    }
     let Some(si) = media
         .stream_info
         .clone()
@@ -1803,7 +1858,7 @@ pub async fn audio_universal(
     State(state): State<AppState>,
     session: auth::AuthSession,
     Path(id): Path<Uuid>,
-    Query(q): Query<api::HlsVideoQuery>,
+    Query(q): Query<UniversalAudioQuery>,
 ) -> Result<impl IntoResponse> {
     let mut media = db::Media::get_by_id(
         &state
@@ -1837,18 +1892,111 @@ pub async fn audio_universal(
                 .to_string()
         });
 
-    let transcoding_url = format!(
-        "/videos/{}/master.m3u8?PlaySessionId={}&MediaSourceId={}&VideoCodec=copy&AudioCodec=aac&ApiKey={}",
+    // Like Jellyfin: a source the client lists in `Container` is served as is,
+    // anything else is transcoded to HLS. Inspect the very source the static
+    // endpoint will serve (same lookup as PlaybackInfo and `/stream`), and pin
+    // it in the redirect so both sides agree.
+    let source = crate::services::stream_service::StreamService::lookup(
+        &state.ctx,
         id,
-        play_session_id,
-        id,
-        session
-            .device
-            .access_token
-            .expose()
-    );
+        q.media_source_id,
+        Some(
+            &session
+                .device
+                .id,
+        ),
+        Some(
+            session
+                .user
+                .id,
+        ),
+    )
+    .await
+    .ok();
+    let direct = source
+        .as_ref()
+        .and_then(|s| {
+            s.probe_data
+                .as_ref()
+        })
+        .is_some_and(|p| {
+            universal_can_direct_play(
+                q.container
+                    .as_deref(),
+                p.container
+                    .as_ref(),
+                p.media_streams
+                    .iter()
+                    .find(|s| s.type_ == Some(api::MediaStreamType::Audio))
+                    .and_then(|s| {
+                        s.codec
+                            .as_deref()
+                    }),
+            )
+        });
+    let source_id = source
+        .as_ref()
+        .map_or(id, |s| s.id);
 
-    Ok(axum::response::Redirect::temporary(&transcoding_url).into_response())
+    let token = session
+        .device
+        .access_token
+        .expose();
+    let url = if direct {
+        format!(
+            "/audio/{id}/stream?Static=true&PlaySessionId={play_session_id}&MediaSourceId={source_id}&ApiKey={token}"
+        )
+    } else {
+        format!(
+            "/videos/{id}/master.m3u8?PlaySessionId={play_session_id}&MediaSourceId={id}&VideoCodec=copy&AudioCodec=aac&ApiKey={token}"
+        )
+    };
+
+    Ok(axum::response::Redirect::temporary(&url).into_response())
+}
+
+/// Whether the client's `Container` list (comma separated) covers the source.
+/// An entry must name the source's container, optionally qualified with its
+/// audio codec as `container|codec`. A codec alone says nothing about the
+/// container (AAC inside Matroska), so it never matches.
+fn universal_can_direct_play(
+    client_containers: Option<&str>,
+    source_container: Option<&remux_sdks::remux::VideoContainer>,
+    source_audio_codec: Option<&str>,
+) -> bool {
+    let (Some(list), Some(container)) = (client_containers, source_container) else {
+        return false;
+    };
+    let container = container.to_string();
+    let same_container = |wanted: &str| {
+        let wanted = wanted.trim();
+        wanted.eq_ignore_ascii_case(&container)
+            || matches!(
+                (
+                    wanted.parse::<remux_sdks::remux::VideoContainer>(),
+                    container.parse::<remux_sdks::remux::VideoContainer>()
+                ),
+                (Ok(a), Ok(b)) if a == b
+            )
+    };
+    list.split(',')
+        .any(|entry| match entry.split_once('|') {
+            Some((c, codec)) => {
+                same_container(c)
+                    && source_audio_codec
+                        .is_some_and(|a| a.eq_ignore_ascii_case(codec.trim()))
+            }
+            None => same_container(entry),
+        })
+}
+
+#[query]
+pub struct UniversalAudioQuery {
+    pub container: Option<String>,
+    #[serde(alias = "playSessionId")]
+    pub play_session_id: Option<String>,
+    #[serde(alias = "mediaSourceId")]
+    pub media_source_id: Option<Uuid>,
 }
 
 /// Bitrate test endpoint - returns a body of the requested size for bandwidth measurement.
@@ -1898,6 +2046,54 @@ mod tests {
             super::compatible_media_source_id(false, item_id, Some(item_id)),
             Some(item_id)
         );
+    }
+
+    #[test]
+    fn universal_direct_plays_only_what_the_client_lists() {
+        use remux_sdks::remux::VideoContainer;
+        let webm = VideoContainer::Webm;
+        let list = Some("mp3,aac,m4a|aac,flac");
+        // Container list names neither webm nor opus: transcode.
+        assert!(!super::universal_can_direct_play(
+            list,
+            Some(&webm),
+            Some("opus")
+        ));
+        // A listed codec alone is not enough: AAC inside WebM/Matroska stays
+        // unreadable for the client.
+        assert!(!super::universal_can_direct_play(
+            list,
+            Some(&webm),
+            Some("aac")
+        ));
+        assert!(!super::universal_can_direct_play(
+            list,
+            Some(&VideoContainer::Mkv),
+            Some("aac")
+        ));
+        // Listed by container, and by container|codec pair.
+        assert!(super::universal_can_direct_play(
+            Some("webm"),
+            Some(&webm),
+            Some("opus")
+        ));
+        assert!(super::universal_can_direct_play(
+            Some("mp4|aac"),
+            Some(&VideoContainer::Mp4),
+            Some("AAC")
+        ));
+        assert!(!super::universal_can_direct_play(
+            Some("mp4|aac"),
+            Some(&VideoContainer::Mp4),
+            Some("alac")
+        ));
+        assert!(!super::universal_can_direct_play(
+            None,
+            Some(&webm),
+            Some("opus")
+        ));
+        // Unprobed source: nothing to negotiate on.
+        assert!(!super::universal_can_direct_play(list, None, None));
     }
 
     #[test]
@@ -2296,17 +2492,15 @@ mod tests {
 
     #[test]
     fn parent_item_language_overrides_missing_or_stale_source_language() {
-        let parent = crate::db::Media {
-            original_language: Some("en".to_string()),
-            ..Default::default()
-        };
-
         assert_eq!(
-            super::playback_original_language(Some(&parent), None),
+            super::playback_original_language(Some("en".to_string()), None),
             Some("en".to_string())
         );
         assert_eq!(
-            super::playback_original_language(Some(&parent), Some("ru".to_string())),
+            super::playback_original_language(
+                Some("en".to_string()),
+                Some("ru".to_string())
+            ),
             Some("en".to_string())
         );
         assert_eq!(
@@ -3491,6 +3685,125 @@ mod tests {
         assert!(url.contains("MaxStreamingBitrate=2000000"), "{url}");
     }
 
+    /// The Remux web client's profile: it direct plays mp4/mov/webm/mkv and
+    /// asks for HLS in TS segments when it has to transcode.
+    fn web_client_profile() -> serde_json::Value {
+        json!({
+            "Name": "Remux Web",
+            "MaxStreamingBitrate": 120_000_000i64,
+            "DirectPlayProfiles": [
+                {
+                    "Type": "Video",
+                    "Container": "mp4,m4v,mov",
+                    "VideoCodec": "h264,hevc,av1,vp9",
+                    "AudioCodec": "aac,mp3,opus,flac,ac3,eac3"
+                },
+                {
+                    "Type": "Video",
+                    "Container": "webm",
+                    "VideoCodec": "vp8,vp9,av1",
+                    "AudioCodec": "opus,vorbis"
+                },
+                {
+                    "Type": "Video",
+                    "Container": "mkv",
+                    "VideoCodec": "h264,hevc,av1,vp9",
+                    "AudioCodec": "aac,mp3,opus,flac,ac3,eac3"
+                }
+            ],
+            "TranscodingProfiles": [{
+                "Type": "Video",
+                "Context": "Streaming",
+                "Protocol": "hls",
+                "Container": "ts",
+                "VideoCodec": "h264",
+                "AudioCodec": "aac"
+            }],
+            "CodecProfiles": [],
+            "SubtitleProfiles": []
+        })
+    }
+
+    async fn playback_info(
+        server: &axum_test::TestServer,
+        token: &str,
+        item_id: uuid::Uuid,
+        profile: serde_json::Value,
+    ) -> serde_json::Value {
+        server
+            .post(&format!("/items/{item_id}/playbackinfo"))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth_header_with_token(token)).unwrap(),
+            )
+            .json(&json!({ "DeviceProfile": profile }))
+            .await
+            .json::<serde_json::Value>()
+    }
+
+    /// A raw MPEG-TS stream is not an HLS playlist. The web client's transcoding
+    /// container is "ts" (HLS segments), which used to match a live source in
+    /// "ts" and turn the copy-copy remux into a "direct play" of the raw
+    /// stream, one a browser cannot play and the device's direct-play
+    /// profiles do not list.
+    #[tokio::test]
+    async fn live_ts_source_is_not_direct_played_by_a_browser() {
+        let (server, guard, token) = authenticated_server().await;
+        let media = crate::integration_test::insert_test_source_with_container(
+            &guard.0,
+            crate::db::MediaKind::TvChannel,
+            VideoContainer::Ts,
+        )
+        .await;
+
+        let body = playback_info(&server, &token, media.id, web_client_profile()).await;
+        let source = &body["MediaSources"][0];
+        assert_eq!(source["SupportsDirectPlay"], false, "{source}");
+        assert!(
+            source["TranscodingUrl"]
+                .as_str()
+                .is_some(),
+            "a TS source must come back as an HLS transcode: {source}"
+        );
+    }
+
+    /// The same profile still direct plays a source it lists.
+    #[tokio::test]
+    async fn mp4_h264_aac_source_still_direct_plays_in_a_browser() {
+        let (server, guard, token) = authenticated_server().await;
+        let media = insert_test_source(&guard.0).await;
+
+        let body = playback_info(&server, &token, media.id, web_client_profile()).await;
+        let source = &body["MediaSources"][0];
+        assert_eq!(source["SupportsDirectPlay"], true, "{source}");
+        assert!(source["TranscodingUrl"].is_null(), "{source}");
+    }
+
+    /// A native player that lists ts in its direct-play profiles keeps
+    /// playing the raw stream directly.
+    #[tokio::test]
+    async fn live_ts_source_still_direct_plays_when_the_device_lists_ts() {
+        let (server, guard, token) = authenticated_server().await;
+        let media = crate::integration_test::insert_test_source_with_container(
+            &guard.0,
+            crate::db::MediaKind::TvChannel,
+            VideoContainer::Ts,
+        )
+        .await;
+        let mut profile = web_client_profile();
+        profile["Name"] = json!("MPV");
+        profile["DirectPlayProfiles"] = json!([{
+            "Type": "Video",
+            "Container": "mp4,mkv,ts",
+            "VideoCodec": "h264,hevc",
+            "AudioCodec": "aac,mp3,ac3"
+        }]);
+
+        let body = playback_info(&server, &token, media.id, profile).await;
+        let source = &body["MediaSources"][0];
+        assert_eq!(source["SupportsDirectPlay"], true, "{source}");
+    }
+
     /// `enable_direct_play: false` must force transcoding even with a matching
     /// direct-play profile.
     #[tokio::test]
@@ -4239,6 +4552,105 @@ mod tests {
             body["MediaSources"][0]["DefaultAudioStreamIndex"].as_i64(),
             Some(2),
             "PlayDefaultAudioTrack=true should select the track matching original_language=en (index 2)"
+        );
+    }
+
+    /// An episode without its own original_language inherits the series' for PlayDefaultAudioTrack.
+    #[tokio::test]
+    async fn test_play_default_audio_track_inherits_series_original_language() {
+        use crate::{
+            api::{MediaSourceInfo, MediaStream, MediaStreamType},
+            db,
+        };
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let ctx = &guard.0;
+        let now = chrono::Utc::now().naive_utc();
+
+        let episode = crate::integration_test::seed_episode(ctx).await;
+        sqlx::query("UPDATE media SET original_language = 'en' WHERE id = ?")
+            .bind(episode.grandparent_id)
+            .execute(&ctx.db)
+            .await
+            .expect("set series original_language");
+        // Mark streams fresh so refresh_streams doesn't replace the fixture source.
+        sqlx::query("UPDATE media SET streams_refreshed_at = ? WHERE id = ?")
+            .bind(now - chrono::Duration::seconds(30))
+            .bind(episode.id)
+            .execute(&ctx.db)
+            .await
+            .expect("set streams_refreshed_at");
+
+        // French is the container default; English is the series' language.
+        let probe = MediaSourceInfo {
+            container: Some(VideoContainer::Mp4),
+            media_streams: vec![
+                MediaStream {
+                    type_: Some(MediaStreamType::Audio),
+                    index: 0,
+                    language: Some("fre".to_string()),
+                    is_default: Some(true),
+                    ..Default::default()
+                },
+                MediaStream {
+                    type_: Some(MediaStreamType::Audio),
+                    index: 1,
+                    language: Some("eng".to_string()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let mut source = db::Media {
+            title: "1080p".to_string(),
+            kind: db::MediaKind::Stream,
+            parent_id: Some(episode.id),
+            stream_info: Some(crate::stream::StreamInfo {
+                descriptor: crate::stream::StreamDescriptor::Local(
+                    "test-fixture-episode-orig-lang.mp4".into(),
+                ),
+                ..Default::default()
+            }),
+            probe_data: Some(probe),
+            created_at: now,
+            updated_at: now,
+            ..Default::default()
+        };
+        source
+            .save(&ctx.db)
+            .await
+            .expect("save source");
+
+        let resp = server
+            .post(&format!("/items/{}/playbackinfo", episode.id))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .json(&json!({}))
+            .await;
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        assert_eq!(
+            body["MediaSources"][0]["DefaultAudioStreamIndex"].as_i64(),
+            Some(1),
+            "PlaybackInfo"
+        );
+
+        let resp = server
+            .get(&format!("/items/{}", episode.id))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .add_query_params(&[("Fields", "MediaSources")])
+            .await;
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        assert_eq!(
+            body["MediaSources"][0]["DefaultAudioStreamIndex"].as_i64(),
+            Some(1),
+            "item details"
         );
     }
 
@@ -5113,5 +5525,126 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A title the user's policy hides can't be streamed, not even through an
+    /// allowed title's PlaybackInfo that names the hidden stream as its source.
+    #[tokio::test]
+    async fn policy_hidden_title_cannot_be_streamed() {
+        use crate::{
+            api::{MediaSourceInfo, MediaStream, MediaStreamType},
+            db, stream,
+        };
+
+        let (server, guard, token) = authenticated_server().await;
+        let db = &guard
+            .0
+            .db;
+        let auth = HeaderValue::from_str(&auth_header_with_token(&token)).unwrap();
+        let set_age_limit = |age: i32| async move {
+            let mut user = db::User::get_by_username(db, "test")
+                .await
+                .unwrap()
+                .unwrap();
+            let mut policy = user
+                .policy
+                .map(|p| p.0)
+                .unwrap_or_default();
+            policy.max_parental_rating = Some(age);
+            user.policy = Some(sqlx::types::Json(policy));
+            user.save(db)
+                .await
+                .unwrap();
+        };
+
+        let movie = |title: &str, age: i32, tmdb: i64| db::Media {
+            title: title.to_string(),
+            kind: db::MediaKind::Movie,
+            certification_age: Some(age),
+            external_ids: db::ExternalIds {
+                tmdb: Some(tmdb),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut allowed = movie("Family Movie", 0, 9000001);
+        let mut hidden = movie("Restricted Movie", 16, 9000002);
+        allowed
+            .save(db)
+            .await
+            .unwrap();
+        hidden
+            .save(db)
+            .await
+            .unwrap();
+        let fixture = std::env::temp_dir()
+            .join(format!("remux-policy-{}.mkv", uuid::Uuid::new_v4()));
+        tokio::fs::write(&fixture, b"0123456789abcdef")
+            .await
+            .unwrap();
+        let mut hidden_stream = db::Media {
+            kind: db::MediaKind::Stream,
+            parent_id: Some(hidden.id),
+            stream_info: Some(stream::StreamInfo {
+                descriptor: stream::StreamDescriptor::Local(fixture.clone()),
+                ..Default::default()
+            }),
+            probe_data: Some(MediaSourceInfo {
+                container: Some(VideoContainer::Mkv),
+                media_streams: vec![
+                    MediaStream {
+                        codec: Some("h264".to_string()),
+                        type_: Some(MediaStreamType::Video),
+                        index: 0,
+                        ..Default::default()
+                    },
+                    MediaStream {
+                        codec: Some("aac".to_string()),
+                        type_: Some(MediaStreamType::Audio),
+                        index: 1,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        hidden_stream
+            .save(db)
+            .await
+            .unwrap();
+        let stream_path = format!("/videos/{}/stream.mkv", hidden_stream.id);
+        let playback_info = |source: uuid::Uuid| {
+            server
+                .post(&format!("/items/{}/playbackinfo", allowed.id))
+                .add_header(http::header::AUTHORIZATION, auth.clone())
+                .json(&json!({ "MediaSourceId": source }))
+        };
+
+        set_age_limit(0).await;
+        playback_info(hidden_stream.id)
+            .expect_failure()
+            .await
+            .assert_status(StatusCode::NOT_FOUND);
+        server
+            .get(&stream_path)
+            .add_header(http::header::AUTHORIZATION, auth.clone())
+            .expect_failure()
+            .await
+            .assert_status(StatusCode::NOT_FOUND);
+
+        // Once the limit allows the title, the same requests succeed.
+        set_age_limit(16).await;
+        playback_info(hidden_stream.id)
+            .await
+            .assert_status_ok();
+        server
+            .get(&stream_path)
+            .add_header(http::header::AUTHORIZATION, auth.clone())
+            .add_header(http::header::RANGE, HeaderValue::from_static("bytes=4-7"))
+            .await
+            .assert_status(StatusCode::PARTIAL_CONTENT);
+
+        let _ = tokio::fs::remove_file(fixture).await;
     }
 }

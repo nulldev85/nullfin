@@ -11,9 +11,9 @@ The goal is to keep Nullfin close enough to Remux that updates remain routine. C
 ## Bring in the changes
 
 ```sh
-git fetch --no-tags upstream refs/tags/v0.37.0:refs/remotes/upstream/v0.37.0
-git switch -c codex/nullfin-remux-0.37
-git merge --no-ff upstream/v0.37.0
+git fetch --no-tags upstream refs/tags/v0.39.0:refs/remotes/upstream/v0.39.0
+git switch -c codex/nullfin-remux-0.39
+git merge --no-ff upstream/v0.39.0
 ```
 
 The local remote named `upstream` should point to `https://github.com/lostb1t/remux.git`. Choose the intended stable tag for each update; do not import a moving development branch by accident. Keep upstream tags out of the fork's release-tag namespace so a Nullfin release can point to the integrated fork commit.
@@ -36,6 +36,16 @@ Also build the container and check these by hand:
 - Restarting the container keeps settings and users.
 
 Publish a new image only after those checks pass. Keep the previous working tag available so a rollback is straightforward.
+
+## Remux v0.39.0 integration
+
+This update imports the stable v0.38–v0.39 changes: merged concurrent add-on search, library and WebDAV performance improvements, watchlist/ignore state, iOS music seeking, browser live-TV compatibility, saved device capabilities, redacted server logs, and an optional Remux Web client alongside Jellyfin Web. The optional web client is pinned to the asset and SHA256 published with the stable v0.39.0 server release.
+
+Nullfin retains its branding, empty-provider local-library search fallback, configurable provider deadline, tolerant add-on import, full source-picker list, deferred initial probes, score labels, file sizes and credential redaction. Upstream's explicit probe outcome now controls RemuxDB submissions; selected-source playback still runs its normal probes and policy checks.
+
+New migrations add local-music indexing fields and watchlist/ignore columns. Upstream also removes obsolete bundled Monochrome/SpotiFLAC presets or converts operator-supplied manifests to Eclipse. Check the private preflight migration result before deployment; any active data change outside those expected migrations must block the upgrade. Back up the complete volume and retain the old image; an image downgrade alone does not undo schema changes.
+
+Each Docker architecture retains the existing v0.33 upgrade smoke and additionally upgrades a v0.37 database. Both runs check users, settings, add-ons, library favorites, play counts, resume positions, real selected-source bytes, restart, fresh setup, the dashboard and both web clients. The full Rust test suite and all desktop/server packaging checks remain enabled.
 
 ## Remux v0.37.0 integration
 

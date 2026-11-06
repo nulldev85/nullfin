@@ -58,6 +58,12 @@ Manifest URLs can contain API keys or personal tokens, so do not paste configure
 
 The plan is to keep Nullfin close to the project it came from and bring over useful changes without turning maintenance into a second job. New builds will be tested before the `latest` tag moves.
 
+The 0.39 integration adds upstream's watchlist/ignore state, library improvements, browser live TV and iOS music fixes, server logs viewer, and optional Remux Web client at `/remux/`. Jellyfin Web remains available at `/web/`. See [upgrade notes](docs/updates.md) for migration and validation details.
+
+## Server logs
+
+Daily rolling logs live under the data directory's `logs` folder. The default policy retains at most five files and removes files older than five days; it does not cap the size of an individual file. Set `LOG_FILE_ENABLED=false` for stdout only, or configure `LOG_DIR`, `LOG_FILE_MAX_FILES` and `LOG_FILE_RETENTION_DAYS` through the normal config system. The dashboard log viewer requires an administrator session. Treat logs as private even though common credential-shaped values are redacted.
+
 ## Credits and license
 
 Nullfin is a community fork of [Remux by lostb1t](https://github.com/lostb1t/remux). It remains licensed under the [GNU Affero General Public License v3.0](LICENSE), and the original copyright and license notices are preserved.
