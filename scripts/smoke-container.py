@@ -156,6 +156,12 @@ def check_persistence(server, addon_id, movie_id):
     item = server.request(f"/users/{server.user_id}/items/{movie_id}")
     assert item["Name"] == "Nullfin Smoke Movie"
     assert item["UserData"]["IsFavorite"], "favorite lost during migration/restart"
+    with sqlite3.connect(server.data / "db.sqlite") as db:
+        row = db.execute("SELECT play_count, playback_position FROM user_media_state WHERE user_id=? AND media_id=?",
+                         (uuid.UUID(server.user_id).bytes, uuid.UUID(movie_id).bytes)).fetchone()
+        assert row == (3, 987654321), "play count or resume position lost during migration/restart"
+        columns = {column[1] for column in db.execute("PRAGMA table_info(user_media_state)")}
+        assert {"watchlist", "ignored", "watchlisted_at"} <= columns
 
 
 def check_playback(server, movie_id, check_redaction=True):
@@ -213,6 +219,9 @@ def main():
                 check_playback(server, movie_id, check_redaction=False)
                 server.stop()
                 running = False
+                with sqlite3.connect(data / "db.sqlite") as db:
+                    db.execute("UPDATE user_media_state SET play_count=3, playback_position=987654321 WHERE user_id=? AND media_id=?",
+                               (uuid.UUID(server.user_id).bytes, uuid.UUID(movie_id).bytes))
                 server.start(args.image)
                 running = True
                 check_persistence(server, addon["id"], movie_id)
@@ -238,10 +247,10 @@ def main():
                 server.start(args.image)
                 running = True
                 server.setup()
-                for path in ("/", "/admin/"):
+                for path in ("/", "/web/", "/remux/", "/admin/"):
                     html = server.request(path, raw=True).lower()
                     assert b"<html" in html or b"<!doctype" in html, f"missing UI: {path}"
-                print("PASS: old-version migration, admin login, library/addon/settings persistence, source playback, restart, fresh setup, and both web UIs")
+                print("PASS: old-version migration, admin login, library/addon/settings/watch-state persistence, source playback, restart, fresh setup, dashboard and both web clients")
             except Exception:
                 if running:
                     print(docker("logs", "--tail", "100", server.name), flush=True)

@@ -70,6 +70,12 @@ jobs:
           name: jellyfin-web-dist
           path: artifacts/jellyfin-web/
 
+      - name: Download remux-web
+        uses: actions/download-artifact@v4
+        with:
+          name: remux-web-dist
+          path: artifacts/remux-web/
+
       - name: Download desktop artifacts
         uses: actions/download-artifact@v4
         with:
@@ -88,6 +94,7 @@ jobs:
                    "nullfin-${VERSION}-macos-amd64" "nullfin-${VERSION}-macos-arm64"
           tar -czf "nullfin-${VERSION}-dashboard.tar.gz" -C artifacts/dashboard .
           tar -czf "nullfin-${VERSION}-jellyfin-web.tar.gz" -C artifacts/jellyfin-web .
+          tar -czf "nullfin-${VERSION}-remux-web.tar.gz" -C artifacts/remux-web .
           mv remux-desktop-linux-x86_64.deb nullfin-desktop-linux-x86_64.deb
           mv remux-desktop-macos-aarch64.dmg nullfin-desktop-macos-aarch64.dmg
           mv remux-desktop-macos-x86_64.dmg nullfin-desktop-macos-x86_64.dmg
@@ -108,13 +115,14 @@ jobs:
             --target "${{ github.sha }}" \
             --title "${TAG}" \
             --generate-notes \
-            --notes-start-tag "v0.27.0" \
+            --notes-start-tag "v0.37.0" \
             "nullfin-${VERSION}-linux-amd64" \
             "nullfin-${VERSION}-linux-arm64" \
             "nullfin-${VERSION}-macos-amd64" \
             "nullfin-${VERSION}-macos-arm64" \
             "nullfin-${VERSION}-dashboard.tar.gz" \
             "nullfin-${VERSION}-jellyfin-web.tar.gz" \
+            "nullfin-${VERSION}-remux-web.tar.gz" \
             "nullfin-desktop-linux-x86_64.deb" \
             "nullfin-desktop-macos-aarch64.dmg" \
             "nullfin-desktop-macos-x86_64.dmg" \
